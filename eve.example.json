@@ -16,6 +16,7 @@
     "owner_user_id": "",
     "owner_dm_enabled": true,
     "presence_enabled": true,
+    "thread_status_enabled": true,
     "channel_ids": [],
     "channel_learning_ids": [],
     "member_dm_enabled": false,
@@ -29,6 +30,7 @@
   "network_tools": {"enabled": false},
   "shell": {"enabled": false},
   "wayland_computer": {"enabled": false},
+  "mcp": {"max_sessions": 8, "servers": {}},
   "nova_maintenance": {"enabled": false},
   "web": {"enabled": false},
   "local_files": {"roots": []}

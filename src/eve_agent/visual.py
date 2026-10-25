@@ -1366,6 +1366,8 @@ class VisualServer:
                     elif path == "/api/chatto/conversation":
                         self._validate_images(payload.get("images", []))
                         self._json(200, handle_chatto.conversation(payload))
+                    elif path == "/api/chatto/activity":
+                        self._json(200, handle_chatto.activity(payload))
                     elif path == "/api/chatto/observe":
                         self._json(200, handle_chatto.observe(payload))
                     else:

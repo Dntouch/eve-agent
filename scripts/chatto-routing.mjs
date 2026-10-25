@@ -22,6 +22,8 @@ export function selectRoute(config, viewerId, ownerId, room, message) {
 }
 
 export function scopeForRoute(serverUrl, viewerId, message, route) {
-  return JSON.stringify([serverUrl, viewerId, message.roomId,
-    route.kind === 'dm' ? message.authorId : 'public_channel']);
+  const scope = [serverUrl, viewerId, message.roomId,
+    route.kind === 'dm' ? message.authorId : 'public_channel'];
+  if (message.threadRootId) scope.push(message.threadRootId);
+  return JSON.stringify(scope);
 }

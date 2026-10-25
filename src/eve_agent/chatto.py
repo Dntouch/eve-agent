@@ -9,8 +9,9 @@ import secrets
 from copy import deepcopy
 from datetime import datetime, timezone
 import uuid
+import threading
 
-from .transport_access import transport_access, PUBLIC_CAPABILITIES
+from .transport_access import transport_access, PUBLIC_CAPABILITIES, update_transport_metadata
 from .memory import redact_sensitive
 
 
@@ -18,6 +19,8 @@ class ChattoAPI:
     def __init__(self, config, conversations, message_handler, learning_activity=None):
         self.config, self.conversations, self.message_handler = config, conversations, message_handler
         self.learning_activity = learning_activity
+        self.activities = {}
+        self.activity_lock = threading.RLock()
 
     def configure(self, config):
         self.config = deepcopy(config)
@@ -39,6 +42,12 @@ class ChattoAPI:
             raise PermissionError("Chatto server does not match configuration")
         clean["sender_name"] = str(context.get("sender_name") or "")[:128]
         clean["room_name"] = str(context.get("room_name") or "")[:128]
+        thread_root = context.get("thread_root_id", "")
+        if not isinstance(thread_root, str) or len(thread_root) > 2048:
+            raise ValueError("Invalid Chatto thread root")
+        if thread_root:
+            clean["thread_root_id"] = thread_root
+            clean["project_reference"] = self._project_reference(clean)
         clean["transport"] = "chatto"
         if clean["room_kind"] == "dm":
             if clean["owner_id"] != config["owner_user_id"]:
@@ -58,24 +67,48 @@ class ChattoAPI:
         return clean
 
     @staticmethod
+    def _project_reference(context):
+        identity = json.dumps([context[key] for key in
+                              ("server_url", "bot_id", "room_id", "thread_root_id")])
+        return "EVE-" + str(uuid.uuid5(uuid.NAMESPACE_URL, "chatto-project:" + identity))
+
+    @staticmethod
     def _scope(context):
         # One conversation per room/profile; everyone in the channel shares its history.
         keys = ("server_url", "bot_id", "room_id", "access_profile")
         if context["access_profile"] == "member_dm":
             keys += ("sender_id",)
-        return {key: context[key] for key in keys}
+        scope = {key: context[key] for key in keys}
+        if context.get("thread_root_id"):
+            scope["thread_root_id"] = context["thread_root_id"]
+        return scope
 
     def create_conversation(self, payload):
         context = self._context(payload)
+        if context.get("thread_root_id"):
+            with self.conversations.database.connect() as connection:
+                rows = connection.execute("SELECT id,metadata_json FROM conversations WHERE source='chatto' AND status!='deleted' "
+                    "AND json_extract(metadata_json,'$.chatto_scope.thread_root_id')=?", (context["thread_root_id"],)).fetchall()
+            for row in rows:
+                if json.loads(row["metadata_json"] or "{}").get("chatto_scope") == self._scope(context):
+                    return {"conversation_id": row["id"], "project_reference": context["project_reference"]}
         conversation = self.conversations.create(
-            "Chatto · " + ((context["sender_name"] if context["room_kind"] == "dm" else context["room_name"])
+            "Chatto · " + ((context.get("project_reference")) or (context["sender_name"] if context["room_kind"] == "dm" else context["room_name"])
                           or context["sender_name"] or context["room_id"]),
             source="chatto",
         )
         with self.conversations.database.connect() as connection:
             connection.execute("UPDATE conversations SET metadata_json=? WHERE id=?",
                                (json.dumps({"chatto_scope": self._scope(context)}), conversation["id"]))
-        return {"conversation_id": conversation["id"]}
+        return {"conversation_id": conversation["id"],
+                **({"project_reference": context["project_reference"]} if context.get("project_reference") else {})}
+
+    def activity(self, payload):
+        context = self._context(payload)
+        self._require_bound_conversation(payload.get("conversation_id"), context)
+        key = (payload["conversation_id"], context["message_id"])
+        with self.activity_lock:
+            return deepcopy(self.activities.get(key, {"state": "unknown"}))
 
     def conversation(self, payload):
         config = self.config
@@ -89,16 +122,82 @@ class ChattoAPI:
         if not isinstance(identifier, str) or not identifier:
             raise ValueError("Chatto conversation ID is required")
         self._require_bound_conversation(identifier, context)
-        with transport_access(context, public=context["access_profile"] != "owner_dm",
-                              allowed_capabilities=(PUBLIC_CAPABILITIES if context["access_profile"] == "member_dm"
-                                                    else config["channel_capabilities"])):
-            result = self.message_handler(text, images, identifier)
-        return {**{key: result[key] for key in ("answer", "conversation_id", "turn_id")},
+        original_thread = context.get("thread_root_id")
+        with self.conversations.database.connect() as connection:
+            metadata = json.loads(connection.execute("SELECT metadata_json FROM conversations WHERE id=?", (identifier,)).fetchone()[0] or "{}")
+        if metadata.get("mcp_session_id"):
+            context["mcp_session_id"] = metadata["mcp_session_id"]
+        activity_key = (identifier, context["message_id"])
+        progress = {"state": "working", "thread_root_id": original_thread or ""}
+        with self.activity_lock:
+            if len(self.activities) >= 256:
+                completed = next((key for key, item in self.activities.items() if item["state"] != "working"), None)
+                if completed is not None:
+                    self.activities.pop(completed)
+            self.activities[activity_key] = progress
+        branch_identifier = None
+        def activity(event):
+            nonlocal branch_identifier
+            if event.get("reply_mode") == "thread" and not context.get("thread_root_id"):
+                context["thread_root_id"] = context["message_id"]
+                context["project_reference"] = self._project_reference(context)
+                context["mcp_session_id"] = context["project_reference"]
+                update_transport_metadata({key: context[key] for key in
+                                           ("thread_root_id", "project_reference", "mcp_session_id")})
+            if not original_thread and context.get("thread_root_id") and branch_identifier is None:
+                branch_identifier = self.create_conversation({"context": context})["conversation_id"]
+                with self.conversations.database.connect() as connection:
+                    branch_metadata = {"chatto_scope": self._scope(context), "mcp_session_id": context["mcp_session_id"],
+                                       "origin_conversation_id": identifier, "origin_message_id": context["message_id"]}
+                    connection.execute("UPDATE conversations SET metadata_json=? WHERE id=?",
+                                       (json.dumps(branch_metadata), branch_identifier))
+            with self.activity_lock:
+                progress.update({"integration": event.get("integration", ""),
+                                 "thread_root_id": context.get("thread_root_id", "")})
+        try:
+            with transport_access(context, public=context["access_profile"] != "owner_dm", activity=activity,
+                                  allowed_capabilities=(PUBLIC_CAPABILITIES if context["access_profile"] == "member_dm"
+                                                        else config["channel_capabilities"])):
+                result = self.message_handler(text, images, identifier)
+        except BaseException:
+            with self.activity_lock:
+                progress["state"] = "failed"
+            raise
+        response_identifier = identifier
+        if not original_thread and context.get("thread_root_id"):
+            response_identifier = branch_identifier
+            with self.conversations.database.connect() as connection:
+                metadata = {"chatto_scope": self._scope(context), "mcp_session_id": context["mcp_session_id"],
+                            "origin_conversation_id": identifier, "origin_turn_id": result.get("turn_id")}
+                connection.execute("UPDATE conversations SET metadata_json=? WHERE id=?",
+                                   (json.dumps(metadata), response_identifier))
+            _, copied_answer = self.conversations.append_turn(response_identifier, text, result["answer"],
+                user_metadata={"conversation_source": context, "context_copy": True, "origin_turn_id": result.get("turn_id")},
+                assistant_metadata={"context_copy": True, "origin_turn_id": result.get("turn_id")},
+                user_attachments=[{"type":"image", "content": image} for image in images],
+                assistant_attachments=[r for r in result.get("resources", []) if r.get("type") == "image"])
+            artifacts = list(result.get("artifacts", []))
+            for resource in result.get("resources", []):
+                if resource.get("type") == "file" and isinstance(resource.get("content"), str):
+                    header, separator, encoded = resource["content"].partition(";base64,")
+                    if separator and header.startswith("data:"):
+                        artifacts.append({"filename": resource.get("filename") or "eve-download.bin",
+                                          "mime": header[5:], "base64": encoded})
+            if artifacts:
+                self.conversations.store_artifacts(response_identifier, copied_answer["id"], artifacts)
+        with self.activity_lock:
+            progress["state"] = "completed"
+        answer = result["answer"]
+        if context.get("thread_root_id") == context["message_id"]:
+            answer = f"Auftrag: {context['project_reference']}\n\n{answer}"
+        return {**{key: result[key] for key in ("conversation_id", "turn_id")}, "conversation_id": response_identifier, "answer": answer,
+                "thread_root_id": context.get("thread_root_id", ""),
+                **({"project_reference": context["project_reference"]} if context.get("project_reference") else {}),
                 "resources": [
-                    {"type": "image", "content": resource["content"]}
+                    {key: resource[key] for key in ("type", "content", "filename", "media_type") if key in resource}
                     for resource in result.get("resources", [])
-                    if resource.get("type") == "image" and isinstance(resource.get("content"), str)
-                    and resource["content"].startswith("data:image/")
+                    if resource.get("type") in {"image", "file"} and isinstance(resource.get("content"), str)
+                    and (resource["content"].startswith("data:image/") if resource.get("type") == "image" else resource["content"].startswith("data:"))
                 ]}
 
     def _require_bound_conversation(self, identifier, context):

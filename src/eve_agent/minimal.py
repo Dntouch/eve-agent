@@ -282,6 +282,9 @@ class NativeToolRuntime:
         wayland_computer = getattr(a, "wayland_computer", None)
         if wayland_computer:
             capabilities["wayland_computer"] = deepcopy(wayland_computer.native_contract())
+        external_mcp = getattr(a, "external_mcp", None)
+        if external_mcp is not None:
+            capabilities.update(external_mcp.contracts(a.conversation_id))
         if a.presentations:
             current = a.presentations.read()
             capabilities["presentation"] = {
@@ -691,10 +694,15 @@ class NativeToolRuntime:
         if capability != "eve_runtime":
             require_capability(capability)
         if capability == "eve_runtime" and operation == "load_capabilities":
-            available = self._capabilities(state)
             requested = parameters.get("capabilities") or []
             if not isinstance(requested, list) or not requested:
                 raise ValueError("At least one capability must be selected")
+            external = getattr(a, "external_mcp", None)
+            if external is not None:
+                for name in requested:
+                    if isinstance(name, str) and name.startswith("mcp_"):
+                        external.select(name)
+            available = self._capabilities(state)
             unknown = [name for name in requested if name not in available]
             if unknown:
                 raise ValueError(f"Unknown capabilities: {', '.join(map(str, unknown))}")
@@ -715,6 +723,10 @@ class NativeToolRuntime:
                     for name in requested
                 },
             }
+            runtime = {name: deepcopy(available[name]["runtime"])
+                       for name in requested if name.startswith("mcp_") and "runtime" in available[name]}
+            if runtime:
+                result["runtime"] = runtime
             if provider_memory:
                 result["provider_memory"] = provider_memory
             return result, Route.CHAT
@@ -739,6 +751,10 @@ class NativeToolRuntime:
             result = a.wayland_computer.execute_native_operation(operation, resolve_credentials(parameters))
             a._presentation_resources.extend(deepcopy(result.get("resources", [])))
             return result, Route.COMPUTER
+        if capability.startswith("mcp_") and getattr(a, "external_mcp", None) is not None:
+            result = a.external_mcp.execute(capability, operation, parameters, a.conversation_id)
+            a._presentation_resources.extend(deepcopy(result.get("resources", [])))
+            return result, Route.CHAT
         if capability == "semantic_learning":
             return self.semantic_session.execute(operation, parameters), Route.CHAT
         if capability == "home_assistant_inventory":

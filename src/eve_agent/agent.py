@@ -81,10 +81,12 @@ class EveAgent:
         semantic_composition=None,
         wayland_computer=None,
         shell=None,
+        external_mcp=None,
     ):
         self.identity, self.memory, self.llm, self.bus = identity, memory, llm, bus
         self.web, self.home_assistant = web, home_assistant
         self.wayland_computer = wayland_computer
+        self.external_mcp = external_mcp
         self.shell = shell
         from .semantic_links import SemanticLinks
         database = getattr(memory, "database", None)

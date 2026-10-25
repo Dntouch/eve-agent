@@ -56,6 +56,7 @@ from .turn_lifecycle import TurnCompletionStore
 from .streaming_tts import StreamingTTSPipeline
 from .web_tools import WebResearch
 from .wayland_computer import WaylandComputerCapability
+from .external_mcp import ExternalMcpServers
 from .shell import ShellCapability
 from .runtime_self_knowledge import RuntimeSelfKnowledgeSync, collect_runtime_self_descriptions
 from .working_memory import WorkingMemoryCleanupCoordinator
@@ -181,6 +182,7 @@ def build(root: Path, cfg: dict, *, config_path: Path | None = None):
         local_files=local_files,
         semantic_similarity=cfg.get("semantic_similarity", {}),
         semantic_composition=cfg.get("semantic_composition", {}),
+        external_mcp=ExternalMcpServers(cfg.get("mcp", {}), root),
         wayland_computer=wayland_computer,
         shell=shell,
     )
@@ -497,6 +499,12 @@ def main(argv: list[str] | None = None) -> int:
         response_started = time.perf_counter()
         response_start_ms = telemetry.elapsed_ms()
         spoken_answer, artifacts = extract_artifacts(answer, utterance)
+        for resource in result.resources:
+            if resource.get("type") == "file" and isinstance(resource.get("content"), str):
+                header, separator, encoded = resource["content"].partition(";base64,")
+                if separator and header.startswith("data:"):
+                    artifacts.append({"filename": resource.get("filename") or "eve-download.bin",
+                                      "mime": header[5:], "base64": encoded})
         if artifacts and conversations and result.conversation_id and result.assistant_message_id:
             conversations.store_artifacts(
                 result.conversation_id, result.assistant_message_id, artifacts,
@@ -767,10 +775,10 @@ def main(argv: list[str] | None = None) -> int:
             "conversation_id": result.conversation_id,
             "assistant_message_id": result.assistant_message_id,
             "resources": [
-                {"type": "image", "content": resource["content"]}
+                {key: resource[key] for key in ("type", "content", "filename", "media_type") if key in resource}
                 for resource in result.resources
-                if resource.get("type") == "image" and isinstance(resource.get("content"), str)
-                and resource["content"].startswith("data:image/")
+                if resource.get("type") in {"image", "file"} and isinstance(resource.get("content"), str)
+                and (resource["content"].startswith("data:image/") if resource.get("type") == "image" else resource["content"].startswith("data:"))
             ],
             "presentation_pending": result.presentation is not None,
         }
@@ -1338,6 +1346,9 @@ def main(argv: list[str] | None = None) -> int:
                 "working_memory": "Arbeitsgedächtnis", "web": "Webrecherche", "clock": "Uhrzeit",
                 "calculator": "Rechner",
             }
+            _, current_config = load_config(config_path)
+            labels.update({"mcp_" + name: server.get("title") or name
+                           for name, server in current_config.get("mcp", {}).get("servers", {}).items()})
             for section in result["sections"]:
                 for field in section["fields"]:
                     if field["id"] == "chatto.channel_capabilities":
@@ -1904,7 +1915,7 @@ def main(argv: list[str] | None = None) -> int:
         shell = getattr(agent, "shell", None)
         if shell is not None:
             shell.close_all()
-        for name in ("work_tasks", "nova_maintenance"):
+        for name in ("work_tasks", "nova_maintenance", "external_mcp"):
             provider = getattr(agent, name, None)
             if provider is not None:
                 provider.close_all()

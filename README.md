@@ -104,6 +104,7 @@ Serveradressen und Berechtigungen muss jede Installation selbst konfigurieren.
 | Sprache | `--with-speech`; Mikrofon im Browser freigeben. Für Linux-Audiogeräte muss die Systembibliothek PortAudio vorhanden sein. |
 | Home Assistant | Eigene Integration: [eve-home-assistant](https://github.com/Dntouch/eve-home-assistant). Installation und Updates über HACS (benutzerdefiniertes Repository, Typ Integration); Einrichtung und Tokens gemäß der dortigen Anleitung. |
 | Chatto-Bot-Anbindung | EVE als Bot mit einem bestehenden Chatto-Server verbinden: Node 22.13+ und npm, `python3 scripts/setup_chatto.py`, anschließend Serveradresse und eigenen Bot konfigurieren. Siehe [Chatto-Anleitung](docs/CHATTO.md). |
+| Externe MCP-Werkzeuge, etwa SolidCraft | Konfigurierbare Server, getrennte Sitzungen, Chatto-Auftrags-Threads und Dateianhänge: [MCP-Anleitung](docs/MCP.md). |
 | Lokale Dateien und Shell | Eigene Verzeichnisse beziehungsweise Shell in der Konfiguration freigeben. |
 | Desktopsteuerung | Linux/Wayland mit Desktop-Portal; separates Paket `wayland-mcp-kurojs==0.6.1` in `.venv-wayland-mcp` installieren und dort `scripts/patch_wayland_mcp_keyboard.py` ausführen. Benötigt die Systemabhängigkeiten von PyGObject, PyWayland und das Portal des Desktops. Die Desktop-Freigabe erfolgt lokal über das Portal. |
 | Nova-Wartung | Eigenen Coding-Agenten samt Anmeldung konfigurieren; für isolierten Linux-Betrieb wird Bubblewrap benötigt. |

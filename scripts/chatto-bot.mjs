@@ -8,6 +8,7 @@ import { selectRoute, scopeForRoute } from './chatto-routing.mjs';
 import { loadImages } from './chatto-images.mjs';
 import { createBotPresence } from './chatto-presence.mjs';
 import { postAnswer } from './chatto-output.mjs';
+import { threadProgress } from './chatto-progress.mjs';
 
 process.umask(0o077);
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
@@ -121,7 +122,7 @@ try {
         if (!author.user?.user || author.user.user.bot || author.user.user.deleted) return;
         const permissions = new Set((room.viewerState?.permissions || []).filter(p => p.granted).map(p => p.permission));
         const canRead = permissions.has('message.read') || permissions.has('message.read-interactions');
-        const canPost = config.reply_mode === 'chat' ? permissions.has('message.post')
+        const canPost = config.reply_mode === 'chat' && !message.threadRootId ? permissions.has('message.post')
           : ['message.post', 'message.post-in-thread', 'message.post-in-interactions'].some(p => permissions.has(p));
         if (!canRead || (!route.observeOnly && !canPost)) { status('permissions_missing', { room_id: message.roomId, can_read: canRead, can_post: canPost }); return; }
         const currentMessage = await server.service(MessageService).getMessage({ roomId: message.roomId, eventId: message.id }, { signal });
@@ -130,26 +131,37 @@ try {
             || readable.actorId !== message.authorId || readable.deletedAt) return;
         message.body = readable.body || '';
         message.attachments = readable.attachments || [];
+        message.threadRootId = readable.threadRootEventId || undefined;
+        if (config.reply_mode === 'thread' && !route.observeOnly) message.threadRootId ||= message.id;
         const scope = scopeForRoute(serverUrl, viewerId, message, route);
-        if (route.kind === 'dm') adoptRoomConversation(state, scope, serverUrl, viewerId, message);
+        if (route.kind === 'dm' && !message.threadRootId) adoptRoomConversation(state, scope, serverUrl, viewerId, message);
         const context = {
           server_url: serverUrl, bot_id: viewerId, owner_id: ownerId,
           room_id: message.roomId, room_kind: route.kind, room_name: room.room.name || '',
           sender_id: message.authorId, sender_name: author.user.user.displayName || author.user.user.login,
           message_id: message.id,
+          thread_root_id: message.threadRootId || "",
           access_profile: route.profile,
         };
         if (route.kind === 'dm') message.reasons.push('direct_message');
-        const destination = { roomId: message.roomId, threadRootId: config.reply_mode === 'thread' ? message.threadRootId || message.id : '' };
+        const destination = { roomId: message.roomId, threadRootId: message.threadRootId || '' };
         await handleMessage({
           message, conversationKey: scope, transport: context, signal, observeOnly: Boolean(route.observeOnly),
           loadImages: () => loadImages(server, message, signal),
-          withTyping: work => server.withTyping(destination, work),
-          reply: async (text, resources) => {
+          withTyping: work => server.withTyping(destination, work, { signal }),
+          progress: config.thread_status_enabled === false ? undefined : threadProgress(server.service(MessageService), destination, { signal, timeoutMs: 5000 }),
+          bindThread: (root, id) => {
+            const key = scopeForRoute(serverUrl, viewerId, { ...message, threadRootId: root }, route);
+            const known = state.conversation(key);
+            if (known && known !== id) throw new Error('Thread conversation binding conflict');
+            if (!known) state.remember(key, id);
+          },
+          reply: async (text, resources, result) => {
+            if (result?.thread_root_id) destination.threadRootId = result.thread_root_id;
             const latest = await server.service(RoomDirectoryService).getRoom({ roomId: message.roomId }, { signal });
             if (!latest.room || !selectRoute(config, viewerId, ownerId, latest.room, message)) throw new Error('Room access changed');
             const output = { ...destination,
-              inReplyTo: config.reply_mode === 'thread' ? message.id : '',
+              inReplyTo: destination.threadRootId ? message.id : '',
             };
             return postAnswer(server.service(AssetUploadService), server.service(MessageService), output, text, resources, signal);
           },

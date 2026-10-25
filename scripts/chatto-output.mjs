@@ -11,10 +11,21 @@ function imageFile(resource, index) {
   return { bytes, contentType: match[1], filename: `eve-bild-${index + 1}.${TYPES[match[1]]}` };
 }
 
+function outputFile(resource, index) {
+  if (resource.type === 'image') return imageFile(resource, index);
+  const match = /^data:([a-z0-9.+-]+\/[a-z0-9.+-]+);base64,([A-Za-z0-9+/]*={0,2})$/i.exec(resource.content || '');
+  if (!match) throw new Error('Unsupported EVE file resource');
+  const bytes = Buffer.from(match[2], 'base64');
+  if (!bytes.length || bytes.length > 20 * 1024 * 1024 || bytes.toString('base64') !== match[2]) throw new Error('Invalid EVE file resource');
+  const filename = String(resource.filename || `eve-datei-${index + 1}.bin`).split(/[\\/]/).pop();
+  if (!filename || /[\x00-\x1f]/.test(filename)) throw new Error('Invalid EVE filename');
+  return { bytes, contentType: match[1], filename };
+}
+
 export async function postAnswer(uploadApi, messageApi, destination, text, resources = [], signal) {
-  const imageResources = resources.filter(r => r.type === 'image');
-  if (imageResources.length > 4) throw new Error('Too many EVE output images');
-  const files = imageResources.map(imageFile);
+  const outputs = resources.filter(r => r.type === 'image' || r.type === 'file');
+  if (outputs.filter(r => r.type === 'image').length > 4 || outputs.length > 8) throw new Error('Too many EVE output attachments');
+  const files = outputs.map(outputFile);
   const options = { signal, timeoutMs: 30000 };
   const assets = [];
   for (const file of files) {

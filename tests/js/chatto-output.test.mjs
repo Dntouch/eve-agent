@@ -49,3 +49,24 @@ test('text-only answers retain Unicode chunking and explicit thread destination'
   assert.equal(requests[0].threadRootEventId, 'thread');
   assert.equal(requests[0].inReplyTo, 'question');
 });
+
+test('CAD files are uploaded as bytes with their filename into the same thread', async () => {
+  let created, posted;
+  const bytes = Buffer.from('ISO-10303-21;');
+  await postAnswer({
+    createUpload: async payload => { created = payload; return { upload: { uploadId: 'u', maxChunkSize: 100 } }; },
+    uploadChunk: async payload => { assert.deepEqual(payload.content, bytes); },
+    completeUpload: async () => ({ asset: { id: 'cad' } }),
+  }, { createMessage: async payload => { posted = payload; return { message: { id: 'answer' } }; } },
+  { roomId: 'room', threadRootId: 'root', inReplyTo: 'request' }, 'Fertig',
+  [{ type: 'file', filename: 'halter.step', content: `data:application/octet-stream;base64,${bytes.toString('base64')}` }]);
+  assert.equal(created.filename, 'halter.step');
+  assert.equal(created.roomId, 'room');
+  assert.equal(posted.threadRootEventId, 'root');
+  assert.deepEqual(posted.attachmentAssetIds, ['cad']);
+});
+test('file paths and URLs never become uploaded attachments', async () => {
+  for (const content of ['/private/file.step', 'https://example.org/model.step', 'data:application/octet-stream;base64,!!']) {
+    await assert.rejects(postAnswer({}, {}, { roomId: 'room' }, 'Datei', [{ type: 'file', content }]));
+  }
+});

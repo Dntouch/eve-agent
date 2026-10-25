@@ -11,6 +11,51 @@ from eve_agent.llm import OpenAICompatibleLLM
 
 
 class ConfigurationTest(unittest.TestCase):
+    def test_external_mcp_is_portable_editable_and_channel_access_is_explicit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = self.write_config(Path(directory), {})
+            servers = {'cad': {'command': 'solidcraft-cli', 'args': ['mcp', '--headless', '--allow-path', '{workspace}']}}
+            update_editable_config(path, {'values': {'mcp.servers': servers,
+                'chatto.channel_capabilities': ['memory', 'mcp_cad']}}, environ={})
+            config = load_config(path, environ={})[1]
+            self.assertEqual(config['mcp']['servers'], servers)
+            fields = {field['id']: field for section in editable_config(path, environ={})['sections'] for field in section['fields']}
+            self.assertNotIn('mcp.servers', fields)
+            self.assertEqual(fields['mcp.server.cad.command']['type'], 'text')
+            self.assertTrue(fields['mcp.server.cad.command']['restart_required'])
+            with self.assertRaises(ConfigError):
+                update_editable_config(path, {'values': {'mcp.servers': {}}}, environ={})
+
+    def test_mcp_categories_and_individual_gui_fields_preserve_other_servers(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = self.write_config(Path(directory), {'mcp': {'servers': {
+                'solidcraft': {'title': 'SolidCraft', 'command': 'before',
+                              'startup': [{'tool': 'open', 'arguments': {'path': '{workspace}/model'}}]},
+                'other': {'title': 'Andere App', 'command': 'other'}}}})
+            data = editable_config(path, environ={})
+            titles = [section['title'] for section in data['sections']]
+            self.assertEqual(titles, sorted(titles, key=str.casefold))
+            self.assertIn('SolidCraft', titles)
+            self.assertIn('Andere App', titles)
+            update_editable_config(path, {'values': {
+                'mcp.server.solidcraft.command': '/my/cli',
+                'mcp.server.solidcraft.env': {'LANG': 'de_DE.UTF-8'},
+                'mcp.server.new_server.command': 'new-cli',
+                'mcp.server.new_server.title': 'Neue App'}}, environ={})
+            servers = load_config(path, environ={})[1]['mcp']['servers']
+            self.assertEqual(servers['solidcraft']['command'], '/my/cli')
+            self.assertEqual(servers['solidcraft']['startup'][0]['arguments']['path'], '{workspace}/model')
+            self.assertEqual(servers['other'], {'title': 'Andere App', 'command': 'other'})
+            self.assertEqual(servers['new_server']['command'], 'new-cli')
+            before = path.read_bytes()
+            for field, value in [('mcp.server.new_server.scope', 'invalid'),
+                                 ('mcp.server.new_server.enabled', 'yes'),
+                                 ('mcp.server.new_server.unknown', True),
+                                 ('mcp.server.invalid.name.command', 'wrong')]:
+                with self.assertRaises(ConfigError):
+                    update_editable_config(path, {'values': {field: value}}, environ={})
+                self.assertEqual(path.read_bytes(), before)
+
     def test_local_configuration_is_preferred_and_explicit_path_is_preserved(self):
         from unittest.mock import patch
         import eve_agent.config as configuration

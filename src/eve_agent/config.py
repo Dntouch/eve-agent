@@ -73,7 +73,7 @@ DEFAULTS: dict[str, Any] = {
         "member_dm_enabled": False, "show_member_dms_in_web": False,
         "show_owner_dms_in_web": True, "show_channels_in_web": True,
         "channel_ids": [], "reply_mode": "chat", "channel_mentions_only": True,
-        "presence_enabled": True, "channel_learning_ids": [],
+        "presence_enabled": True, "thread_status_enabled": True, "channel_learning_ids": [],
         "channel_capabilities": ["memory", "semantic_learning", "working_memory", "web", "clock", "calculator"],
     },
     "nova_maintenance": {"enabled": False, "command": "codex", "transport": "isolated", "shared_chat_socket": "", "shared_chat_timeout_seconds": 900, "bwrap_command": "bwrap", "timeout_seconds": 180, "verification_timeout_seconds": 180, "pending_ttl_seconds": 600, "require_process_isolation": True, "max_context_records": 20, "max_jobs": 20},
@@ -83,6 +83,7 @@ DEFAULTS: dict[str, Any] = {
     "storage": {"data_path": "data/assets", "cache_path": "runtime/cache"},
     "local_files": {"roots": []},
     "shell": {"enabled": False, "executable": "/bin/bash", "forbidden_commands": ["rm -rf"]},
+    "mcp": {"servers": {}, "max_sessions": 8},
     "wayland_computer": {"enabled": False, "env": {}},
     "paths": {"database": "data/eve.db", "runtime": "runtime", "web": "web"},
 }
@@ -110,17 +111,21 @@ UI_SECTIONS = (
     ("speech_to_text", "STT"), ("text_to_speech", "TTS / Piper"),
     ("web", "Web"), ("nova_maintenance", "Nova"), ("conversation", "Unterhaltungen"),
     ("local_files", "Lokaler Dateizugriff"),
+    ("mcp", "Integrationen"),
     ("wayland_computer", "Wayland Desktop"), ("shell", "Shellzugriff"),
 )
 
 # This is both the API allowlist and the rendering description. The browser
 # never needs to duplicate defaults, validation rules, or config paths.
 UI_FIELDS: dict[str, dict[str, Any]] = {
+    "mcp.max_sessions": {"label": "Maximale Sitzungen", "type": "integer", "min": 1, "max": 64, "description": "Maximal gleichzeitig gestartete externe MCP-Prozesse. Kein automatisches Verwerfen ungespeicherter Sitzungen; nach Neustart wirksam."},
+    "mcp.servers": {"label": "MCP-Server", "type": "json", "description": "Server als JSON: command, args, env, cwd, scope (conversation/shared), timeout_seconds, description, attachment_roots. Platzhalter: {root}, {workspace}. Änderungen nach Neustart. Zugangsdaten über die Prozessumgebung setzen. Siehe docs/MCP.md."},
     "chatto.enabled": {"label": "Chatto aktiviert", "type": "boolean", "description": "Bot zusammen mit EVE starten und stoppen. Änderungen werden beim Speichern übernommen; EVE läuft weiter."},
     "chatto.server_url": {"label": "Chatto-Server", "type": "text", "description": "HTTPS-Adresse des Chatto-Servers."},
     "chatto.node_executable": {"label": "Node-Programm", "type": "text", "description": "Node 22.13 oder neuer; Programmname oder absoluter Pfad."},
     "chatto.owner_user_id": {"label": "Eigentümer-Konto-ID", "type": "text", "description": "Feste Chatto-ID für persönliche DMs. Anzeigenamen dürfen sich ändern."},
     "chatto.owner_dm_enabled": {"label": "Persönliche DMs aktiviert", "type": "boolean", "description": "Nur Zweier-DMs mit dem konfigurierten Bot-Eigentümer; bestehende persönliche Werkzeugrechte."},
+    "chatto.thread_status_enabled": {"label": "Arbeitsstatus in Threads anzeigen", "type": "boolean", "description": "Während der Bearbeitung eine sichtbare Statusnachricht im Thread anzeigen und bei Abschluss oder Fehler aktualisieren."},
     "chatto.presence_enabled": {"label": "Online-Status anzeigen", "type": "boolean", "description": "Online melden, solange der Bot verbunden ist. Beim Stoppen offline; bei Verbindungsabbruch verfällt der Status automatisch nach etwa 60 Sekunden."},
     "chatto.channel_ids": {"label": "Freigegebene Channels", "type": "string_list", "description": "Nur ausgewählte Channels verarbeiten. Neue Räume werden alle 30 Sekunden eingelesen; Auswahl durch erneutes Öffnen der Konfiguration aktualisieren. Änderungen gelten ab der nächsten Nachricht."},
     "chatto.channel_mentions_only": {"label": "Im Channel nur auf Erwähnungen antworten", "type": "boolean", "description": "Deaktiviert: alle neuen Textnachrichten in freigegebenen Channels verarbeiten. Bot-Nachrichten werden ignoriert."},
@@ -413,7 +418,7 @@ def _validate(root: Path, config: dict[str, Any]) -> None:
     chatto = config["chatto"]
     if not isinstance(chatto, dict):
         raise ConfigError("chatto muss ein Objekt sein")
-    for key in ("enabled", "owner_dm_enabled", "member_dm_enabled", "show_member_dms_in_web", "show_owner_dms_in_web", "show_channels_in_web", "channel_mentions_only", "presence_enabled"):
+    for key in ("enabled", "owner_dm_enabled", "member_dm_enabled", "show_member_dms_in_web", "show_owner_dms_in_web", "show_channels_in_web", "channel_mentions_only", "presence_enabled", "thread_status_enabled"):
         if not isinstance(chatto.get(key), bool):
             raise ConfigError("chatto." + key + " muss boolesch sein")
     chatto["server_url"] = _url(chatto.get("server_url"), "chatto.server_url")
@@ -431,6 +436,15 @@ def _validate(root: Path, config: dict[str, Any]) -> None:
         if not isinstance(chatto.get(key), list) or any(not isinstance(v, str) or not v.strip() or len(v) > 128 for v in chatto[key]):
             raise ConfigError("chatto." + key + " muss eine Liste nichtleerer Zeichenketten sein")
     known_capabilities = {"memory", "semantic_learning", "working_memory", "web", "clock", "calculator", "home_assistant", "home_assistant_inventory", "local_search", "local_files", "shell", "nova", "wayland_computer", "network", "scheduled_tasks", "work_tasks", "assist_events", "presentation"}
+    from .external_mcp import validate_servers
+    if not isinstance(config.get("mcp"), dict):
+        raise ConfigError("mcp muss ein JSON-Objekt sein")
+    try:
+        validate_servers(config["mcp"]["servers"])
+        _integer(config["mcp"], "max_sessions", 1, 64, "mcp.max_sessions")
+    except ValueError as exc:
+        raise ConfigError(str(exc)) from exc
+    known_capabilities.update("mcp_" + name for name in config["mcp"]["servers"])
     if set(chatto["channel_capabilities"]) - known_capabilities:
         raise ConfigError("chatto.channel_capabilities enthält unbekannte Werkzeuge")
     if chatto["enabled"] and (not chatto["api_key"].strip() or not chatto["owner_user_id"].strip()):
@@ -728,6 +742,37 @@ def _source_map(config_path: Path, environ: Mapping[str, str] | None) -> dict[st
     return sources
 
 
+
+# Transport settings only; domain contracts continue to come from the MCP server.
+MCP_SERVER_FIELDS = {
+    "chatto_reply_mode": {"label": "Antworten in Chatto", "type": "select", "options": ["inherit", "thread"], "default": "inherit", "description": "inherit: allgemeinen Chatto-Antwortmodus beibehalten. thread: bei Verwendung dieser Integration im eigenen Thread antworten."},
+    "title": {"label": "Name der Kategorie", "type": "text", "default": ""},
+    "enabled": {"label": "Aktiviert", "type": "boolean", "default": True},
+    "command": {"label": "Programm / CLI-Pfad", "type": "text", "default": "", "description": "Ausführbares CLI-Programm oder Programmname auf PATH. {root} bezeichnet den EVE-Ordner."},
+    "args": {"label": "Programmargumente", "type": "string_list", "default": [], "description": "Ein Argument pro Zeile; keine Shell-Anführungszeichen. {workspace} bezeichnet den Sitzungsordner."},
+    "scope": {"label": "Sitzungsumfang", "type": "select", "options": ["conversation", "shared"], "default": "conversation", "description": "conversation: eigene Sitzung pro Gespräch. shared: gemeinsam verwendete Sitzung."},
+    "cwd": {"label": "Arbeitsverzeichnis", "type": "text", "default": "{workspace}"},
+    "timeout_seconds": {"label": "Zeitlimit pro Aufruf (Sekunden)", "type": "integer", "min": 1, "max": 3600, "default": 330},
+    "description": {"label": "Beschreibung für EVE", "type": "text", "default": ""},
+    "attachment_roots": {"label": "Zusätzliche Ordner für Antwortdateien", "type": "path_list", "default": []},
+    "env": {"label": "Prozessumgebung", "type": "key_value", "default": {}, "description": "Zusätzliche Umgebungsvariablen; Zugangsdaten über die Umgebung des EVE-Prozesses setzen."},
+    "protocol_version": {"label": "MCP-Protokollversion", "type": "text", "default": "2025-06-18", "advanced": True},
+    "startup": {"label": "Beim Sitzungsstart", "type": "mcp_calls", "default": [], "advanced": True},
+    "after_write": {"label": "Nach Schreibaufrufen", "type": "mcp_calls", "default": [], "advanced": True},
+}
+
+
+def _mcp_server_section(name, server):
+    fields = []
+    for key, spec in MCP_SERVER_FIELDS.items():
+        fields.append({**copy.deepcopy(spec), "id": f"mcp.server.{name}.{key}",
+                       "value": copy.deepcopy(server.get(key, spec["default"])),
+                       "source": "Konfiguration" if key in server else "default",
+                       "restart_required": True, "locked": False})
+    return {"id": "mcp_" + name, "title": server.get("title") or name,
+            "fields": fields, "secrets": [], "mcp_server": name}
+
+
 def editable_config(config_path: Path, *, environ: Mapping[str, str] | None = None) -> dict[str, Any]:
     """Return the safe, server-described configuration model for the web UI."""
     resolved = config_path.resolve()
@@ -738,7 +783,7 @@ def editable_config(config_path: Path, *, environ: Mapping[str, str] | None = No
         fields = []
         for field, meta in UI_FIELDS.items():
             field_section, key = field.split(".", 1)
-            if field_section != section:
+            if field_section != section or field == "mcp.servers":
                 continue
             fields.append({"id": field, "value": effective[section][key],
                            "default": copy.deepcopy(DEFAULTS[section][key]),
@@ -764,7 +809,11 @@ def editable_config(config_path: Path, *, environ: Mapping[str, str] | None = No
                                 "description": meta["description"]})
         if fields or secrets:
             sections.append({"id": section, "title": title, "fields": fields, "secrets": secrets})
-    return {"sections": sections, "runtime_effect": "mixed"}
+    sections.extend(_mcp_server_section(name, server)
+                    for name, server in effective["mcp"]["servers"].items())
+    sections.sort(key=lambda section: section["title"].casefold())
+    return {"sections": sections, "runtime_effect": "mixed",
+            "mcp_server_template": _mcp_server_section("{name}", {})}
 
 
 def update_editable_config(config_path: Path, payload: Mapping[str, Any], *, environ: Mapping[str, str] | None = None) -> dict[str, Any]:
@@ -774,13 +823,24 @@ def update_editable_config(config_path: Path, payload: Mapping[str, Any], *, env
     values, secrets = payload.get("values", {}), payload.get("secrets", {})
     if not isinstance(values, Mapping) or not isinstance(secrets, Mapping):
         raise ConfigError("values und secrets müssen JSON-Objekte sein")
-    unknown = (set(values) - set(UI_FIELDS)) | (set(secrets) - set(UI_SECRETS))
+    dynamic = {}
+    for field in values:
+        match = re.fullmatch(r"mcp\.server\.([a-z][a-z0-9_]{0,39})\.([a-z_]+)", field)
+        if match and match[2] in MCP_SERVER_FIELDS:
+            dynamic[field] = (match[1], match[2])
+    if "mcp.servers" in values and dynamic:
+        raise ConfigError("Serverliste und einzelne Serverfelder können nicht gleichzeitig geändert werden")
+    unknown = (set(values) - set(UI_FIELDS) - set(dynamic)) | (set(secrets) - set(UI_SECRETS))
     if unknown:
         raise ConfigError(f"Unbekanntes Konfigurationsfeld: {sorted(unknown)[0]}")
     resolved = config_path.resolve()
     local = json.loads(resolved.read_text(encoding="utf-8"))
     candidate = copy.deepcopy(local)
     for field, value in values.items():
+        if field in dynamic:
+            name, key = dynamic[field]
+            candidate.setdefault("mcp", {}).setdefault("servers", {}).setdefault(name, {})[key] = value
+            continue
         section, key = field.split(".", 1)
         field_type = UI_FIELDS[field]["type"]
         if field_type == "boolean" and not isinstance(value, bool):

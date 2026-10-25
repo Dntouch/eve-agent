@@ -12,6 +12,101 @@ from eve_agent.transport_access import capability_allowed, require_capability, t
 
 
 class ChattoTest(unittest.TestCase):
+    def test_selected_integration_opens_own_thread_without_changing_normal_chat(self):
+        from eve_agent.transport_access import report_transport_activity
+        created = self.api.create_conversation({'context': self.context})
+        request = {**created, 'context': self.context, 'text': 'Konstruieren'}
+        session_ids = []
+        def answer(*args):
+            report_transport_activity({'integration': 'SolidCraft', 'reply_mode': 'thread'})
+            session_ids.append(transport_metadata()['mcp_session_id'])
+            live = self.api.activity(request)
+            self.assertEqual(live['state'], 'working')
+            self.assertEqual(live['thread_root_id'], self.context['message_id'])
+            return {'answer': 'Hier ist das Ergebnis', 'conversation_id': args[2], 'turn_id': 'origin-turn'}
+        self.handler.side_effect = answer
+        result = self.api.conversation(request)
+        self.assertNotEqual(result['conversation_id'], created['conversation_id'])
+        self.assertEqual(result['thread_root_id'], self.context['message_id'])
+        history = self.store.messages(result['conversation_id'])['messages']
+        self.assertEqual([item['role'] for item in history], ['user', 'assistant'])
+        self.assertEqual(history[0]['metadata']['origin_turn_id'], 'origin-turn')
+        following = {**self.context, 'thread_root_id': self.context['message_id'], 'message_id': 'followup'}
+        self.handler.side_effect = lambda *args: session_ids.append(transport_metadata()['mcp_session_id']) or {
+            'answer': 'Geändert', 'conversation_id': args[2], 'turn_id': 'next-turn'}
+        self.api.conversation({'conversation_id': result['conversation_id'], 'context': following, 'text': 'Ändern'})
+        self.assertEqual(session_ids[0], session_ids[1])
+        self.handler.side_effect = None
+        self.handler.return_value = {'answer': 'Hallo', 'conversation_id': created['conversation_id'], 'turn_id': 'hello'}
+        normal = self.api.conversation({**request, 'context': {**self.context, 'message_id': 'normal'}})
+        self.assertEqual(normal['thread_root_id'], '')
+        self.assertEqual(normal['conversation_id'], created['conversation_id'])
+        self.assertEqual(self.api.config['reply_mode'], 'chat')
+        self.assertEqual(self.api.activity(request)['state'], 'completed')
+
+    def test_failed_first_thread_request_retains_project_binding_for_followups(self):
+        from eve_agent.transport_access import report_transport_activity
+        created = self.api.create_conversation({'context': self.context})
+        request = {**created, 'context': self.context, 'text': 'Konstruieren'}
+        session = []
+        def fail(*args):
+            report_transport_activity({'integration': 'CAD', 'reply_mode': 'thread'})
+            session.append(transport_metadata()['mcp_session_id'])
+            raise RuntimeError('model disconnected')
+        self.handler.side_effect = fail
+        with self.assertRaises(RuntimeError): self.api.conversation(request)
+        following = {**self.context, 'thread_root_id': self.context['message_id'], 'message_id': 'after-failure'}
+        thread = self.api.create_conversation({'context': following})
+        self.assertEqual(thread, self.api.create_conversation({'context': following}))
+        self.handler.side_effect = lambda *args: session.append(transport_metadata()['mcp_session_id']) or {
+            'answer': 'Zustand geprüft', 'conversation_id': args[2], 'turn_id': 'recovered'}
+        self.api.conversation({**thread, 'context': following, 'text': 'Zustand prüfen'})
+        self.assertEqual(session[0], session[1])
+
+    def test_activity_is_bound_to_room_and_message_and_marks_failure(self):
+        created = self.api.create_conversation({'context': self.context})
+        request = {**created, 'context': self.context, 'text': 'Auftrag'}
+        self.assertEqual(self.api.activity(request)['state'], 'unknown')
+        self.handler.side_effect = RuntimeError('model unavailable')
+        with self.assertRaises(RuntimeError): self.api.conversation(request)
+        self.assertEqual(self.api.activity(request)['state'], 'failed')
+        self.assertEqual(self.api.activity({**request, 'context': {**self.context, 'message_id': 'other'}})['state'], 'unknown')
+        with self.assertRaises(PermissionError):
+            self.api.activity({**request, 'context': {**self.context, 'room_id': 'other'}})
+
+    def test_thread_reference_is_stable_scoped_and_available_to_learning(self):
+        context = {**self.context, 'thread_root_id': 'root', 'message_id': 'root'}
+        first = self.api.create_conversation({'context': context})
+        self.assertTrue(first['project_reference'].startswith('EVE-'))
+        self.assertIn(first['project_reference'], self.store.get(first['conversation_id'])['title'])
+        seen = []
+        def answer(*args):
+            seen.append(transport_metadata())
+            return {'answer': 'Fertig', 'conversation_id': args[2], 'turn_id': 'turn'}
+        self.handler.side_effect = answer
+        response = self.api.conversation({**first, 'context': context, 'text': 'Auftrag'})
+        self.assertIn(first['project_reference'], response['answer'])
+        self.assertEqual(seen[0]['project_reference'], first['project_reference'])
+        following = {**context, 'message_id': 'reply'}
+        response = self.api.conversation({**first, 'context': following, 'text': 'Änderung'})
+        self.assertEqual(response['answer'], 'Fertig')
+        self.assertEqual(seen[1]['project_reference'], seen[0]['project_reference'])
+        for other in ({**following, 'thread_root_id': 'different'},
+                      {key: value for key, value in following.items() if key != 'thread_root_id'}):
+            with self.assertRaises(PermissionError):
+                self.api.conversation({**first, 'context': other, 'text': 'Änderung'})
+        another = self.api.create_conversation({'context': {**context, 'thread_root_id': 'other'}})
+        self.assertNotEqual(another['project_reference'], first['project_reference'])
+
+    def test_inline_files_are_returned_without_reading_provider_paths(self):
+        created = self.api.create_conversation({'context': self.context})
+        file = {'type': 'file', 'content': 'data:application/octet-stream;base64,Y2Fk',
+                'filename': 'part.step', 'media_type': 'application/octet-stream'}
+        self.handler.return_value['resources'] = [{**file, 'provider_path': '/private/file'},
+                                                {'type': 'file', 'content': '/private/config'}]
+        response = self.api.conversation({**created, 'context': self.context, 'text': 'Datei'})
+        self.assertEqual(response['resources'], [file])
+
     def test_web_list_filters_only_member_dms_before_pagination(self):
         self.api.configure({**self.config, "member_dm_enabled": True})
         channel = self.api.create_conversation({"context": self.context})["conversation_id"]
@@ -151,6 +246,8 @@ class ChattoTest(unittest.TestCase):
             self.assertEqual(response.status, 201)
             identifier = json.load(response)['conversation_id']
             self.assertTrue(identifier)
+        with request({'context': self.context, 'conversation_id': identifier}, 'bridge-only', 'activity') as response:
+            self.assertEqual(json.load(response)['state'], 'unknown')
         with self.assertRaises(urllib.error.HTTPError) as error:
             request({'context': {**self.context, 'room_id': 'not-allowed'}}, 'bridge-only')
         self.assertEqual(error.exception.code, 403)

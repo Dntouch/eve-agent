@@ -3017,6 +3017,51 @@
     renderPreviews();
   }
 
+  function configEntriesControl(field) {
+    const control = document.createElement("div");
+    control.className = "config-entry-list";
+    const entries = document.createElement("div");
+    const dirty = () => control.dispatchEvent(new Event("input", { bubbles: true }));
+    const addRow = (value = {}) => {
+      const row = document.createElement("div");
+      row.className = "config-entry-row";
+      const input = (key, placeholder, initial) => {
+        const element = document.createElement(key === "arguments" ? "textarea" : "input");
+        element.dataset.entryKey = key;
+        element.placeholder = placeholder;
+        element.setAttribute("aria-label", placeholder);
+        element.value = initial ?? "";
+        row.append(element);
+        return element;
+      };
+      if (field.type === "key_value") {
+        input("key", "Variable", value.key);
+        input("value", "Wert", value.value);
+      } else {
+        input("tool", "Natives Werkzeug", value.tool);
+        input("arguments", "Werkzeugargumente (JSON)", JSON.stringify(value.arguments || {}, null, 2));
+        input("if_exists", "Nur wenn Datei existiert (optional)", value.if_exists);
+      }
+      const remove = document.createElement("button");
+      remove.type = "button";
+      remove.className = "eve-button eve-button--ghost";
+      remove.textContent = "Entfernen";
+      remove.addEventListener("click", () => { row.remove(); dirty(); });
+      row.append(remove);
+      entries.append(row);
+    };
+    const initial = field.type === "key_value"
+      ? Object.entries(field.value || {}).map(([key, value]) => ({ key, value })) : field.value || [];
+    initial.forEach(addRow);
+    const add = document.createElement("button");
+    add.type = "button";
+    add.className = "eve-button eve-button--ghost";
+    add.textContent = field.type === "key_value" ? "Variable hinzufügen" : "Aufruf hinzufügen";
+    add.addEventListener("click", () => { addRow(); dirty(); });
+    control.append(entries, add);
+    return control;
+  }
+
   function configControl(field) {
     let control;
     if (field.choices) {
@@ -3035,6 +3080,12 @@
         label.append(checkbox, document.createTextNode(` ${choice.label}`));
         control.append(label);
       }
+    } else if (["key_value", "mcp_calls"].includes(field.type)) {
+      control = configEntriesControl(field);
+    } else if (field.type === "json") {
+      control = document.createElement("textarea");
+      control.rows = 16;
+      control.spellcheck = false;
     } else if (["path_list", "string_list"].includes(field.type)) {
       control = document.createElement("textarea");
       control.rows = 5;
@@ -3062,6 +3113,7 @@
     if (field.locked) control.title = "Dieser Wert wird außerhalb von EVE durch die Umgebung vorgegeben.";
     if (field.type === "boolean") control.checked = Boolean(field.value);
     else if (["path_list", "string_list"].includes(field.type)) control.value = (field.value || []).join("\n");
+    else if (field.type === "json") control.value = JSON.stringify(field.value ?? {}, null, 2);
     else if (field.type !== "secret") control.value = field.value ?? "";
     return control;
   }
@@ -3641,6 +3693,10 @@
       summary.append(heading, count);
       const body = document.createElement("div");
       body.className = "config-section-body";
+      const advanced = document.createElement("details");
+      const advancedTitle = document.createElement("summary");
+      advancedTitle.textContent = "Erweiterte Einstellungen";
+      advanced.append(advancedTitle);
       card.append(summary, body);
       if (section.id === "chatto") {
         const status = document.createElement("p");
@@ -3701,8 +3757,49 @@
           }
           row.append(suggestions);
         }
-        body.append(row);
+        (field.advanced ? advanced : body).append(row);
         configValues.set(field.id, field.type === "secret" ? "" : field.value);
+      }
+      if (advanced.childElementCount > 1) body.append(advanced);
+      if (section.id === "mcp") {
+        const add = document.createElement("button");
+        add.type = "button";
+        add.className = "eve-button eve-button--ghost";
+        add.textContent = "Integration hinzufügen";
+        add.addEventListener("click", () => {
+          const name = window.prompt("Eindeutiger Integrationsname (Kleinbuchstaben, Ziffern, Unterstriche):");
+          if (name === null) return;
+          if (!/^[a-z][a-z0-9_]{0,39}$/.test(name) || data.sections.some(item => item.mcp_server === name)) {
+            elements.configStatus.textContent = "Bitte einen freien Namen mit maximal 40 Zeichen verwenden.";
+            return;
+          }
+          const baseline = new Map(configValues);
+          const secretValues = new Map([...elements.configForm.querySelectorAll('[data-config-type="secret"]')]
+            .map(control => [control.dataset.configField, control.value]));
+          try {
+            for (const section of data.sections) for (const field of section.fields) {
+              const control = [...elements.configForm.querySelectorAll("[data-config-field]")]
+                .find(item => item.dataset.configField === field.id);
+              if (control) field.value = readConfigValue(control);
+            }
+          } catch (error) { elements.configStatus.textContent = error.message; return; }
+          const section = JSON.parse(JSON.stringify(data.mcp_server_template).replaceAll("{name}", name));
+          section.fields.find(field => field.id.endsWith(".title")).value = name;
+          section.pending_create = true;
+          data.sections.push(section);
+          renderConfig(data);
+          for (const [id, value] of baseline) configValues.set(id, value);
+          for (const pending of data.sections.filter(item => item.pending_create))
+            for (const field of pending.fields) configValues.delete(field.id);
+          for (const control of elements.configForm.querySelectorAll('[data-config-type="secret"]'))
+            control.value = secretValues.get(control.dataset.configField) || "";
+          const card = [...elements.configSections.children].find(item => item.dataset.configSection === section.id);
+          card.open = true;
+          card.querySelector('input[data-config-field$=".command"]')?.focus();
+          elements.configSave.disabled = false;
+          elements.configStatus.textContent = "Neue Integration: Programm eintragen und speichern.";
+        });
+        body.append(add);
       }
       if (section.id === "home_assistant") {
         body.append(homeAssistantInventoryAction(), homeAssistantPolicyAction());
@@ -3710,6 +3807,10 @@
       elements.configSections.append(card);
     }
     elements.configSections.append(trainingPackagesSection(openSections));
+    const sorted = [...elements.configSections.children].sort((left, right) =>
+      (left.querySelector(".config-section-heading")?.textContent || "").localeCompare(
+        right.querySelector(".config-section-heading")?.textContent || "", "de", { sensitivity: "base" }));
+    elements.configSections.replaceChildren(...sorted);
     elements.configSave.disabled = true;
   }
 
@@ -3745,6 +3846,18 @@
 
   function readConfigValue(control) {
     if (control.dataset.configChoices === "true") return [...control.querySelectorAll("input:checked")].map(input => input.value);
+    if (["key_value", "mcp_calls"].includes(control.dataset.configType)) {
+      const rows = [...control.querySelectorAll(".config-entry-row")].map(row =>
+        Object.fromEntries([...row.querySelectorAll("[data-entry-key]")].map(input => [input.dataset.entryKey, input.value])));
+      if (control.dataset.configType === "key_value") {
+        if (rows.some(row => !row.key) || new Set(rows.map(row => row.key)).size !== rows.length)
+          throw new Error("Umgebungsvariablen benötigen eindeutige, nichtleere Namen.");
+        return Object.fromEntries(rows.map(row => [row.key, row.value]));
+      }
+      return rows.map(row => ({ tool: row.tool, arguments: JSON.parse(row.arguments),
+        ...(row.if_exists ? { if_exists: row.if_exists } : {}) }));
+    }
+    if (control.dataset.configType === "json") return JSON.parse(control.value);
     if (control.dataset.configType === "boolean") return control.checked;
     if (["integer", "number"].includes(control.dataset.configType)) return Number(control.value);
     if (["path_list", "string_list"].includes(control.dataset.configType)) {
@@ -3758,7 +3871,9 @@
     const values = {};
     const secrets = {};
     for (const control of elements.configForm.querySelectorAll("[data-config-field]")) {
-      const value = readConfigValue(control);
+      let value;
+      try { value = readConfigValue(control); }
+      catch (error) { elements.configStatus.textContent = `Konfiguration prüfen: ${error.message}`; return; }
       if (control.dataset.configType === "secret") {
         if (String(value).trim()) secrets[control.dataset.configField] = value;
       } else if (JSON.stringify(value) !== JSON.stringify(configValues.get(control.dataset.configField))) {

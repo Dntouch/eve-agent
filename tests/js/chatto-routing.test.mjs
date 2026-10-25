@@ -49,3 +49,11 @@ test('other members can use restricted two-person DMs when explicitly enabled', 
   assert.equal(selectRoute(enabled, 'eve', 'owner', ownerDM, { ...request, authorId: 'owner' }).profile, 'owner_dm');
   assert.equal(selectRoute({ ...enabled, owner_dm_enabled: false }, 'eve', 'owner', ownerDM, { ...request, authorId: 'owner' }), undefined);
 });
+
+test('different threads separate context and replies in one thread keep context', () => {
+  const route = { kind: 'channel' };
+  const first = { ...message, threadRootId: 'root-one' };
+  assert.equal(scopeForRoute('s', 'eve', first, route), scopeForRoute('s', 'eve', { ...first, id: 'reply', authorId: 'other' }, route));
+  assert.notEqual(scopeForRoute('s', 'eve', first, route), scopeForRoute('s', 'eve', { ...first, threadRootId: 'root-two' }, route));
+  assert.notEqual(scopeForRoute('s', 'eve', first, route), scopeForRoute('s', 'eve', message, route));
+});

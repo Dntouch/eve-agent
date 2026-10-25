@@ -152,3 +152,14 @@ Prüfung ohne Modellaufrufe (HTTP-Tests verwenden einen lokalen Testserver):
 PYTHONPATH=src:tests .venv/bin/python -m unittest test_chatto test_native_runtime test_config test_assist_api
 node --test tests/js/chatto-bot.test.mjs tests/js/chatto-routing.test.mjs tests/js/chatto-images.test.mjs tests/js/chatto-output.test.mjs
 ```
+
+## Konfigurierbare MCP-Werkzeuge und Auftrags-Threads
+
+Externe MCP-Server, etwa SolidCraft, werden zentral in EVE konfiguriert.
+Die [MCP-Anleitung](MCP.md) beschreibt Einrichtung, getrennte Sitzungen,
+Dateianhänge und Channel-Freigaben. Der allgemeine Antwortmodus kann `chat` bleiben. Mit `thread` unter der
+jeweiligen Integration erhält nur deren Verwendung einen eigenen Thread und
+EVE-Verlauf. Der sichtbare Arbeitsstatus in Threads lässt sich im Chatto-Abschnitt
+aktivieren. Eine stabile `EVE-<UUID>`-Referenz
+verbindet den Thread technisch mit den Herkunftsdaten für das Memory-Lernen.
+Die Bedeutung und fachlichen Beziehungen bestimmt weiterhin das Modell.

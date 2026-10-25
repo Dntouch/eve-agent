@@ -1,3 +1,4 @@
+import { withProgress } from './chatto-progress.mjs';
 import { DatabaseSync } from 'node:sqlite';
 
 export class ChattoState {
@@ -80,11 +81,15 @@ export async function handleMessage(ctx, ownerId, state, eve) {
         conversation_id: id, text: message.body, images, context: ctx.transport,
       }, ctx.signal);
       if (typeof result.answer !== 'string' || !result.answer.trim()) throw new Error('Empty EVE answer');
-      await ctx.reply(result.answer, result.resources || []);
+      if (result.thread_root_id && ctx.bindThread) ctx.bindThread(result.thread_root_id, result.conversation_id);
+      await ctx.reply(result.answer, result.resources || [], result);
       state.finish(message.id, 'replied');
     };
     if (ctx.observeOnly) await processMessage();
-    else await ctx.withTyping(processMessage);
+    else await ctx.withTyping(() => ctx.progress ? withProgress(processMessage,
+      () => eve('/api/chatto/activity', { conversation_id: state.conversation(ctx.conversationKey), context: ctx.transport },
+        AbortSignal.any([ctx.signal || new AbortController().signal, AbortSignal.timeout(5000)])), ctx.progress)
+      : processMessage());
   } catch (error) {
     // No automatic retry: EVE may already have performed an action or Chatto accepted a reply.
     state.finish(message.id, 'uncertain');
