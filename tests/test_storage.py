@@ -353,3 +353,38 @@ class ConversationStoreTest(unittest.TestCase):
             self.assertEqual("bericht.txt", message["attachments"][0]["filename"])
             self.assertEqual("text/plain", message["attachments"][0]["media_type"])
             self.assertEqual(b"Hallo", store.read_asset(message["attachments"][0]["id"])[1])
+
+    def test_download_export_reuses_tool_image_attachment_and_visual_index(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = self.make_store(Path(tmp))
+            cid = store.create("Bild")["id"]
+            encoded = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB"
+            _, assistant = store.append_turn(cid, "Erzeuge ein Bild", "Hier ist es.",
+                assistant_attachments=[{"type": "file", "filename": "bild.png", "content": "data:image/png;base64," + encoded}])
+            original = store.messages(cid)["messages"][1]["attachments"][0]
+            artifact = {"filename": "bild.png", "mime": "image/png", "base64": encoded}
+            for _ in range(2):
+                self.assertEqual(original["id"], store.store_artifacts(cid, assistant["id"], [artifact])[0]["id"])
+            with store.database.connect() as connection:
+                self.assertEqual(1, connection.execute("SELECT count(*) FROM conversation_assets").fetchone()[0])
+                self.assertEqual(1, connection.execute("SELECT count(*) FROM visual_asset_index").fetchone()[0])
+            self.assertEqual(1, len(list(store.asset_root.iterdir())))
+            # A deliberately different download name remains a separate file.
+            store.store_artifacts(cid, assistant["id"], [{**artifact, "filename": "kopie.png"}])
+            self.assertEqual(2, len(store.messages(cid)["messages"][1]["attachments"]))
+
+    def test_historical_duplicate_assistant_assets_are_displayed_once_without_deletion(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = self.make_store(Path(tmp))
+            cid = store.create("Bild")["id"]
+            _, assistant = store.append_turn(cid, "Bild", "Fertig", assistant_attachments=[{
+                "type": "file", "filename": "bild.png",
+                "content": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB"}])
+            with store.database.connect() as connection:
+                connection.execute("""INSERT INTO conversation_assets
+                    (id,conversation_id,message_id,media_type,filename,byte_size,sha256,ordinal,created_at,metadata_json)
+                    SELECT 'historical-duplicate',conversation_id,message_id,media_type,filename,byte_size,sha256,
+                           ordinal+1,created_at,metadata_json FROM conversation_assets WHERE message_id=?""", (assistant["id"],))
+            self.assertEqual(1, len(store.messages(cid)["messages"][1]["attachments"]))
+            with store.database.connect() as connection:
+                self.assertEqual(2, connection.execute("SELECT count(*) FROM conversation_assets").fetchone()[0])

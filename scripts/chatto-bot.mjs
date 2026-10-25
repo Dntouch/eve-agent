@@ -7,7 +7,7 @@ import { ChattoState, handleMessage, adoptRoomConversation } from './chatto-stat
 import { selectRoute, scopeForRoute } from './chatto-routing.mjs';
 import { loadImages } from './chatto-images.mjs';
 import { createBotPresence } from './chatto-presence.mjs';
-import { postAnswer } from './chatto-output.mjs';
+import { postAnswer, postScheduledAnswer } from './chatto-output.mjs';
 import { threadProgress } from './chatto-progress.mjs';
 
 process.umask(0o077);
@@ -62,6 +62,7 @@ const server = client.connect({ serverUrl, apiKey: process.env.EVE_CHATTO_BOT_KE
 const controller = new AbortController();
 let presence;
 let roomRefreshTimer;
+let deliveryTimer;
 for (const event of ['SIGINT', 'SIGTERM']) process.on(event, () => { controller.abort(); });
 status('connecting');
 try {
@@ -87,12 +88,38 @@ try {
         if (!page.page?.hasMore) break;
       }
       statusData.rooms = rooms;
+      await eve('/api/chatto/output-rooms', { rooms }, controller.signal);
       const currentStatus = JSON.parse(readFileSync(resolve(directory, 'status.json'), 'utf8'));
       status(currentStatus.state);
     } finally { refreshing = false; }
   }
   await refreshRooms();
   roomRefreshTimer = setInterval(() => refreshRooms().catch(() => {}), 30000);
+  let delivering = false;
+  async function deliverScheduled() {
+    if (delivering || controller.signal.aborted) return;
+    delivering = true;
+    try {
+      const batch = await eve('/api/chatto/deliveries', {}, controller.signal);
+      for (const delivery of batch.deliveries) {
+        let dispatched = false;
+        try {
+          config = JSON.parse(readFileSync(effectivePath, 'utf8')).chatto;
+          await postScheduledAnswer({
+            config, serverUrl, viewerId, ownerId, target: delivery.target, payload: delivery.payload,
+            userApi: server.service(UserService), roomApi: server.service(RoomDirectoryService),
+            messageApi: server.service(MessageService), uploadApi: server.service(AssetUploadService),
+            signal: controller.signal, onDispatch: () => { dispatched = true; },
+          });
+          await eve('/api/chatto/delivery-ack', { id: delivery.id, status: 'delivered' }, controller.signal);
+        } catch {
+          await eve('/api/chatto/delivery-ack', { id: delivery.id, status: dispatched ? 'uncertain' : 'blocked',
+            error: dispatched ? 'Send outcome uncertain' : 'Destination validation failed' }, controller.signal);
+        }
+      }
+    } finally { delivering = false; }
+  }
+  deliveryTimer = setInterval(() => deliverScheduled().catch(() => {}), 3000);
   console.log('EVE bot connected. Configured DMs and channels enabled.');
   await server.consumeEvents({
     signal: controller.signal,
@@ -179,4 +206,4 @@ try {
   status('connection_failed');
   console.error('Chatto connection stopped or setup failed.');
   process.exitCode = controller.signal.aborted ? 0 : 1;
-} finally { clearInterval(roomRefreshTimer); await presence?.stop(); client.close(); state.close(); status('stopped'); }
+} finally { clearInterval(deliveryTimer); clearInterval(roomRefreshTimer); await presence?.stop(); client.close(); state.close(); status('stopped'); }

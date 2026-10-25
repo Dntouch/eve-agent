@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 import uuid
 import threading
 
-from .transport_access import transport_access, PUBLIC_CAPABILITIES, update_transport_metadata
+from .transport_access import transport_access, PUBLIC_CAPABILITIES, update_transport_metadata, transport_metadata
 from .memory import redact_sensitive
 
 
@@ -19,8 +19,66 @@ class ChattoAPI:
     def __init__(self, config, conversations, message_handler, learning_activity=None):
         self.config, self.conversations, self.message_handler = config, conversations, message_handler
         self.learning_activity = learning_activity
+        self.scheduler = None
+        self.output_rooms = []
         self.activities = {}
         self.activity_lock = threading.RLock()
+
+    def output_targets(self):
+        context = transport_metadata()
+        # Public callers can address only their verified current room/thread.
+        if context and context.get("access_profile") != "owner_dm":
+            return []
+        with self.conversations.database.connect() as connection:
+            local_rows = connection.execute("SELECT id,title FROM conversations WHERE source!='chatto' AND status!='deleted'").fetchall()
+        local_targets = [{"id": "eve:conversation:" + row["id"], "name": "EVE · " + row["title"],
+                          "transport": "eve", "conversation_id": row["id"]} for row in local_rows]
+        if not self.config.get("enabled"):
+            return local_targets
+        targets = local_targets + [{"id": "chatto:room:" + room["id"], "name": "Chatto · " + room["name"],
+                    "transport": "chatto", "server_url": self.config["server_url"],
+                    "room_id": room["id"], "room_kind": "channel"}
+                   for room in self.output_rooms if room["id"] in self.config["channel_ids"]]
+        with self.conversations.database.connect() as connection:
+            rows = connection.execute("SELECT id,title,metadata_json FROM conversations WHERE source='chatto' AND status!='deleted'").fetchall()
+        for row in rows:
+            scope = json.loads(row["metadata_json"] or "{}").get("chatto_scope", {})
+            if scope.get("server_url") != self.config["server_url"]:
+                continue
+            if scope.get("access_profile") == "public_channel" and scope.get("room_id") not in self.config["channel_ids"]:
+                continue
+            if scope.get("access_profile") == "owner_dm" and not self.config.get("owner_dm_enabled"):
+                continue
+            if scope.get("access_profile") == "member_dm" and not self.config.get("member_dm_enabled"):
+                continue
+            targets.append({**scope, "id": "chatto:conversation:" + row["id"], "name": row["title"],
+                            "transport": "chatto", "conversation_id": row["id"]})
+        return targets
+
+    def deliveries(self, payload):
+        if self.scheduler is None:
+            return {"deliveries": []}
+        return {"deliveries": self.scheduler.claim_deliveries()}
+
+    def delivery_ack(self, payload):
+        self.scheduler.acknowledge_delivery(payload["id"], payload["status"], payload.get("error"))
+        return {"ok": True}
+
+    def register_output_rooms(self, payload):
+        rooms = payload.get("rooms")
+        if not isinstance(rooms, list) or len(rooms) > 10000:
+            raise ValueError("Invalid rooms")
+        self.output_rooms = [{"id": room["id"], "name": room["name"]} for room in rooms
+                             if isinstance(room.get("id"), str) and isinstance(room.get("name"), str)]
+        return {"ok": True}
+
+    def scheduled_access(self, context):
+        clean = self._context({"context": context})
+        if context.get("mcp_session_id"):
+            clean["mcp_session_id"] = context["mcp_session_id"]
+        allowed = (PUBLIC_CAPABILITIES if clean["access_profile"] == "member_dm"
+                   else self.config["channel_capabilities"])
+        return transport_access(clean, public=clean["access_profile"] != "owner_dm", allowed_capabilities=allowed)
 
     def configure(self, config):
         self.config = deepcopy(config)

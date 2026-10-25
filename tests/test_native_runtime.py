@@ -193,6 +193,19 @@ class NativeRuntimeTest(unittest.TestCase):
         self.assertEqual(inbox.groups()["total_count"], 1)
         self.llm.request_tool_turn.assert_not_called()
 
+    def test_image_service_contract_and_result_bind_to_current_conversation(self):
+        provider = Mock()
+        provider.minimal_contract.return_value = {"description": "Images", "operations": {}}
+        resource = {"type": "file", "filename": "image.png", "content": "data:image/png;base64,YQ=="}
+        provider.execute_operation.return_value = {"status": "completed", "resources": [resource]}
+        self.agent.image_generation = provider
+        self.agent.conversation_id = "image-conversation"
+        self.assertIn("image_generation", self.runtime._capabilities())
+        result, _ = self.runtime._execute_direct("image_generation", "status", {"job_id": "a" * 32}, {}, [])
+        provider.execute_operation.assert_called_once_with("status", {"job_id": "a" * 32}, conversation_id="image-conversation")
+        self.assertEqual([resource], self.agent._presentation_resources)
+        self.assertEqual("completed", result["status"])
+
     def test_structured_memory_tool_is_published_and_returns_completeness(self):
         self.llm.request_tool_turn.side_effect = [
             {"content": "", "tool_calls": [{"id": "load", "name": "eve__load_capabilities",

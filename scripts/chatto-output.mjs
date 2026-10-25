@@ -1,3 +1,4 @@
+import { selectRoute } from './chatto-routing.mjs';
 import { createHash } from 'node:crypto';
 
 const TYPES = { 'image/jpeg': 'jpg', 'image/png': 'png', 'image/webp': 'webp', 'image/gif': 'gif' };
@@ -62,4 +63,27 @@ export async function postAnswer(uploadApi, messageApi, destination, text, resou
     ids.push(response.message.id);
   }
   return { ids };
+}
+
+// Validate the current destination independently of any triggering message.
+export async function postScheduledAnswer({ config, serverUrl, viewerId, ownerId, target, payload,
+  userApi, roomApi, messageApi, uploadApi, signal, onDispatch }) {
+  if (!config.enabled || target.server_url !== serverUrl || (target.bot_id && target.bot_id !== viewerId)) throw new Error('Destination configuration changed');
+  const options = { signal, timeoutMs: 10000 };
+  const currentBot = await userApi.getUser({ target: { case: 'userId', value: viewerId } }, options);
+  if (currentBot.user?.user?.bot?.ownerUserId !== config.owner_user_id) throw new Error('Bot ownership changed');
+  const { room } = await roomApi.getRoom({ roomId: target.room_id }, options);
+  if (!room) throw new Error('Destination unavailable');
+  const probe = { body: '', authorId: target.sender_id || ownerId, roomId: target.room_id, reasons: ['mention'], threadRootId: target.thread_root_id };
+  if (!selectRoute(config, viewerId, ownerId, room, probe)) throw new Error('Destination no longer enabled');
+  const permissions = new Set((room.viewerState?.permissions || []).filter(p => p.granted).map(p => p.permission));
+  if (!(permissions.has('message.read') || permissions.has('message.read-interactions')) ||
+      !(target.thread_root_id ? ['message.post', 'message.post-in-thread', 'message.post-in-interactions'].some(p => permissions.has(p)) : permissions.has('message.post'))) throw new Error('Destination permissions missing');
+  if (target.thread_root_id) {
+    const root = await messageApi.getMessage({ roomId: target.room_id, eventId: target.thread_root_id }, options);
+    if (!root.message || root.message.deletedAt || root.message.roomId !== target.room_id || root.message.id !== target.thread_root_id) throw new Error('Destination thread unavailable');
+  }
+  onDispatch();
+  return postAnswer(uploadApi, messageApi, { roomId: target.room_id, threadRootId: target.thread_root_id || '' },
+    payload.notification.message, payload.resources || [], signal);
 }

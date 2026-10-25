@@ -263,6 +263,30 @@ class ChattoTest(unittest.TestCase):
         self.assertEqual(error.exception.code, 400)
         error.exception.close()
 
+    def test_scheduled_context_restores_current_restrictions(self):
+        with self.api.scheduled_access(self.context):
+            self.assertFalse(capability_allowed('shell'))
+            self.assertEqual(transport_metadata()['room_id'], 'general')
+        self.assertIsNone(transport_metadata())
+        self.api.configure({**self.config, 'channel_ids': []})
+        with self.assertRaises(PermissionError):
+            self.api.scheduled_access(self.context)
+
+    def test_output_targets_use_discovered_ids_and_respect_caller_scope(self):
+        self.api.register_output_rooms({'rooms': [{'id': 'general', 'name': 'Allgemein'},
+                                                   {'id': 'other', 'name': 'Anderer Raum'}]})
+        local = self.store.create('Lokales Ziel')
+        self.api.create_conversation({'context': {**self.context, 'thread_root_id': 'thread'}})
+        targets = self.api.output_targets()
+        self.assertTrue(any(t['id'] == 'chatto:room:general' for t in targets))
+        self.assertFalse(any(t.get('room_id') == 'other' for t in targets))
+        self.assertTrue(any(t.get('thread_root_id') == 'thread' for t in targets))
+        self.assertTrue(any(t['id'] == 'eve:conversation:' + local['id'] for t in targets))
+        with self.api.scheduled_access(self.context):
+            self.assertEqual(self.api.output_targets(), [])
+        self.api.configure({**self.config, 'channel_ids': []})
+        self.assertFalse(any(t.get('transport') == 'chatto' for t in self.api.output_targets()))
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)

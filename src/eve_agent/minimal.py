@@ -265,6 +265,7 @@ class NativeToolRuntime:
             ("local_files", a.local_files),
             ("scheduled_tasks", a.reminders),
             ("network", a.network_tools),
+            ("image_generation", getattr(a, "image_generation", None)),
             ("nova", a.nova_maintenance),
         ):
             contract = getattr(provider, "minimal_contract", None)
@@ -744,6 +745,10 @@ class NativeToolRuntime:
             a.last_sources = deepcopy(result.get("sources", []))
             a._presentation_resources.extend(deepcopy(result.get("resources", [])))
             return result, Route.WEB
+        if capability == "image_generation":
+            result = a.image_generation.execute_operation(operation, parameters, conversation_id=a.conversation_id)
+            a._presentation_resources.extend(deepcopy(result.get("resources", [])))
+            return result, Route.CHAT
         if capability == "shell":
             return a.shell.execute_native_operation(operation, parameters), Route.SHELL
         if capability == "wayland_computer":

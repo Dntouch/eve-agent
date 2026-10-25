@@ -163,3 +163,40 @@ EVE-Verlauf. Der sichtbare Arbeitsstatus in Threads lässt sich im Chatto-Abschn
 aktivieren. Eine stabile `EVE-<UUID>`-Referenz
 verbindet den Thread technisch mit den Herkunftsdaten für das Memory-Lernen.
 Die Bedeutung und fachlichen Beziehungen bestimmt weiterhin das Modell.
+
+## Geplante Aufgaben und Ausgabeziele
+
+Geplante Aufgaben besitzen ein strukturiertes `output_target` unabhängig vom
+Herkunftsgespräch und dem gespeicherten `execution_context`. `scheduled_tasks`
+veröffentlicht `list_output_targets`; `create` und `update` akzeptieren
+`output_target_id`. Ohne Auswahl gilt `current`: das aktuelle EVE-Gespräch oder
+der verifizierte Chatto-Raum einschließlich Thread. Verfügbare Ziele werden aus
+lokalen Gesprächen, den vom Bot entdeckten freigegebenen Channels und bekannten
+Chatto-Gesprächen/Threads gebildet. Raumbezeichnungen werden nicht in Python aus
+dem Auftrag herausinterpretiert. Die Entscheidung trifft das Modell anhand der
+veröffentlichten Ressourcen und ihrer Referenzen.
+
+Der lokale Benutzer und Owner-DMs können andere verfügbare Ziele wählen.
+Öffentliche Channels und Member-DMs bleiben auf ihr aktuelles Gespräch begrenzt
+und können keine Aufgaben anderer Gespräche lesen oder umleiten. Bei geplanten
+Chatto-Turns werden die aktuellen Capability-Freigaben des Herkunftskontexts
+wiederhergestellt; ein Ausgabeziel verleiht keine zusätzlichen Werkzeugrechte.
+
+Chatto-Ergebnisse einschließlich Anhängen landen nach Ausführung in einer
+persistenten Zustellwarteschlange (`scheduled_deliveries`). Der Bot holt sie
+über die ausschließlich mit dem Bridge-Token zugänglichen Endpunkte ab und
+prüft vor Versand die aktuelle Konfiguration, Bot-Eigentümerschaft,
+Raummitgliedschaft, Lese-/Schreibrechte und gegebenenfalls den Zielthread.
+Ein offener Browser ist dafür nicht erforderlich. Der Auftrag bestimmt weiterhin,
+welche Ergebnisse und Änderungen EVE melden soll; die Zustellung vergleicht keine
+Nachrichtentexte und baut keine eigene inhaltliche Benachrichtigungslogik ein.
+
+`list_deliveries(task_id)` zeigt Zustellstatus und Fehler. Mit
+`retry_delivery(task_id, delivery_id)` lässt sich eine vor dem Versand blockierte
+Zustellung erneut anstoßen, ohne den Task erneut auszuführen. Nach einem
+möglicherweise begonnenen Versand lautet der Status `uncertain`; nach einem
+Abbruch ohne Bestätigung kann `sending` verbleiben. Solche Zustellungen werden
+zur Vermeidung doppelter Nachrichten nicht automatisch wiederholt.
+Bereits bestehende Aufgaben ohne Ausgabeziel behalten ihre lokale Zustellung;
+ein Ziel lässt sich nachträglich setzen. Ein Neustart von EVE samt Bot lädt die
+Erweiterung. Für die Tests ist kein Versand an einen echten Chatto-Server nötig.

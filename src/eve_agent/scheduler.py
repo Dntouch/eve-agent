@@ -12,6 +12,7 @@ from typing import Callable
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .memory import redact_sensitive
+from .transport_access import transport_metadata
 
 
 def _utc_iso(value: datetime) -> str:
@@ -59,6 +60,11 @@ class ScheduledTasks:
         self.conversation_id: str | None = None
         self._monitor_thread: threading.Thread | None = None
         self._stop = threading.Event()
+        self.output_targets_provider = lambda: []
+        with self.database.connect() as connection:
+            connection.execute("""CREATE TABLE IF NOT EXISTS scheduled_deliveries (
+                id TEXT PRIMARY KEY, target_json TEXT NOT NULL, payload_json TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending', error TEXT, updated_at TEXT NOT NULL)""")
         if start_monitor:
             self.start()
 
@@ -100,13 +106,19 @@ class ScheduledTasks:
                 }},
             },
         }
+        targets = [{"id": "current", "name": "Current conversation"}] + self.output_targets_provider()
+        target_schema = {"type": "string", "enum": [t["id"] for t in targets],
+                         "description": "Output destination; omitted means current conversation."}
         task_ids = [item["id"] for item in self.list_tasks(include_finished=True)]
         task_id_schema = {"type": "string"}
         if task_ids:
             task_id_schema["enum"] = task_ids
         return {
             "description": "Future and recurring EVE turns: create, inspect, pause, change or delete schedules.",
+            "output_targets": targets,
             "operations": {
+                "list_output_targets": {"effect": "read", "parameters_schema": {
+                    "type": "object", "additionalProperties": False, "properties": {}}},
                 "create": {"effect": "write", "description": (
                     "Store the instruction EVE shall execute later. delay is one-shot; interval repeats. "
                     "once uses schedule.at; delay uses seconds; interval uses seconds and optional first_at; "
@@ -114,6 +126,7 @@ class ScheduledTasks:
                 ), "parameters_schema": {
                     "type": "object", "additionalProperties": False,
                     "properties": {
+                        "output_target_id": target_schema,
                         "request": {"type": "string", "minLength": 1},
                         "name": {"type": "string", "minLength": 1},
                         "schedule_type": {"enum": ["once", "delay", "interval", "daily", "weekly"]},
@@ -130,6 +143,13 @@ class ScheduledTasks:
                     "type": "object", "additionalProperties": False,
                     "properties": {"task_id": task_id_schema}, "required": ["task_id"],
                 }},
+                "list_deliveries": {"effect": "read", "parameters_schema": {
+                    "type": "object", "additionalProperties": False,
+                    "properties": {"task_id": task_id_schema}, "required": ["task_id"]}},
+                "retry_delivery": {"effect": "write", "description": "Retry a blocked delivery without executing the task again. Uncertain sends cannot be retried automatically.",
+                    "parameters_schema": {"type": "object", "additionalProperties": False,
+                    "properties": {"task_id": task_id_schema, "delivery_id": {"type": "string"}},
+                    "required": ["task_id", "delivery_id"]}},
                 "list_runs": {"effect": "read", "parameters_schema": {
                     "type": "object", "additionalProperties": False,
                     "properties": {"task_id": task_id_schema, "limit": {"type": "integer", "minimum": 1}},
@@ -141,6 +161,7 @@ class ScheduledTasks:
                         "task_id": task_id_schema,
                         "changes": {"type": "object", "additionalProperties": False, "properties": {
                             "name": {"type": "string", "minLength": 1},
+                            "output_target_id": target_schema,
                             "request": {"type": "string", "minLength": 1},
                             "status": {"enum": ["active", "paused"]},
                             "schedule_type": {"enum": ["once", "delay", "interval", "daily", "weekly"]},
@@ -158,13 +179,15 @@ class ScheduledTasks:
             "current_time": datetime.now().astimezone().isoformat(),
             "local_timezone": _local_timezone_name(),
             "tasks": [{"id": item["id"], "name": item["name"], "status": item["status"],
-                       "next_run_at": item["next_run_at"], "request": item["action"].get("request") or item["action"].get("message")}
+                       "next_run_at": item["next_run_at"], "output_target": item["action"].get("output_target"), "request": item["action"].get("request") or item["action"].get("message")}
                       for item in self.list_tasks(include_finished=False)],
         }
 
     def execute_operation(self, operation: str, arguments: dict, *, conversation_id: str | None = None) -> dict:
         if not isinstance(arguments, dict):
             raise ValueError("Scheduler-Argumente müssen ein Objekt sein")
+        if operation == "list_output_targets":
+            return {"status": "completed", "result": [{"id": "current", "name": "Current conversation"}] + self.output_targets_provider()}
         published = {item["id"] for item in self.list_tasks(include_finished=False)}
         if operation == "list":
             tasks = self.list_tasks(include_finished=bool(arguments.get("include_finished", False)))
@@ -183,6 +206,8 @@ class ScheduledTasks:
             action = {
                 "tool": "eve_turn", "request": request, "conversation_id": conversation_id or self.conversation_id,
                 "task_id": task_id, "name": name,
+                "execution_context": transport_metadata(),
+                "output_target": self.resolve_output_target(arguments.get("output_target_id", "current"), conversation_id or self.conversation_id),
             }
             metadata = {"origin": "eve_native_schedule"}
             with self.database.connect() as connection:
@@ -201,6 +226,17 @@ class ScheduledTasks:
             return {"status": "created", "result": task}
         if operation == "get":
             return {"status": "completed", "result": self.get_task(arguments.get("task_id"))}
+        if operation in {"list_deliveries", "retry_delivery"}:
+            self.get_task(arguments.get("task_id"))
+            with self.database.connect() as connection:
+                rows = connection.execute("SELECT id,status,error,updated_at FROM scheduled_deliveries WHERE json_extract(payload_json, '$.notification.task_id')=?",
+                                          (arguments["task_id"],)).fetchall()
+                if operation == "list_deliveries":
+                    return {"status": "completed", "result": [dict(row) for row in rows]}
+                if not any(row["id"] == arguments["delivery_id"] and row["status"] == "blocked" for row in rows):
+                    raise ValueError("Nur blockierte Zustellungen können erneut versucht werden")
+                connection.execute("UPDATE scheduled_deliveries SET status='pending',error=NULL WHERE id=? AND status='blocked'", (arguments["delivery_id"],))
+            return {"status": "updated", "result": {"delivery_id": arguments["delivery_id"], "status": "pending"}}
         if operation == "list_runs":
             return {"status": "completed", "result": self.list_runs(
                 arguments.get("task_id"), limit=arguments.get("limit", 20),
@@ -216,6 +252,31 @@ class ScheduledTasks:
             self.delete_task(task_id)
             return {"status": "deleted", "result": task}
         raise ValueError("Nicht veröffentlichte Scheduler-Operation")
+
+    def resolve_output_target(self, identifier, conversation_id):
+        if identifier == "current":
+            context = transport_metadata()
+            return ({"transport": "chatto", **context} if context else
+                    {"transport": "eve", "conversation_id": conversation_id})
+        for target in self.output_targets_provider():
+            if target["id"] == identifier:
+                return dict(target)
+        raise ValueError("Unbekanntes oder nicht erlaubtes Ausgabeziel")
+
+    def claim_deliveries(self):
+        with self._lock, self.database.connect() as connection:
+            rows = connection.execute("""UPDATE scheduled_deliveries SET status='sending', updated_at=?
+                WHERE id IN (SELECT id FROM scheduled_deliveries WHERE status='pending' ORDER BY updated_at LIMIT 10)
+                RETURNING *""", (_utc_iso(datetime.now(timezone.utc)),)).fetchall()
+        return [{"id": row["id"], "target": json.loads(row["target_json"]),
+                 "payload": json.loads(row["payload_json"])} for row in rows]
+
+    def acknowledge_delivery(self, identifier, status, error=None):
+        if status not in {"delivered", "blocked", "uncertain"}:
+            raise ValueError("Invalid delivery status")
+        with self.database.connect() as connection:
+            connection.execute("UPDATE scheduled_deliveries SET status=?, error=?, updated_at=? WHERE id=? AND status='sending'",
+                               (status, redact_sensitive(str(error or ""))[:500], _utc_iso(datetime.now(timezone.utc)), identifier))
 
     def register_executor(self, tool: str, executor: Callable[[dict], dict]) -> None:
         if not re.fullmatch(r"[a-z][a-z0-9_]{0,63}", tool):
@@ -234,7 +295,18 @@ class ScheduledTasks:
             parameters = (max(int(limit), 1),)
         with self.database.connect() as connection:
             rows = connection.execute(sql, parameters).fetchall()
-        return [self._task_dict(row) for row in rows]
+        return [self._task_dict(row) for row in rows if self._task_accessible(self._task_dict(row))]
+
+    @staticmethod
+    def _task_accessible(task):
+        context = transport_metadata()
+        if not context or context.get("access_profile") == "owner_dm":
+            return True
+        origin = task["action"].get("execution_context") or {}
+        keys = ["server_url", "bot_id", "room_id", "thread_root_id", "access_profile"]
+        if context.get("access_profile") == "member_dm":
+            keys.append("sender_id")
+        return all(origin.get(key) == context.get(key) for key in keys)
 
     def get_task(self, task_id: str) -> dict:
         with self.database.connect() as connection:
@@ -243,7 +315,10 @@ class ScheduledTasks:
             ).fetchone()
         if row is None:
             raise KeyError("Geplante Aufgabe wurde nicht gefunden")
-        return self._task_dict(row)
+        task = self._task_dict(row)
+        if not self._task_accessible(task):
+            raise PermissionError("Aufgabe gehört zu einem anderen Gespräch")
+        return task
 
     def list_runs(self, task_id: str, *, limit: int = 20) -> list[dict]:
         self.get_task(task_id)
@@ -262,9 +337,10 @@ class ScheduledTasks:
         } for row in rows]
 
     def update_task(self, task_id: str, changes: dict) -> dict:
+        self.get_task(task_id)
         if not isinstance(changes, dict):
             raise ValueError("Änderungen müssen ein Objekt sein")
-        allowed = {"name", "message", "request", "status", "next_run_at", "schedule_type", "schedule", "timezone"}
+        allowed = {"name", "message", "request", "status", "next_run_at", "schedule_type", "schedule", "timezone", "output_target_id"}
         if set(changes) - allowed:
             raise ValueError("Unbekanntes Aufgabenfeld")
         with self._lock, self.database.connect() as connection:
@@ -278,6 +354,8 @@ class ScheduledTasks:
                 raise ValueError("Der Aufgabenname muss zwischen 1 und 120 Zeichen lang sein")
             action = json.loads(row["action_json"])
             metadata = json.loads(row["metadata_json"])
+            if "output_target_id" in changes:
+                action["output_target"] = self.resolve_output_target(changes["output_target_id"], row["conversation_id"])
             request_change = changes.get("request", changes.get("message"))
             if request_change is not None:
                 request = redact_sensitive(str(request_change).strip())
@@ -368,6 +446,7 @@ class ScheduledTasks:
         return cls._next_weekly(schedule, now)
 
     def delete_task(self, task_id: str) -> None:
+        self.get_task(task_id)
         with self._lock, self.database.connect() as connection:
             row = connection.execute(
                 "SELECT id, conversation_id FROM scheduled_tasks WHERE id=? AND status!='deleted'", (str(task_id),)
@@ -462,6 +541,12 @@ class ScheduledTasks:
                 if tool not in self._executors:
                     raise RuntimeError(f"Kein Executor für {tool}")
                 result = self._executors[tool](action)
+                target = action.get("output_target")
+                if target and target.get("transport") == "chatto" and result.get("notification"):
+                    with self.database.connect() as connection:
+                        connection.execute("INSERT INTO scheduled_deliveries VALUES (?, ?, ?, 'pending', NULL, ?)",
+                            (run_id, json.dumps(target), json.dumps(result, ensure_ascii=False), _utc_iso(datetime.now(timezone.utc))))
+                    result["notification"]["delivered"] = True
                 self._finish(row, run_id, result=result)
             except sqlite3.IntegrityError:
                 # The unique idempotency key means another scheduler tick has

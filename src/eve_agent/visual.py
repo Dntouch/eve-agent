@@ -1361,7 +1361,13 @@ class VisualServer:
                     if not isinstance(payload, dict):
                         raise ValueError("JSON object required")
                     path = self.path.split("?", 1)[0]
-                    if path == "/api/chatto/conversations":
+                    if path == "/api/chatto/output-rooms":
+                        self._json(200, handle_chatto.register_output_rooms(payload))
+                    elif path == "/api/chatto/deliveries":
+                        self._json(200, handle_chatto.deliveries(payload))
+                    elif path == "/api/chatto/delivery-ack":
+                        self._json(200, handle_chatto.delivery_ack(payload))
+                    elif path == "/api/chatto/conversations":
                         self._json(201, handle_chatto.create_conversation(payload))
                     elif path == "/api/chatto/conversation":
                         self._validate_images(payload.get("images", []))

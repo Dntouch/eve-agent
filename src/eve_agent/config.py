@@ -78,6 +78,7 @@ DEFAULTS: dict[str, Any] = {
     },
     "nova_maintenance": {"enabled": False, "command": "codex", "transport": "isolated", "shared_chat_socket": "", "shared_chat_timeout_seconds": 900, "bwrap_command": "bwrap", "timeout_seconds": 180, "verification_timeout_seconds": 180, "pending_ttl_seconds": 600, "require_process_isolation": True, "max_context_records": 20, "max_jobs": 20},
     "web": {"enabled": False, "searxng_url": "http://127.0.0.1:8888", "image_results": 4, "timeout_seconds": 12},
+    "image_generation": {"enabled": False, "api_format": "sdapi", "base_url": "http://127.0.0.1:1235", "api_key": "", "model": "", "width": 1024, "height": 1024, "steps": 4, "guidance_scale": 1.0, "timeout_seconds": 3600, "extra_parameters": {}},
     "home_assistant": {"enabled": False, "url": "", "token": "", "language": "de", "timeout_seconds": 12},
     "network_tools": {"enabled": False, "subnet": "192.168.0.0/16", "image": "docker.io/instrumentisto/nmap:latest", "timeout_seconds": 35},
     "storage": {"data_path": "data/assets", "cache_path": "runtime/cache"},
@@ -90,6 +91,7 @@ DEFAULTS: dict[str, Any] = {
 
 
 ENVIRONMENT_FIELDS: dict[str, tuple[str, str]] = {
+    "EVE_IMAGE_API_KEY": ("image_generation", "api_key"),
     "EVE_CHATTO_BOT_KEY": ("chatto", "api_key"),
     "EVE_ASSIST_TOKEN": ("assist_api", "token"),
     "EVE_LLM_BASE_URL": ("llm", "base_url"), "EVE_LLM_MODEL": ("llm", "model"),
@@ -101,6 +103,7 @@ ENVIRONMENT_FIELDS: dict[str, tuple[str, str]] = {
 }
 
 UI_SECTIONS = (
+    ("image_generation", "Bildgenerierung"),
     ("chatto", "Chatto"),
     ("assist_api", "Home Assistant Assist"),
     ("conversation_learning", "Lernen aus Gesprächen"),
@@ -118,6 +121,16 @@ UI_SECTIONS = (
 # This is both the API allowlist and the rendering description. The browser
 # never needs to duplicate defaults, validation rules, or config paths.
 UI_FIELDS: dict[str, dict[str, Any]] = {
+    "image_generation.enabled": {"label": "Bildgenerierung aktiviert", "type": "boolean", "description": "Separaten Bildserver anbinden. Änderungen nach EVE-Neustart wirksam."},
+    "image_generation.api_format": {"label": "API-Format", "type": "select", "options": ["sdapi", "openai"], "description": "sdapi: /sdapi/v1/txt2img; openai: /images/generations relativ zur Basis-URL."},
+    "image_generation.base_url": {"label": "Bildserver", "type": "text", "description": "Zum Beispiel http://127.0.0.1:1235 für sdapi; bei OpenAI-kompatiblen Servern gegebenenfalls /v1 anhängen. CPU/GPU wird am Bildserver eingestellt."},
+    "image_generation.model": {"label": "Modell", "type": "text", "description": "Modellname für OpenAI-kompatible APIs. sdapi verwendet das am Server geladene Modell."},
+    "image_generation.width": {"label": "Bildbreite", "type": "integer", "min": 64, "max": 4096, "description": "Standard in Pixeln; Vielfaches von 64. Größenangaben im Chat gelten nur für den jeweiligen Auftrag."},
+    "image_generation.height": {"label": "Bildhöhe", "type": "integer", "min": 64, "max": 4096, "description": "Standard in Pixeln; Vielfaches von 64. Größenangaben im Chat gelten nur für den jeweiligen Auftrag."},
+    "image_generation.steps": {"label": "Schritte", "type": "integer", "min": 1, "max": 150, "description": "Sampling-Schritte für sdapi."},
+    "image_generation.guidance_scale": {"label": "Guidance", "type": "number", "min": 0, "max": 30, "step": 0.1, "description": "CFG-Skala für sdapi; modellabhängig."},
+    "image_generation.timeout_seconds": {"label": "Zeitlimit (Sekunden)", "type": "integer", "min": 10, "max": 86400, "description": "Auch lange CPU-Aufträge laufen im Hintergrund. Status und fertiges Bild im Gespräch abrufen; keine automatische Fertigmeldung."},
+    "image_generation.extra_parameters": {"label": "Zusätzliche Serverparameter", "type": "json", "description": "JSON-Objekt, etwa sampler_name oder seed. Nur Parameter verwenden, die der Bildserver unterstützt. Änderungen nach EVE-Neustart."},
     "mcp.max_sessions": {"label": "Maximale Sitzungen", "type": "integer", "min": 1, "max": 64, "description": "Maximal gleichzeitig gestartete externe MCP-Prozesse. Kein automatisches Verwerfen ungespeicherter Sitzungen; nach Neustart wirksam."},
     "mcp.servers": {"label": "MCP-Server", "type": "json", "description": "Server als JSON: command, args, env, cwd, scope (conversation/shared), timeout_seconds, description, attachment_roots. Platzhalter: {root}, {workspace}. Änderungen nach Neustart. Zugangsdaten über die Prozessumgebung setzen. Siehe docs/MCP.md."},
     "chatto.enabled": {"label": "Chatto aktiviert", "type": "boolean", "description": "Bot zusammen mit EVE starten und stoppen. Änderungen werden beim Speichern übernommen; EVE läuft weiter."},
@@ -338,6 +351,7 @@ UI_FIELDS: dict[str, dict[str, Any]] = {
 }
 
 UI_SECRETS = {
+    "image_generation.api_key": {"label": "Bildserver-Schlüssel", "environment": "EVE_IMAGE_API_KEY", "description": "Optional. Privat in .env gespeichert; für lokale Server meist leer."},
     "chatto.api_key": {"label": "Bot-Schlüssel", "environment": "EVE_CHATTO_BOT_KEY", "description": "Hier setzen oder ersetzen. Speicherung privat in .env; der hinterlegte Wert wird nicht angezeigt."},
     "assist_api.token": {"label": "Assist-Token", "environment": "EVE_ASSIST_TOKEN", "description": "Separater Zugriffstoken für Home Assistant."},
 
@@ -415,6 +429,29 @@ def _resolve_path(root: Path, value: Any, label: str) -> str:
 
 
 def _validate(root: Path, config: dict[str, Any]) -> None:
+    image = config["image_generation"]
+    if not isinstance(image, dict) or not isinstance(image.get("enabled"), bool):
+        raise ConfigError("image_generation.enabled muss boolesch sein")
+    if not isinstance(image.get("api_format"), str) or image["api_format"] not in {"sdapi", "openai"}:
+        raise ConfigError("image_generation.api_format muss sdapi oder openai sein")
+    image["base_url"] = _url(image.get("base_url"), "image_generation.base_url")
+    parsed_image = urlparse(image["base_url"])
+    if parsed_image.username or parsed_image.password or parsed_image.query or parsed_image.fragment:
+        raise ConfigError("image_generation.base_url darf keine Zugangsdaten, Query oder Fragment enthalten")
+    for key in ("model", "api_key"):
+        if not isinstance(image.get(key), str) or any(c in image[key] for c in "\x00\r\n"):
+            raise ConfigError("image_generation." + key + " ist ungültig")
+    for key, low, high in (("width", 64, 4096), ("height", 64, 4096), ("steps", 1, 150), ("timeout_seconds", 10, 86400)):
+        _integer(image, key, low, high, "image_generation." + key)
+    if image["width"] % 64 or image["height"] % 64:
+        raise ConfigError("Bildmaße müssen Vielfache von 64 sein")
+    guidance = image.get("guidance_scale")
+    if isinstance(guidance, bool) or not isinstance(guidance, (float, int)) or not 0 <= guidance <= 30:
+        raise ConfigError("image_generation.guidance_scale muss zwischen 0 und 30 liegen")
+    if not isinstance(image.get("extra_parameters"), dict):
+        raise ConfigError("image_generation.extra_parameters muss ein JSON-Objekt sein")
+    if set(image["extra_parameters"]) & {"prompt", "n", "n_iter", "batch_size", "response_format", "width", "height", "size", "model", "steps", "cfg_scale"}:
+        raise ConfigError("Zusätzliche Bildparameter dürfen die Standardfelder nicht überschreiben")
     chatto = config["chatto"]
     if not isinstance(chatto, dict):
         raise ConfigError("chatto muss ein Objekt sein")
@@ -435,7 +472,7 @@ def _validate(root: Path, config: dict[str, Any]) -> None:
     for key in ("channel_ids", "channel_capabilities", "channel_learning_ids"):
         if not isinstance(chatto.get(key), list) or any(not isinstance(v, str) or not v.strip() or len(v) > 128 for v in chatto[key]):
             raise ConfigError("chatto." + key + " muss eine Liste nichtleerer Zeichenketten sein")
-    known_capabilities = {"memory", "semantic_learning", "working_memory", "web", "clock", "calculator", "home_assistant", "home_assistant_inventory", "local_search", "local_files", "shell", "nova", "wayland_computer", "network", "scheduled_tasks", "work_tasks", "assist_events", "presentation"}
+    known_capabilities = {"memory", "semantic_learning", "working_memory", "web", "image_generation", "clock", "calculator", "home_assistant", "home_assistant_inventory", "local_search", "local_files", "shell", "nova", "wayland_computer", "network", "scheduled_tasks", "work_tasks", "assist_events", "presentation"}
     from .external_mcp import validate_servers
     if not isinstance(config.get("mcp"), dict):
         raise ConfigError("mcp muss ein JSON-Objekt sein")
@@ -678,6 +715,8 @@ def load_config(path: Path | None = None, *, environ: Mapping[str, str] | None =
         raise ConfigError("home_assistant.token gehört in EVE_HOME_ASSISTANT_TOKEN oder .env")
     if local.get("llm", {}).get("api_key"):
         raise ConfigError("llm.api_key gehört in EVE_LLM_API_KEY oder .env")
+    if local.get("image_generation", {}).get("api_key"):
+        raise ConfigError("image_generation.api_key gehört in EVE_IMAGE_API_KEY oder .env")
     if local.get("assist_api", {}).get("token"):
         raise ConfigError("assist_api.token gehört in EVE_ASSIST_TOKEN oder .env")
     if local.get("chatto", {}).get("api_key"):
@@ -863,6 +902,7 @@ def update_editable_config(config_path: Path, payload: Mapping[str, Any], *, env
     _, current = load_config(resolved, environ=environ)
     validation["home_assistant"]["token"] = secret_updates.get("EVE_HOME_ASSISTANT_TOKEN", current["home_assistant"]["token"])
     validation["llm"]["api_key"] = secret_updates.get("EVE_LLM_API_KEY", current["llm"]["api_key"])
+    validation["image_generation"]["api_key"] = secret_updates.get("EVE_IMAGE_API_KEY", current["image_generation"]["api_key"])
     validation["assist_api"]["token"] = secret_updates.get("EVE_ASSIST_TOKEN", current["assist_api"]["token"])
     validation["chatto"]["api_key"] = secret_updates.get("EVE_CHATTO_BOT_KEY", current["chatto"]["api_key"])
     validation["home_assistant"].pop("token_file", None)
@@ -919,6 +959,7 @@ def config_status(config: Mapping[str, Any]) -> list[str]:
         f"bei {float(config.get('semantic_similarity', {}).get('threshold', .85)):.0%}",
         f"Differenzielle Komposition: {config.get('semantic_composition', {}).get('mode', 'active')}",
         f"Home Assistant: {'konfiguriert' if config.get('home_assistant', {}).get('enabled') else 'deaktiviert'}",
+        f"Bildgenerierung: {'aktiv' if config.get('image_generation', {}).get('enabled') else 'deaktiviert'}",
         "LLM-Endpunkt: gesetzt",
         f"Piper-Stimme: {'gefunden' if voice_path.is_file() else 'nicht gefunden'}",
         f"Storage data_path: {config.get('storage', {}).get('data_path', '')}",

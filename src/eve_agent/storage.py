@@ -2000,6 +2000,8 @@ class ConversationStore:
             ).fetchall()
             message_ids = [str(row["id"]) for row in rows]
             assets: dict[str, list[dict]] = {}
+            assistant_ids = {str(row["id"]) for row in rows if row["role"] == "assistant"}
+            seen_assets = set()
             events: dict[str, list[dict]] = {}
             if message_ids:
                 placeholders = ",".join("?" for _ in message_ids)
@@ -2007,7 +2009,15 @@ class ConversationStore:
                     f"SELECT * FROM conversation_assets WHERE message_id IN ({placeholders}) "
                     "ORDER BY message_id, ordinal", message_ids,
                 ).fetchall():
-                    assets.setdefault(str(item["message_id"]), []).append(self._asset_dict(item))
+                    asset = self._asset_dict(item)
+                    provenance = json.dumps({key: asset["metadata"].get(key) for key in (
+                        "action_index", "operation", "entity_id", "result_status", "result_reference",
+                    )}, sort_keys=True)
+                    identity = (str(item["message_id"]), asset["sha256"], asset["media_type"], asset["filename"], provenance)
+                    if str(item["message_id"]) in assistant_ids and identity in seen_assets:
+                        continue
+                    seen_assets.add(identity)
+                    assets.setdefault(str(item["message_id"]), []).append(asset)
                 for item in connection.execute(
                     f"SELECT * FROM conversation_tool_events WHERE message_id IN ({placeholders}) "
                     "ORDER BY message_id, ordinal", message_ids,
@@ -2450,14 +2460,27 @@ class ConversationStore:
                 continue
             media_type = str(artifact.get("mime") or "application/octet-stream").casefold()
             display_name = Path(str(artifact.get("filename") or "eve-download.bin")).name
+            digest = hashlib.sha256(body).hexdigest()
             asset_id = str(uuid.uuid4())
             suffix = Path(display_name).suffix[:12] or ".bin"
             filename = asset_id + suffix
             path = self.asset_root / filename
-            path.write_bytes(body)
-            os.chmod(path, 0o600)
             try:
                 with self.database.connect() as connection:
+                    connection.execute("BEGIN IMMEDIATE")
+                    # Tool resources are already persisted by append_turn. The
+                    # download export must reuse that same attachment identity.
+                    existing = connection.execute(
+                        "SELECT id FROM conversation_assets WHERE conversation_id=? AND message_id=? "
+                        "AND sha256=? AND media_type=? AND json_extract(metadata_json, '$.display_name')=? "
+                        "ORDER BY ordinal LIMIT 1",
+                        (str(conversation_id), str(message_id), digest, media_type, display_name),
+                    ).fetchone()
+                    if existing:
+                        stored.append({"id": existing["id"], "url": f"/api/conversation-assets/{existing['id']}"})
+                        continue
+                    path.write_bytes(body)
+                    os.chmod(path, 0o600)
                     ordinal = int(connection.execute(
                         "SELECT COALESCE(MAX(ordinal), -1) + 1 FROM conversation_assets WHERE message_id=?",
                         (str(message_id),),
@@ -2467,7 +2490,7 @@ class ConversationStore:
                            (id,conversation_id,message_id,media_type,filename,byte_size,sha256,ordinal,created_at,metadata_json)
                            VALUES (?,?,?,?,?,?,?,?,?,?)""",
                         (asset_id, str(conversation_id), str(message_id), media_type, filename, len(body),
-                         hashlib.sha256(body).hexdigest(), ordinal, _now(),
+                         digest, ordinal, _now(),
                          json.dumps({"type": "attachment", "display_name": display_name}, ensure_ascii=False)),
                     )
                     if media_type.startswith("image/"):

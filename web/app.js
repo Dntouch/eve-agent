@@ -3070,16 +3070,29 @@
       control.className = "config-choices";
       control.setAttribute("role", "group");
       control.setAttribute("aria-label", field.label);
-      for (const choice of field.choices) {
+      const selectionCount = document.createElement("small");
+      selectionCount.className = "config-choices-count";
+      selectionCount.setAttribute("aria-live", "polite");
+      const updateSelectionCount = () => {
+        const selected = control.querySelectorAll('input[type="checkbox"]:checked').length;
+        selectionCount.textContent = `${selected} von ${field.choices.length} ausgewählt`;
+      };
+      control.append(selectionCount);
+      const sortedChoices = [...field.choices].sort((a, b) => a.label.localeCompare(b.label, "de", { sensitivity: "base", numeric: true }));
+      for (const choice of sortedChoices) {
         const label = document.createElement("label");
         const checkbox = document.createElement("input");
         checkbox.type = "checkbox";
         checkbox.value = choice.value;
         checkbox.checked = (field.value || []).includes(choice.value);
         checkbox.disabled = Boolean(field.locked);
-        label.append(checkbox, document.createTextNode(` ${choice.label}`));
+        checkbox.addEventListener("change", updateSelectionCount);
+        const text = document.createElement("span");
+        text.textContent = choice.label;
+        label.append(checkbox, text);
         control.append(label);
       }
+      updateSelectionCount();
     } else if (["key_value", "mcp_calls"].includes(field.type)) {
       control = configEntriesControl(field);
     } else if (field.type === "json") {
@@ -3707,6 +3720,7 @@
       for (const field of fields) {
         const row = document.createElement("div");
         row.className = "config-field";
+        if (field.choices) row.classList.add("config-field--choices");
         const head = document.createElement("div");
         head.className = "config-field-head";
         const nameLine = document.createElement("div");

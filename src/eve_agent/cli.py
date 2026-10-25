@@ -57,6 +57,7 @@ from .streaming_tts import StreamingTTSPipeline
 from .web_tools import WebResearch
 from .wayland_computer import WaylandComputerCapability
 from .external_mcp import ExternalMcpServers
+from .image_generation import ImageGeneration
 from .shell import ShellCapability
 from .runtime_self_knowledge import RuntimeSelfKnowledgeSync, collect_runtime_self_descriptions
 from .working_memory import WorkingMemoryCleanupCoordinator
@@ -183,6 +184,7 @@ def build(root: Path, cfg: dict, *, config_path: Path | None = None):
         semantic_similarity=cfg.get("semantic_similarity", {}),
         semantic_composition=cfg.get("semantic_composition", {}),
         external_mcp=ExternalMcpServers(cfg.get("mcp", {}), root),
+        image_generation=ImageGeneration(cfg["image_generation"], root) if cfg["image_generation"]["enabled"] else None,
         wayland_computer=wayland_computer,
         shell=shell,
     )
@@ -796,7 +798,10 @@ def main(argv: list[str] | None = None) -> int:
                     input_kind="scheduled", new_turn=True,
                 )
                 bus.set("thinking", "Geplante Aufgabe wird ausgeführt …")
-                response = browser_response(request, conversation_id=conversation_id)
+                from contextlib import nullcontext
+                context = action.get("execution_context")
+                with chatto_bridge.scheduled_access(context) if context else nullcontext():
+                    response = browser_response(request, conversation_id=conversation_id)
             except Exception as exc:
                 remember_turn_failure(exc, text=request, conversation_id=conversation_id)
                 agent._diagnostic(
@@ -809,12 +814,22 @@ def main(argv: list[str] | None = None) -> int:
             finally:
                 if previous_conversation_id and agent.conversation_id != previous_conversation_id:
                     agent.prepare_conversation_view(previous_conversation_id)
+        target = action.get("output_target") or {}
+        output_conversation = response.get("conversation_id")
+        if target.get("transport") == "eve" and target.get("conversation_id") and target["conversation_id"] != output_conversation:
+            output_conversation = target["conversation_id"]
+            conversations.get(output_conversation)
+            conversations.append_turn(output_conversation, request, response["answer"],
+                user_metadata={"context_copy": True, "origin_turn_id": response.get("turn_id"), "scheduled_task_id": action.get("task_id")},
+                assistant_metadata={"context_copy": True, "origin_turn_id": response.get("turn_id")},
+                assistant_attachments=response.get("resources", []))
         return {
             "notification": {
                 "message": response["answer"], "kind": "scheduled_result", "delivered": False,
-                "persisted": True, "conversation_id": response.get("conversation_id"),
+                "persisted": True, "conversation_id": output_conversation,
                 "turn_id": response.get("turn_id"), "task_id": action.get("task_id"),
             },
+            "resources": response.get("resources", []),
             "turn": {
                 "turn_id": response.get("turn_id"), "conversation_id": response.get("conversation_id"),
                 "assistant_message_id": response.get("assistant_message_id"),
@@ -825,8 +840,6 @@ def main(argv: list[str] | None = None) -> int:
     if callable(register_scheduled_executor):
         register_scheduled_executor("eve_turn", execute_scheduled_eve_turn)
     start_scheduler = getattr(reminders, "start", None)
-    if callable(start_scheduler):
-        start_scheduler()
 
     def browser_turn(audio_path: Path, conversation_id: str | None = None) -> dict:
         if not turn_lock.acquire(blocking=False):
@@ -1344,6 +1357,7 @@ def main(argv: list[str] | None = None) -> int:
                 "assist_events": "Hausereignisse", "presentation": "Lokale Anzeige",
                 "memory": "Gemeinsames Gedächtnis", "semantic_learning": "Bedeutungslernen",
                 "working_memory": "Arbeitsgedächtnis", "web": "Webrecherche", "clock": "Uhrzeit",
+                "image_generation": "Bildgenerierung",
                 "calculator": "Rechner",
             }
             _, current_config = load_config(config_path)
@@ -1762,6 +1776,10 @@ def main(argv: list[str] | None = None) -> int:
         lambda text, images, identifier: browser_message(text, images, identifier, synthesize_audio=False),
         learning_activity=conversation_learning.note_activity if conversation_learning else None,
     )
+    chatto_bridge.scheduler = reminders
+    reminders.output_targets_provider = chatto_bridge.output_targets
+    if callable(start_scheduler):
+        start_scheduler()
     from .assist_events import AssistEventInbox
     assist_config = cfg.get("assist_api", {})
     assist_bridge = None
