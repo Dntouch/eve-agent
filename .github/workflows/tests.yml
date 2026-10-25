@@ -1,0 +1,32 @@
+name: EVE tests
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  linux:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ['3.11', '3.12', '3.14']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - name: System libraries
+        run: sudo apt-get update && sudo apt-get install -y libportaudio2 libjavascriptcoregtk-4.1-0
+      - name: Install application dependencies
+        run: python -m pip install -c constraints-tested.txt -e .
+      - name: Check dependencies
+        run: python -m pip check
+      - name: Python tests
+        run: python -m unittest discover -v -s tests
+      - name: JavaScript tests
+        run: node --test tests/js/*.test.*

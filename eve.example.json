@@ -1,0 +1,35 @@
+{
+  "llm": {
+    "base_url": "http://127.0.0.1:1234/v1",
+    "model": "local-model"
+  },
+  "visual": {
+    "host": "127.0.0.1",
+    "port": 8790,
+    "open_browser": false
+  },
+  "home_assistant": {"enabled": false},
+  "chatto": {
+    "enabled": false,
+    "server_url": "https://chat.example.org",
+    "node_executable": "node",
+    "owner_user_id": "",
+    "owner_dm_enabled": true,
+    "presence_enabled": true,
+    "channel_ids": [],
+    "channel_learning_ids": [],
+    "member_dm_enabled": false,
+    "show_member_dms_in_web": false,
+    "show_owner_dms_in_web": true,
+    "show_channels_in_web": true,
+    "reply_mode": "chat",
+    "channel_mentions_only": true,
+    "channel_capabilities": ["memory", "semantic_learning", "working_memory", "web", "clock", "calculator"]
+  },
+  "network_tools": {"enabled": false},
+  "shell": {"enabled": false},
+  "wayland_computer": {"enabled": false},
+  "nova_maintenance": {"enabled": false},
+  "web": {"enabled": false},
+  "local_files": {"roots": []}
+}

@@ -1,0 +1,41 @@
+.venv/
+.venv-wayland-mcp/
+.venv-chatterbox/
+.venv-qwen-tts/
+.env
+runtime/
+data/
+certs/*.key
+secrets/*
+!secrets/.gitignore
+memory/index.json
+memory/sessions/
+__pycache__/
+*.pyc
+
+# Generated Python package metadata
+*.egg-info/
+
+# Locally installed voice model binaries (recreated/downloaded by setup)
+voices/*.onnx
+
+# Private consistent Memory V2 snapshots and isolated working copies
+.semantic-sandbox/
+
+# Local configuration and build output
+eve.local.json
+dist/
+build/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Generated installation starters
+/eve-start
+/EVE-starten.cmd
+
+# Published EVE voice; other locally downloaded models stay ignored
+!voices/de_DE-eve-medium.onnx
+
+# Machine-specific runtime configuration
+eve.json

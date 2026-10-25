@@ -1,0 +1,28 @@
+[project]
+name = "eve-local-agent"
+version = "0.1.0"
+description = "Local-first EVE assistant with memory, tools and a web interface"
+requires-python = ">=3.11"
+license = {text = "MIT"}
+dependencies = [
+  "jsonschema>=4.23,<5",
+  "faster-whisper>=1.1,<2",
+  # PyAV 19 removed metadata_errors used by faster-whisper 1.x.
+  "av>=11,<19",
+  "numpy>=1.26,<3",
+  "onnxruntime>=1.20,<2",
+  "tokenizers>=0.21,<1",
+  "piper-tts>=1.4,<2",
+  "sounddevice>=0.5,<1",
+  "websocket-client>=1.8,<2",
+]
+
+[project.scripts]
+eve = "eve_agent.cli:main"
+
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]

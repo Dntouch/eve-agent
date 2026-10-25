@@ -1,0 +1,23 @@
+{
+  "name": "EVE",
+  "engine": "piper",
+  "voice": "de_DE-eve-medium",
+  "sample_rate": 22050,
+  "synthesis": {
+    "length_scale": 1.27,
+    "noise_scale": 0.4,
+    "noise_w_scale": 0.2
+  },
+  "sha256": {
+    "de_DE-eve-medium.onnx": "8dbde09f6628e63039357d5f038ab5e0a5d752f9d6af416f7f20dfa0d380bcb7",
+    "de_DE-eve-medium.onnx.json": "d5909431612ff35daa899ed89c26fffa0de037a64559a9e4aecd80c7fddb9c41"
+  },
+  "provenance": {
+    "reference_model": "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign",
+    "dataset_model": "Qwen/Qwen3-TTS-12Hz-0.6B-Base",
+    "piper_warmstart": "de_DE-thorsten-medium",
+    "reference_audio": "eve-02-klar-futuristisch.wav",
+    "training_utterances": 720,
+    "documentation": "README.md"
+  }
+}

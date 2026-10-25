@@ -1,0 +1,558 @@
+<!doctype html>
+<html lang="de">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#02040a">
+  <meta name="description" content="EVE – dein lokaler intelligenter Assistent">
+  <link rel="icon" href="favicon.ico" sizes="any">
+  <link rel="icon" type="image/png" sizes="32x32" href="assets/favicon-32.png">
+  <link rel="apple-touch-icon" sizes="180x180" href="assets/apple-touch-icon.png">
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="stylesheet" href="styles.css?v=20261024-learning-help1">
+  <title>EVE // Living Signal</title>
+</head>
+<body data-state="idle">
+  <a class="skip-link" href="#ptt">Zur Sprachsteuerung</a>
+
+  <canvas id="neural" aria-hidden="true"></canvas>
+  <div class="space-wash" aria-hidden="true"></div>
+
+  <header class="top-rail" data-eve-surface="toolbar" aria-label="EVE Systemstatus">
+    <div class="system-signature">
+      <span class="eyebrow">EVE</span>
+      <span class="rail-separator" aria-hidden="true"></span>
+      <span class="rail-secondary">LIVING SIGNAL</span>
+    </div>
+    <div class="state-readout">
+      <span class="state-pip" aria-hidden="true"></span>
+      <span id="label" role="status" aria-live="polite">STANDBY</span>
+    </div>
+    <div class="system-meta">
+      <span id="connection">LOCAL // CONNECTING</span>
+      <time id="clock" aria-label="Lokale Uhrzeit">--:--</time>
+      <div class="system-menu-wrap">
+        <button class="system-menu-toggle eve-icon-button" id="systemMenuToggle" type="button" aria-controls="systemMenu" aria-expanded="false" aria-label="EVE-Menü öffnen">
+          <span></span><span></span><span></span>
+        </button>
+        <nav class="system-menu" id="systemMenu" aria-label="EVE-Menü" hidden>
+          <button id="openConfig" type="button">Konfiguration</button>
+          <button id="openBrainwatch" type="button">EVE Brainwatch</button>
+          <button id="avatarModeToggle" type="button" aria-pressed="true" title="Avatar auf diesem Gerät wechseln"><span>Avatar</span><small id="avatarModeState">BRAINWATCH</small></button>
+          <button id="nerdModeToggle" type="button" aria-pressed="false"><span>Nerd Mode</span><small id="nerdModeState">AUS</small></button>
+          <button id="presentationMotionToggle" type="button" aria-pressed="true"><span>Animationen</span><small id="presentationMotionState">AN</small></button>
+        </nav>
+      </div>
+    </div>
+  </header>
+
+  <aside class="conversation-panel" id="conversationPanel" data-eve-intensity="low" aria-label="Unterhaltungen">
+    <div class="workspace-resize" id="workspaceResize" role="separator" aria-label="Breite der Unterhaltungen und Arbeitslisten anpassen" aria-orientation="vertical" tabindex="0"><span aria-hidden="true"></span></div>
+    <div class="conversation-panel-head">
+      <div><span class="eyebrow">EVE</span><strong id="panelTitle">Unterhaltungen</strong></div>
+      <div class="panel-head-actions">
+        <button class="eve-button eve-button--ghost" id="scheduleViewToggle" type="button" aria-pressed="false">ZEITPLÄNE</button>
+        <button class="eve-button eve-button--ghost" id="taskViewToggle" type="button" aria-pressed="false">AUFGABEN</button>
+      </div>
+    </div>
+    <nav class="conversation-list" id="conversationList" aria-label="Gespeicherte Unterhaltungen"></nav>
+    <p class="conversation-empty" id="conversationListEmpty">Noch keine Unterhaltungen.</p>
+    <section class="task-list scheduled-task-view" id="scheduledTaskView" aria-label="Zeitpläne" hidden>
+      <header class="scheduled-task-intro">
+        <span class="eyebrow">ZEITPLÄNE</span>
+        <small>Von EVE später oder regelmäßig ausgeführte Aufträge</small>
+      </header>
+      <div class="scheduled-task-list" id="scheduledTaskList"></div>
+      <p class="conversation-empty" id="scheduledTaskListEmpty">Noch keine aktiven Zeitpläne.</p>
+    </section>
+    <section class="task-list work-task-view" id="taskList" aria-label="Arbeitslisten" hidden>
+      <div class="work-task-toolbar">
+        <span class="eyebrow">ARBEITSLISTEN</span>
+        <button id="newWorkList" class="work-list-add" type="button" aria-expanded="false" aria-controls="newWorkListForm" aria-label="Neue Arbeitsliste" title="Neue Arbeitsliste">
+          <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+            <path d="M5 5h8M5 10h6M5 15h5"></path>
+            <path d="M17 11v8m-4-4h8"></path>
+          </svg>
+        </button>
+      </div>
+      <form class="work-inline-form work-list-form" id="newWorkListForm" hidden>
+        <label>Name<input id="newWorkListName" maxlength="120" required autocomplete="off"></label>
+        <label>Beschreibung<textarea id="newWorkListDescription" maxlength="2000" rows="2"></textarea></label>
+        <div><button type="button" data-action="cancel-list">ABBRECHEN</button><button type="submit">ANLEGEN</button></div>
+      </form>
+      <p class="work-task-error" id="workTaskError" role="alert" hidden></p>
+      <div class="work-lists" id="workLists"></div>
+      <p class="conversation-empty" id="taskListEmpty" hidden>Noch keine Arbeitslisten.</p>
+    </section>
+  </aside>
+  <div class="conversation-scrim" id="conversationScrim" hidden></div>
+
+  <main class="presence" id="presence">
+    <section class="core-scene" aria-label="EVE Präsenz">
+      <div class="core-orbit orbit-far" aria-hidden="true"></div>
+      <div class="core-orbit orbit-mid" aria-hidden="true"></div>
+      <div class="core-orbit orbit-near" aria-hidden="true"></div>
+      <div class="core-aura" aria-hidden="true"></div>
+      <div class="spectrum" id="spectrum" aria-hidden="true"></div>
+      <div class="mark" id="mark">
+        <div class="logo-field" aria-hidden="true"></div>
+        <div class="logo-stage">
+          <canvas class="eve-avatar-cloud" id="eveAvatarCloud" role="img" aria-label="EVEs dreidimensionale Memory-Wolke aus persistenten Claims und Relations">EVEs Memory-Wolke</canvas>
+          <img class="logo" src="assets/eve-logo.png" alt="EVE">
+          <span class="decision-flash" aria-hidden="true"></span>
+        </div>
+      </div>
+      <div class="core-caption" aria-hidden="true">
+        <span class="caption-line"></span>
+        <span>LOCAL INTELLIGENCE</span>
+        <span class="caption-line"></span>
+      </div>
+    </section>
+  </main>
+
+  <section class="presentation-view" id="presentationView" aria-labelledby="presentationTitle" hidden>
+    <header class="presentation-head">
+      <div><span class="eyebrow">EVE OUTPUT</span><h1 id="presentationTitle"></h1></div>
+      <button id="presentationClose" type="button" aria-label="Präsentation schließen">×</button>
+    </header>
+    <div class="presentation-components" id="presentationComponents" aria-live="polite"></div>
+  </section>
+
+  <div class="image-viewer" id="imageViewer" role="dialog" aria-modal="true" aria-labelledby="imageViewerTitle" hidden>
+    <header class="image-viewer-head">
+      <h1 id="imageViewerTitle">Bild in Originalgröße</h1>
+      <div>
+        <a id="imageViewerDownload" class="image-viewer-download" download>Speichern</a>
+        <button id="imageViewerClose" type="button" aria-label="Originalansicht schließen">×</button>
+      </div>
+    </header>
+    <div class="image-viewer-stage" id="imageViewerStage">
+      <img id="imageViewerImage" alt="Bild in Originalgröße">
+    </div>
+  </div>
+
+  <div class="chat-workspace">
+    <div class="panel-resize" id="panelResize" role="separator" aria-label="Breite des aktiven Chats anpassen" aria-orientation="vertical" tabindex="0"><span aria-hidden="true"></span></div>
+    <section class="conversation" id="conversation" aria-label="Unterhaltung mit EVE">
+    <header class="chat-head">
+      <div class="chat-title-cluster">
+        <button class="conversation-toggle eve-icon-button" id="conversationToggle" type="button" aria-controls="conversationPanel" aria-expanded="false" aria-label="Unterhaltungen öffnen">
+          <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+            <rect x="3.5" y="4.5" width="17" height="15" rx="2"></rect>
+            <path d="M9 5v14"></path>
+            <path class="sidebar-open-mark" d="M17.5 12h-6m2.5-2.5-2.5 2.5 2.5 2.5"></path>
+            <path class="sidebar-close-mark" d="M11.5 12h6m-2.5-2.5 2.5 2.5-2.5 2.5"></path>
+          </svg>
+        </button>
+        <div class="chat-title-copy">
+          <span class="eyebrow">AKTIVE UNTERHALTUNG</span>
+          <h1 id="conversationTitle">Neue Unterhaltung</h1>
+        </div>
+      </div>
+      <div class="chat-actions">
+        <button class="eve-button eve-button--ghost" id="newConversation" type="button" aria-label="Neue Unterhaltung" title="Neue Unterhaltung"><span aria-hidden="true">＋</span> NEU</button>
+        <button class="eve-button eve-button--ghost" id="renameConversation" type="button" aria-label="Unterhaltung umbenennen" title="Unterhaltung umbenennen"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m15 5 4 4M4 20l4-1L20 7a2.8 2.8 0 0 0-4-4L4 15z"/></svg></button>
+        <button class="eve-button eve-button--ghost" id="exportConversation" type="button" aria-label="Aktiven Chat als langes PNG exportieren" title="Chat als PNG exportieren"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v12m-4-4 4 4 4-4M4 15v5h16v-5"/></svg><span>PNG</span></button>
+        <button id="deleteConversation" class="chat-action-icon" type="button" aria-label="Unterhaltung löschen" title="Unterhaltung löschen">
+          <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+            <path d="M4 7h16M9 7V4h6v3m3 0-1 13H7L6 7m4 4v5m4-5v5"></path>
+          </svg>
+        </button>
+      </div>
+    </header>
+    <p class="chat-export-status" id="chatExportStatus" role="status" aria-live="polite" hidden></p>
+    <div class="chat-messages" id="chatMessages" role="log" aria-live="polite" aria-relevant="additions"></div>
+    <div class="chat-empty" id="chatEmpty">
+      <strong>Was möchtest du mit EVE besprechen?</strong>
+      <span>Schreibe eine Nachricht, teile einen Screenshot oder halte die Sprechtaste gedrückt.</span>
+    </div>
+    <div class="detail" id="detail" role="status" aria-live="polite">
+      Beim ersten Mal Mikrofonzugriff erlauben.
+    </div>
+    <div class="reply legacy-reply" id="reply" role="log" aria-live="polite" aria-relevant="additions text"></div>
+    <details class="artifact-tray">
+      <summary>ERGEBNISSE</summary>
+      <div class="downloads" id="downloads" aria-label="Downloads"></div>
+      <div class="sources" id="sources" aria-label="Quellen"></div>
+    </details>
+    </section>
+
+    <aside class="composer" id="composer" role="region" aria-modal="false" aria-label="Nachricht an EVE">
+    <div class="message-queue" id="messageQueue" aria-label="Vorgemerkte Nachrichten" aria-live="polite" hidden></div>
+    <div class="composer-input">
+      <textarea class="eve-input" id="messageText" maxlength="32000" placeholder="Nachricht an EVE …"></textarea>
+      <div class="composer-activity" id="composerActivity" role="status" aria-live="polite" hidden>
+        <span class="composer-activity-helix" aria-hidden="true">
+          <i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i>
+        </span>
+        <span id="composerActivityText">EVE denkt …</span>
+        <button class="turn-cancel" id="turnCancel" type="button" hidden>Abbrechen</button>
+      </div>
+    </div>
+    <div class="dropzone eve-button eve-button--ghost" id="dropzone" role="button" tabindex="0" aria-controls="imageInput" aria-label="Screenshot oder Bild hinzufügen">
+      <span class="dropzone-mark" aria-hidden="true">＋</span>
+      <span><strong>Bild</strong><small>Screenshot auswählen oder einfügen · maximal 4</small></span>
+      <input id="imageInput" type="file" accept="image/png,image/jpeg,image/gif,image/webp" multiple hidden>
+    </div>
+    <div class="previews" id="previews" aria-label="Ausgewählte Screenshots"></div>
+    <div class="composer-voice-slot" id="composerVoiceSlot"></div>
+    <div class="composer-actions">
+      <button class="send eve-icon-button eve-button--primary" id="sendMessage" type="button" aria-label="Nachricht an EVE senden" title="Nachricht an EVE senden">
+        <svg class="send-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+          <path d="M5 12h14m-5-5 5 5-5 5"></path>
+        </svg>
+      </button>
+    </div>
+    <p class="composer-hint">Return zum Senden · Shift + Return für eine neue Zeile</p>
+    </aside>
+  </div>
+
+  <section class="config-view" id="configView" aria-labelledby="configTitle" hidden>
+    <div class="config-resize" id="configResize" role="separator" aria-label="Konfiguration in der Breite anpassen" aria-orientation="vertical" aria-valuemin="460" tabindex="0"><span aria-hidden="true"></span></div>
+    <header class="config-head">
+      <div><span class="eyebrow">EVE SYSTEM</span><h1 id="configTitle">Konfiguration</h1></div>
+      <button id="configClose" type="button" aria-label="Konfiguration schließen">×</button>
+    </header>
+    <form id="configForm">
+      <p class="config-intro">Technische Einstellungen · effektive Werte zeigen ihre aktive Quelle.</p>
+      <div class="config-sections" id="configSections" aria-live="polite"></div>
+      <div class="config-footer">
+        <p id="configStatus" role="status" aria-live="polite"></p>
+        <button id="configSave" type="submit" disabled>
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v11m0 0 4-4m-4 4-4-4M5 17v3h14v-3"/></svg>
+          <span>SPEICHERN</span>
+        </button>
+      </div>
+    </form>
+  </section>
+  <aside class="config-help-popover" id="configHelpPopover" role="dialog" aria-labelledby="configHelpTitle" hidden>
+    <button class="config-help-close" id="configHelpClose" type="button" aria-label="Hilfe schließen">×</button>
+    <h2 id="configHelpTitle"></h2>
+    <div id="configHelpContent"></div>
+  </aside>
+
+  <section class="nerd-view" id="nerdView" aria-labelledby="nerdTitle" hidden>
+    <header class="nerd-head">
+      <div><span class="eyebrow">EVE TELEMETRIE</span><h1 id="nerdTitle">Nerd Mode</h1></div>
+    </header>
+    <p class="nerd-intro">Rein beobachtende Turn-Telemetrie · nicht verfügbare Werte werden nicht geschätzt.</p>
+    <div class="nerd-turns" id="nerdTurns" aria-live="polite"></div>
+  </section>
+
+  <section class="brainwatch-view eve-surface eve-surface--raised eve-intensity-high" id="brainwatchView" aria-labelledby="brainwatchTitle" hidden>
+    <header class="brainwatch-head">
+      <div class="brainwatch-title"><span class="eyebrow">EVE WISSENSRAUM</span><h1 id="brainwatchTitle">EVE Brainwatch</h1><p>Bitte nicht gegen die Scheibe klopfen.</p></div>
+      <nav class="brainwatch-modes eve-toolbar" aria-label="Brainwatch-Bereich">
+        <button class="eve-button eve-button--ghost" id="brainwatchInfoMode" type="button" aria-pressed="true">INFORMATIONSGRAPH</button>
+        <button class="eve-button eve-button--ghost" id="brainwatchMemoryMode" type="button" aria-pressed="false">MEMORY EXPLORER</button>
+        <button class="eve-button eve-button--ghost" id="brainwatchSemanticMode" type="button" aria-pressed="false">SEMANTISCHES LERNEN</button>
+        <button class="eve-button eve-button--ghost" id="brainwatchEventsMode" type="button" aria-pressed="false">EREIGNISSE</button>
+        <button class="eve-button eve-button--ghost" id="brainwatchStatisticsMode" type="button" aria-pressed="false">STATISTIK</button>
+        <button class="brainwatch-layout-reset eve-button eve-button--ghost" id="brainwatchLayoutReset" type="button" aria-label="Layout dieses Bereichs zurücksetzen" title="Layout dieses Bereichs zurücksetzen">↺</button>
+      </nav>
+      <button class="eve-icon-button eve-button--ghost" id="brainwatchClose" type="button" aria-label="Brainwatch schließen">×</button>
+    </header>
+    <div class="brainwatch-shell">
+      <aside class="brainwatch-search-panel eve-panel">
+        <button class="brainwatch-search-collapse eve-icon-button eve-button--ghost" id="brainwatchSearchCollapse" type="button" aria-expanded="true" aria-label="Suchbereich einklappen">‹</button>
+        <div id="brainwatchInfoNavigation">
+          <form id="brainwatchSearchForm" role="search">
+            <label for="brainwatchSearch">EVEs Informationswelt durchsuchen</label>
+            <div><input class="eve-input" id="brainwatchSearch" type="search" maxlength="300" autocomplete="off" placeholder="z. B. Kühlschrank, EVE, Arbeitsauftrag …"><button class="eve-button eve-button--primary" type="submit">SUCHEN</button></div>
+          </form>
+          <p class="brainwatch-status" id="brainwatchStatus" role="status" aria-live="polite">Wähle einen Einstiegspunkt.</p>
+          <div class="brainwatch-results" id="brainwatchResults" aria-label="Suchtreffer"></div>
+        </div>
+        <div class="memory-navigation" id="memoryExplorerNavigation" hidden>
+          <div class="memory-subviews eve-toolbar" role="group" aria-label="Memory-Explorer-Ansicht">
+            <button class="eve-button eve-button--ghost" id="memoryCloudView" type="button" aria-pressed="true">3D</button>
+            <button class="eve-button eve-button--ghost" id="memoryTimelineView" type="button" aria-pressed="false">TIMELINE</button>
+          </div>
+          <form id="memoryExplorerForm" role="search">
+            <label for="memoryExplorerSearch">Memory V2 durchsuchen</label>
+            <input class="eve-input" id="memoryExplorerSearch" type="search" maxlength="300" autocomplete="off" placeholder="Optionaler Suchbegriff">
+            <label for="memoryExplorerScope">Scope</label>
+            <input class="eve-input" id="memoryExplorerScope" type="text" maxlength="200" autocomplete="off" placeholder="Alle Scopes">
+            <div class="memory-filter-grid">
+              <label for="memoryExplorerKind">Claim-Art</label>
+              <select class="eve-input" id="memoryExplorerKind"><option value="">Alle Arten</option><option value="opaque_fact">Fakt</option><option value="provider_binding">Provider-Bindung</option><option value="alias">Alias</option></select>
+              <label for="memoryExplorerLifecycle">Lifecycle</label>
+              <select class="eve-input" id="memoryExplorerLifecycle"><option value="">Alle Zustände</option><option value="active">Aktiv</option><option value="candidate">Kandidat</option><option value="retired">Abgelöst</option><option value="invalid">Invalidiert</option></select>
+            </div>
+            <button class="eve-button eve-button--primary" type="submit">ANZEIGEN</button>
+          </form>
+          <p class="brainwatch-status" id="memoryExplorerStatus" role="status" aria-live="polite">Claims werden beim Öffnen geladen.</p>
+          <div class="brainwatch-results memory-results" id="memoryExplorerResults" aria-label="Memory-V2-Claims"></div>
+          <button class="eve-button memory-results-more" id="memoryExplorerMore" type="button" hidden>WEITERE CLAIMS</button>
+          <form class="memory-timeline-filters" id="memoryTimelineForm" hidden>
+            <label for="memoryTimelineSource">Ereignisquelle</label>
+            <select class="eve-input" id="memoryTimelineSource"><option value="all">Historisch + Runtime</option><option value="historical">Historisch</option><option value="runtime">Runtime</option></select>
+            <label for="memoryTimelineCategory">Beweiskategorie</label>
+            <select class="eve-input" id="memoryTimelineCategory"><option value="">Alle Kategorien</option><option value="retrieval">Retrieval</option><option value="llm_context">LLM-Kontext</option><option value="deterministic">Deterministische Verarbeitung</option><option value="actions">Aktionen</option><option value="memory_changes">Gedächtnisänderungen</option><option value="relations">Relationen</option><option value="system">System</option></select>
+            <label for="memoryTimelineProof">Proof-Level</label>
+            <select class="eve-input" id="memoryTimelineProof"><option value="">Alle Proof-Level</option><option value="trace_boundary">trace_boundary</option><option value="operation_boundary">operation_boundary</option><option value="compiler_evaluation">compiler_evaluation</option><option value="consumer_boundary">consumer_boundary</option><option value="assembled_context">assembled_context</option><option value="client_boundary">client_boundary</option><option value="transport_payload">transport_payload</option><option value="transport_result">transport_result</option><option value="deterministic_resolution">deterministic_resolution</option><option value="provider_verification">provider_verification</option><option value="validated_binding">validated_binding</option><option value="dispatch_boundary">dispatch_boundary</option><option value="provider_response">provider_response</option><option value="verification_result">verification_result</option><option value="action_result">action_result</option><option value="relation_traversal">relation_traversal</option><option value="atomic_lifecycle">atomic_lifecycle</option><option value="telemetry_boundary">telemetry_boundary</option></select>
+            <label for="memoryTimelineKind">Ereignistyp</label>
+            <select class="eve-input" id="memoryTimelineKind"><option value="">Alle Ereignisse</option><option value="claim_created">Claim-Erstellung</option><option value="evidence_created">Evidence</option><option value="observation_recorded">Observation</option><option value="relation_stored">Relation</option><option value="learning_decision">Learning Decision</option><option value="learning_job_accepted">Learning Job angenommen</option><option value="learning_job_started">Learning Job gestartet</option><option value="learning_job_completed">Learning Job abgeschlossen</option><option value="learning_job_updated">Learning Job aktualisiert</option><option value="compiler_evaluation">Compiler-Evaluation</option><option value="compiler_retrieved">Compiler-Retrieval</option><option value="compiler_eligible">Compiler-Eligibility</option><option value="compiler_would_present">Compiler-Auswahl</option><option value="compiler_rejected">Compiler-Ablehnung</option><option value="compiler_cancelled">Compiler-Abbruch</option><option value="compiler_error">Compiler-Fehler</option><option value="usage_presented">Präsentation protokolliert</option><option value="semantic_reuse_result">Semantische Wiederverwendung</option></select>
+            <label for="memoryTimelineFidelity">Fidelity</label>
+            <select class="eve-input" id="memoryTimelineFidelity"><option value="">Alle Klassen</option><option value="direct_event">Direktes Ereignis</option><option value="state_timestamp">Zustandszeitpunkt</option><option value="derived_link">Abgeleitete Verbindung</option></select>
+            <div class="memory-filter-grid">
+              <label for="memoryTimelineFrom">Von</label><input class="eve-input" id="memoryTimelineFrom" type="datetime-local">
+              <label for="memoryTimelineTo">Bis</label><input class="eve-input" id="memoryTimelineTo" type="datetime-local">
+              <label for="memoryTimelineClaim">Claim-ID</label><input class="eve-input" id="memoryTimelineClaim" type="text" maxlength="512" placeholder="Optional">
+              <label for="memoryTimelineTurn">Turn-ID</label><input class="eve-input" id="memoryTimelineTurn" type="text" maxlength="512" placeholder="Optional">
+              <label for="memoryTimelineScope">Scope</label><input class="eve-input" id="memoryTimelineScope" type="text" maxlength="200" placeholder="Optional">
+              <label for="memoryTimelineConsumer">Consumer</label><select class="eve-input" id="memoryTimelineConsumer"><option value="">Alle</option><option value="native_tool">Qwen Toolwahl</option><option value="planner">Historischer Planner</option><option value="answer">Antwort</option><option value="audit">Audit</option></select>
+              <label for="memoryTimelineStage">Compiler-Stufe</label><select class="eve-input" id="memoryTimelineStage"><option value="">Alle</option><option value="retrieved">retrieved</option><option value="eligible">eligible</option><option value="would_present">would_present</option><option value="rejected">rejected</option><option value="cancelled">cancelled</option><option value="error">error</option></select>
+              <label for="memoryTimelineTrace">Trace-ID</label><input class="eve-input" id="memoryTimelineTrace" type="text" maxlength="512" placeholder="Optional">
+              <label for="memoryTimelinePlannerRound">Tool-Runde</label><input class="eve-input" id="memoryTimelinePlannerRound" type="text" maxlength="512" placeholder="Optional">
+              <label for="memoryTimelineLlmCall">LLM-Call</label><input class="eve-input" id="memoryTimelineLlmCall" type="text" maxlength="512" placeholder="Optional">
+              <label for="memoryTimelineAttempt">Attempt</label><input class="eve-input" id="memoryTimelineAttempt" type="text" maxlength="512" placeholder="Optional">
+              <label for="memoryTimelineOperation">Operation</label><input class="eve-input" id="memoryTimelineOperation" type="text" maxlength="512" placeholder="Optional">
+              <label for="memoryTimelinePlan">Plan</label><input class="eve-input" id="memoryTimelinePlan" type="text" maxlength="512" placeholder="Optional">
+              <label for="memoryTimelineAction">Action</label><input class="eve-input" id="memoryTimelineAction" type="text" maxlength="512" placeholder="Optional">
+              <label for="memoryTimelineStatus">Status</label><select class="eve-input" id="memoryTimelineStatus"><option value="">Alle</option><option value="started">started</option><option value="completed">completed</option><option value="failed">failed</option><option value="cancelled">cancelled</option><option value="rejected">rejected</option></select>
+            </div>
+            <button class="eve-button eve-button--primary" type="submit">EREIGNISSE LADEN</button>
+          </form>
+        </div>
+        <div class="semantic-navigation" id="semanticNavigation" hidden></div>
+        <div id="brainwatchEventsNavigation" hidden>
+          <p>Exakt gleiche Ereignistypen und JSON-Daten werden zusammen angezeigt. Einzelne Eingänge bleiben gespeichert.</p>
+          <button class="eve-button eve-button--primary" id="brainwatchEventsRefresh" type="button">AKTUALISIEREN</button>
+          <output class="brainwatch-status" id="brainwatchEventsStatus" aria-live="polite"></output>
+        </div>
+        <div class="brainwatch-statistics-navigation" id="brainwatchStatisticsNavigation" hidden>
+          <span class="eyebrow">PERSISTENTE ZÄHLER</span>
+          <p>Alle Werte stammen direkt aus EVEs lokaler Datenbank. Nicht aufgezeichnete Werte werden nicht geschätzt.</p>
+          <button class="eve-button eve-button--primary" id="brainwatchStatisticsRefresh" type="button">AKTUALISIEREN</button>
+          <output class="brainwatch-status" id="brainwatchStatisticsStatus" aria-live="polite">Statistik wird beim Öffnen geladen.</output>
+        </div>
+      </aside>
+      <div class="brainwatch-column-resize brainwatch-column-resize--left" id="brainwatchNavigationResize" role="separator" aria-label="Breite der Navigation ändern" aria-orientation="vertical" aria-valuemin="210" aria-valuemax="480" tabindex="0"><span aria-hidden="true"></span></div>
+      <div class="brainwatch-stage" id="brainwatchStage">
+        <div class="brainwatch-toolbar eve-toolbar" id="brainwatchGraphToolbar" aria-label="Graphsteuerung">
+          <button class="eve-button eve-button--ghost" id="brainwatchZoomIn" type="button" aria-label="Vergrößern">＋</button>
+          <button class="eve-button eve-button--ghost" id="brainwatchZoomOut" type="button" aria-label="Verkleinern">−</button>
+          <button class="eve-button eve-button--ghost" id="brainwatchCenter" type="button">ZENTRIEREN</button>
+          <button class="eve-button eve-button--ghost" id="brainwatchContextView" type="button" aria-pressed="true">UMFELD</button>
+          <button class="eve-button eve-button--ghost" id="brainwatchFlowView" type="button" aria-pressed="false">ABLAUF</button>
+          <button class="eve-button eve-button--ghost" id="brainwatchOverviewView" type="button" aria-pressed="false">GESAMTBILD</button>
+          <button class="eve-button eve-button--ghost" id="brainwatchToggleBranch" type="button" disabled>AUFKLAPPEN</button>
+          <button class="eve-button eve-button--ghost" id="brainwatchReset" type="button">LEEREN</button>
+        </div>
+        <nav class="brainwatch-path" id="brainwatchPath" aria-label="Navigationspfad im Informationsgraph" hidden></nav>
+        <canvas id="brainwatchCanvas" tabindex="0" aria-label="Interaktiver EVE-Wissensgraph"></canvas>
+        <p class="brainwatch-empty" id="brainwatchEmpty">Suche links nach einem Thema und öffne einen Knoten.</p>
+        <div class="brainwatch-groups eve-toolbar" id="brainwatchGroups" aria-label="Beziehungsbereiche" hidden></div>
+        <button class="brainwatch-more eve-button eve-button--secondary" id="brainwatchMore" type="button" hidden>WEITERE NACHBARN LADEN</button>
+        <section class="memory-cloud-workspace" id="memoryCloudWorkspace" aria-label="EVE NeuroCloud – persistente Memory-Struktur" hidden>
+          <canvas id="memoryCloudCanvas" tabindex="0" aria-label="Dreidimensionale Darstellung persistenter Memory-Claims und Relations"></canvas>
+          <header class="memory-cloud-toolbar eve-toolbar">
+            <button class="eve-button eve-button--ghost" id="memoryCloudReset" type="button" title="Kamera zurücksetzen">KAMERA ↺</button>
+            <button class="eve-button eve-button--ghost" id="memoryCloudFocus" type="button" title="Nachbarschaft des gewählten Claims laden">UMFELD</button>
+            <button class="eve-button eve-button--ghost" id="memoryCloudOverview" type="button" title="Gefilterte Übersicht laden">ÜBERSICHT</button>
+            <label class="memory-cloud-live"><input id="memoryCloudWorking" type="checkbox" checked> KURZZEIT</label>
+            <button class="eve-button eve-button--ghost" id="memoryCloudWorkingFocus" type="button">ARBEITSSTAND</button>
+            <label for="memoryCloudRelationType">Relation</label>
+            <select class="eve-input" id="memoryCloudRelationType"><option value="">Alle</option><option value="supersedes">supersedes</option><option value="refines">refines</option><option value="contradicts">contradicts</option></select>
+            <label for="memoryCloudIntensity">Effekt</label>
+            <select class="eve-input" id="memoryCloudIntensity"><option value="0.65">Ruhig</option><option value="1" selected>Normal</option><option value="1.35">Intensiv</option></select>
+            <label for="memoryCloudQuality">Qualität</label>
+            <select class="eve-input" id="memoryCloudQuality"><option value="low">Sparsam</option><option value="medium" selected>Normal</option><option value="high">Fein</option></select>
+          </header>
+          <div class="memory-cloud-xr-controls eve-toolbar" aria-label="VR und AR / Mixed Reality">
+            <button class="eve-button eve-button--secondary" id="memoryCloudVR" type="button" aria-pressed="false" disabled>VR ÖFFNEN</button>
+            <button class="eve-button eve-button--secondary" id="memoryCloudAR" type="button" aria-pressed="false" disabled>AR / MR ÖFFNEN</button>
+            <button class="eve-button eve-button--ghost" id="memoryCloudXREnd" type="button" hidden>XR BEENDEN</button>
+            <output class="memory-cloud-xr-status" id="memoryCloudXRStatus" aria-live="polite">VR-/AR-Verfügbarkeit wird beim Öffnen geprüft.</output>
+          </div>
+          <aside class="memory-cloud-learning-focus" id="memoryCloudLearningFocus" hidden>
+            <span class="memory-cloud-learning-mark" aria-hidden="true"></span>
+            <div><strong id="memoryCloudLearningTitle">LERNERGEBNIS</strong><small id="memoryCloudLearningDetail"></small></div>
+            <button class="eve-button eve-button--ghost" id="memoryCloudLearningClear" type="button">MARKIERUNG LÖSCHEN</button>
+          </aside>
+          <details class="memory-cloud-activity" id="memoryCloudActivityControls">
+            <summary><span>TURN-AKTIVITÄT</span><output id="memoryCloudActivityPosition">Kein Turn gewählt</output></summary>
+            <div class="memory-cloud-activity-panel eve-toolbar" aria-label="Reale Turn-Aktivität">
+              <label for="memoryCloudTurn">Turn</label><input class="eve-input" id="memoryCloudTurn" type="text" maxlength="512" placeholder="Turn-ID">
+              <button class="eve-button eve-button--ghost" id="memoryCloudActivityLoad" type="button">LADEN</button>
+              <label for="memoryCloudActivityCategory">Aktivität</label><select class="eve-input" id="memoryCloudActivityCategory"><option value="all">Alle belegten</option><option value="retrieval">Retrieval</option><option value="llm_context">LLM-Kontext</option><option value="deterministic">Deterministisch</option><option value="actions">Aktionen</option><option value="lifecycle">Lifecycle</option><option value="relations">Relationsnutzung</option></select>
+              <div class="memory-cloud-playback">
+                <button class="eve-button eve-button--ghost" id="memoryCloudActivityPrevious" type="button" title="Vorheriges persistiertes Ereignis">‹</button>
+                <button class="eve-button eve-button--ghost" id="memoryCloudActivityPlay" type="button" aria-pressed="false">START</button>
+                <button class="eve-button eve-button--ghost" id="memoryCloudActivityNext" type="button" title="Nächstes persistiertes Ereignis">›</button>
+                <button class="eve-button eve-button--ghost" id="memoryCloudActivityClear" type="button" title="Turn-Aktivität zurücksetzen">↺</button>
+              </div>
+              <label for="memoryCloudActivitySpeed">Tempo</label><select class="eve-input" id="memoryCloudActivitySpeed"><option value="1800">0,5×</option><option value="900" selected>1×</option><option value="450">2×</option></select>
+              <label class="memory-cloud-live"><input id="memoryCloudLive" type="checkbox"> LIVE</label>
+            </div>
+          </details>
+          <output class="memory-cloud-status" id="memoryCloudStatus" aria-live="polite">NeuroCloud wird beim Öffnen geladen.</output>
+          <output class="memory-cloud-working-status" id="memoryCloudWorkingStatus" aria-live="polite">Lernaktivität wird geladen …</output>
+          <details class="memory-cloud-legend" id="memoryCloudLegend">
+            <summary>FARBEN</summary>
+            <div class="memory-cloud-legend-panel">
+              <section>
+                <strong>AKTIVITÄT</strong>
+                <div class="memory-cloud-legend-items">
+                  <span><i class="swatch retrieval"></i>Retrieval</span>
+                  <span><i class="swatch llm-context"></i>LLM-Kontext</span>
+                  <span><i class="swatch deterministic"></i>Deterministisch</span>
+                  <span><i class="swatch actions"></i>Aktionen</span>
+                  <span><i class="swatch lifecycle"></i>Memory-Änderung</span>
+                  <span><i class="swatch relations"></i>Relationsnutzung</span>
+                </div>
+              </section>
+              <section>
+                <strong>STATUS · ÜBERSCHREIBT AKTIVITÄTSFARBE</strong>
+                <div class="memory-cloud-legend-items">
+                  <span><i class="swatch failed"></i>Fehlgeschlagen</span>
+                  <span><i class="swatch cancelled"></i>Abgebrochen</span>
+                  <span><i class="swatch uncertain"></i>Ungewiss / laufend</span>
+                </div>
+              </section>
+              <section>
+                <strong>AUSWAHL</strong>
+                <div class="memory-cloud-legend-items">
+                  <span><i class="swatch learning-result"></i>Claim aus geöffnetem Lernergebnis</span>
+                  <span><i class="swatch selected-claim"></i>Ausgewählter Claim</span>
+                  <span><i class="swatch direct-hop"></i>Direkte Beziehung</span>
+                  <span><i class="swatch next-hop"></i>Nächster Hop</span>
+                </div>
+              </section>
+              <section>
+                <strong>GRUNDSTRUKTUR</strong>
+                <div class="memory-cloud-legend-items">
+                  <span><i class="swatch fact"></i>Fact / Claim</span>
+                  <span><i class="swatch provider-binding"></i>Provider-Binding</span>
+                  <span><i class="swatch alias"></i>Alias</span>
+                  <span><i class="swatch retired"></i>Abgelöst</span>
+                  <span><i class="swatch invalid"></i>Invalidiert</span>
+                  <span><i class="swatch relation-line"></i>Gespeicherte Relation</span>
+                  <span><i class="swatch working-material"></i>Temporäres Lernmaterial · oberhalb der Memory-Struktur</span>
+                </div>
+                <p>Nebelfarben kennzeichnen Scope-Dichtebereiche. Sie beweisen keine semantische Beziehung.</p>
+              </section>
+            </div>
+          </details>
+          <div class="memory-cloud-tooltip" id="memoryCloudTooltip" role="tooltip" hidden></div>
+          <div class="memory-cloud-fallback" id="memoryCloudFallback" hidden>
+            <strong>3D ist in diesem Browser nicht verfügbar.</strong>
+            <p>Claims lassen sich weiterhin links durchsuchen und im Inspektor öffnen.</p>
+          </div>
+          <button class="memory-cloud-more eve-button eve-button--secondary" id="memoryCloudMore" type="button" hidden>MEMORY NEU LADEN</button>
+          <p class="memory-cloud-truth">Positionen ordnen die Ansicht; räumliche Nähe allein ist keine semantische Aussage. Aktivität stammt ausschließlich aus persistierten Runtime-Ereignissen; es gibt keine simulierte Aktivität.</p>
+        </section>
+        <section class="memory-timeline-workspace" id="memoryTimelineWorkspace" aria-label="Memory-Ereignis-Timeline" hidden>
+          <header class="memory-playback eve-toolbar">
+            <button class="eve-button eve-button--ghost" id="memoryTimelineFirst" type="button" title="Zum Anfang des geladenen Ereignisfensters">|‹</button>
+            <button class="eve-button eve-button--ghost" id="memoryTimelinePrevious" type="button" title="Vorheriges Ereignis">‹</button>
+            <button class="eve-button eve-button--ghost" id="memoryTimelinePlay" type="button" aria-pressed="false">START</button>
+            <button class="eve-button eve-button--ghost" id="memoryTimelineNext" type="button" title="Nächstes Ereignis">›</button>
+            <label for="memoryTimelineSpeed">Tempo</label><select class="eve-input" id="memoryTimelineSpeed"><option value="2000">0,5×</option><option value="1000" selected>1×</option><option value="500">2×</option></select>
+            <output id="memoryTimelinePosition">Kein Ereignis gewählt</output>
+          </header>
+          <p class="memory-timeline-notice">Wiedergabe springt ereignisweise zwischen geladenen, persistenten Datensätzen. Zeitliche Lücken werden nicht aufgefüllt.</p>
+          <div class="memory-timeline-list" id="memoryTimelineList"></div>
+          <button class="eve-button memory-timeline-more" id="memoryTimelineMore" type="button" hidden>ÄLTERE EREIGNISSE LADEN</button>
+        </section>
+        <div class="semantic-workspace" id="semanticWorkspace" hidden></div>
+        <section class="brainwatch-statistics-workspace" id="brainwatchEventsWorkspace" aria-label="Strukturierte Ereignis-Inbox" hidden>
+          <h2>Ereignis-Inbox</h2>
+          <p>Offene Gruppen. Die Anzeige quittiert keine Ereignisse und löst keine Reaktion aus.</p>
+          <div id="brainwatchEventsContent"></div>
+          <button class="eve-button eve-button--ghost" id="brainwatchEventsMore" type="button" hidden>WEITERE LADEN</button>
+        </section>
+        <section class="brainwatch-statistics-workspace" id="brainwatchStatisticsWorkspace" aria-label="Persistente EVE-Statistik" hidden>
+          <header class="brainwatch-statistics-head">
+            <span class="eyebrow">EVE IN ZAHLEN</span>
+            <h2>Persistenter Systembestand</h2>
+            <p>Claims, Relations, Home Assistant, Tool-Aufrufe und belegte Runtime-Aktivität.</p>
+          </header>
+          <div class="brainwatch-statistics-content" id="brainwatchStatisticsContent"></div>
+        </section>
+      </div>
+      <div class="brainwatch-column-resize brainwatch-column-resize--right" id="brainwatchInspectorResize" role="separator" aria-label="Breite des Inspektors ändern" aria-orientation="vertical" aria-valuemin="230" aria-valuemax="520" tabindex="0"><span aria-hidden="true"></span></div>
+      <aside class="brainwatch-inspector-shell eve-panel" id="brainwatchInspectorShell">
+        <button class="brainwatch-inspector-collapse eve-icon-button eve-button--ghost" id="brainwatchInspectorCollapse" type="button" aria-expanded="true" aria-label="Inspektor einklappen">›</button>
+        <div class="brainwatch-inspector" id="brainwatchInspector" aria-live="polite">
+          <span class="eyebrow">INSPECTOR</span>
+          <h2>Noch kein Knoten gewählt</h2>
+          <p>Jeder sichtbare Pfeil zeigt eine gespeicherte, erklärbare Beziehung.</p>
+        </div>
+      </aside>
+    </div>
+  </section>
+
+  <footer class="command-dock" id="commandDock">
+    <button class="voice-mute eve-icon-button" id="voiceMute" type="button" aria-pressed="false" aria-label="EVEs Sprachausgabe stummschalten" title="Sprachausgabe stummschalten">
+      <svg class="voice-mute-icon voice-on-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+        <path d="M4 10v4h4l5 4V6L8 10H4zm12-1.5a5 5 0 0 1 0 7m2.5-9.5a8.5 8.5 0 0 1 0 12"></path>
+      </svg>
+      <svg class="voice-mute-icon voice-off-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+        <path d="M4 10v4h4l5 4V6L8 10H4m7.5 2.5 7 7m0-7-7 7"></path>
+      </svg>
+    </button>
+    <button class="ptt eve-button" id="ptt" type="button" aria-label="Gedrückt halten, um mit EVE zu sprechen">
+      <span class="ptt-meter" aria-hidden="true"><span id="pttLevel"></span></span>
+      <span class="ptt-copy" id="pttText">GEDRÜCKT HALTEN ZUM SPRECHEN</span>
+      <span class="mic-glyph" aria-hidden="true"><span></span></span>
+    </button>
+    <button class="share-toggle eve-icon-button" id="shareToggle" type="button" aria-controls="conversation composer" aria-expanded="false" aria-label="Seitenbereich öffnen" title="Seitenbereich öffnen">
+      <svg class="panel-toggle-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+        <rect x="3.5" y="4.5" width="17" height="15" rx="2"></rect>
+        <path d="M15 5v14"></path>
+        <path class="panel-open-mark" d="M18 12h-6m2.5-2.5L12 12l2.5 2.5"></path>
+        <path class="panel-close-mark" d="M12 12h6m-2.5-2.5L18 12l-2.5 2.5"></path>
+      </svg>
+    </button>
+  </footer>
+
+  <div class="composer-scrim" id="composerScrim" hidden></div>
+
+  <dialog class="task-editor" id="taskEditor" aria-labelledby="taskEditorTitle">
+    <form id="taskEditorForm" method="dialog">
+      <header>
+        <div><span class="eyebrow">GEPLANTE AUFGABE</span><h2 id="taskEditorTitle">Aufgabe ändern</h2></div>
+        <button id="taskEditorClose" type="button" aria-label="Editor schließen">×</button>
+      </header>
+      <label>Auftrag<textarea id="taskMessage" rows="3" required></textarea></label>
+      <label>Wiederholung
+        <select id="taskScheduleType">
+          <option value="once">Einmalig</option>
+          <option value="delay">Einmalig nach einer Verzögerung</option>
+          <option value="daily">Täglich</option>
+          <option value="weekly">Bestimmte Wochentage</option>
+          <option value="interval">Festes Intervall</option>
+        </select>
+      </label>
+      <label id="taskOnceRow">Datum und Uhrzeit<input id="taskOnceAt" type="datetime-local"></label>
+      <label id="taskTimeRow" hidden>Uhrzeit<input id="taskTime" type="time"></label>
+      <fieldset id="taskWeekdays" hidden>
+        <legend>Wochentage</legend>
+        <label><input type="checkbox" value="0">Mo</label><label><input type="checkbox" value="1">Di</label>
+        <label><input type="checkbox" value="2">Mi</label><label><input type="checkbox" value="3">Do</label>
+        <label><input type="checkbox" value="4">Fr</label><label><input type="checkbox" value="5">Sa</label>
+        <label><input type="checkbox" value="6">So</label>
+      </fieldset>
+      <div class="task-interval" id="taskIntervalRow" hidden>
+        <label>Abstand<input id="taskIntervalValue" type="number" min="1" value="30"></label>
+        <label>Einheit<select id="taskIntervalUnit"><option value="60">Minuten</option><option value="3600">Stunden</option><option value="86400">Tage</option></select></label>
+      </div>
+      <label class="task-status"><input id="taskActive" type="checkbox"> Aufgabe aktiv</label>
+      <p class="task-editor-error" id="taskEditorError" role="alert"></p>
+      <footer><button id="taskEditorCancel" type="button">ABBRECHEN</button><button class="send" type="submit">SPEICHERN</button></footer>
+    </form>
+  </dialog>
+  <noscript>Für EVE muss JavaScript aktiviert sein.</noscript>
+  <script src="vendor/marked.umd.js" defer></script>
+  <script src="vendor/purify.min.js" defer></script>
+  <script src="vendor/neurocloud-webgl-v1.js?v=1.21" defer></script>
+  <script src="neurocloud-working.js?v=2" defer></script>
+  <script src="learning-help.js?v=1" defer></script>
+  <script src="neurocloud-xr.js?v=6" defer></script>
+  <script src="vendor/html2canvas.min.js" defer></script>
+  <script src="chat-export.js" defer></script>
+  <script src="app.js?v=20261025-cloud-growth1" defer></script>
+</body>
+</html>

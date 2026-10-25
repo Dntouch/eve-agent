@@ -1,0 +1,11 @@
+{
+  "domain": "eve_agent",
+  "name": "EVE",
+  "version": "0.1.0",
+  "config_flow": true,
+  "documentation": "https://www.home-assistant.io/integrations/conversation/",
+  "codeowners": [],
+  "dependencies": ["conversation", "stt", "tts"],
+  "iot_class": "local_push",
+  "requirements": []
+}
