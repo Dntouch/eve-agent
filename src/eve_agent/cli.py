@@ -189,7 +189,7 @@ def build(root: Path, cfg: dict, *, config_path: Path | None = None):
         shell=shell,
     )
     agent.work_task_store = WorkTaskStore(database)
-    agent.memory_learning = ProductiveLearningPipeline(database, llm, diagnostics)
+    agent.memory_learning = ProductiveLearningPipeline(database, llm, diagnostics, semantic_links=agent.semantic_links)
     agent.working_memory_cleanup = WorkingMemoryCleanupCoordinator(
         database, cfg.get("working_memory", {}),
     )

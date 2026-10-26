@@ -6790,6 +6790,81 @@
     return button;
   }
 
+  function conversationLearningTrace(item) {
+    const trace = document.createElement("section");
+    trace.className = "conversation-learning-trace";
+    const title = document.createElement("strong"); title.textContent = "Was ist mit Deinem Auftrag passiert?";
+    const steps = document.createElement("ol");
+    trace.append(title, steps);
+    const usage = item.llm_usage || {};
+    const usageLabels = {yes: "mit LLM", no: "ohne LLM", unknown: "LLM-Beteiligung nicht nachweisbar"};
+    const usageLine = document.createElement("p");
+    usageLine.className = "conversation-learning-llm-usage";
+    const paths = {exact: "exakte Wiederholung", similarity: "dynamische Semantik", composition: "differenzielle Komposition"};
+    const pathLabel = paths[item.execution_path] ? ` (${paths[item.execution_path]})` : "";
+    usageLine.textContent = `Ausführung: ${usageLabels[usage.execution] || usageLabels.unknown}${pathLabel} · Spätere Lernprüfung: ${usageLabels[usage.learning] || usageLabels.unknown}`;
+    title.after(usageLine);
+    const learned = item.semantic_learning;
+    if (learned) {
+      const labels = {new_formulation: "Neue Formulierung mit einer bekannten Aktion verknüpft",
+        new_action: "Neue semantische Aktion samt Formulierung gespeichert",
+        semantic_candidate: "Semantische Formulierung als Kandidat gespeichert",
+        supporting_evidence: "Bereits gespeicherte semantische Erfahrung nachgewiesen",
+        not_reusable: "Keine wiederverwendbare Formulierung gelernt"};
+      const summary = document.createElement("p");
+      summary.textContent = `Was wurde gelernt? ${labels[learned.kind] || learned.kind}. ${learned.reason || ""}`;
+      if (learned.release) summary.textContent += learned.direct_execution
+        ? " Für direkte Ausführung ohne LLM freigegeben."
+        : learned.context_dependent ? " Kontextabhängig; vor Ausführung erneut durch das LLM zu prüfen."
+        : " Freigabe zur direkten Ausführung noch nicht belegt.";
+      usageLine.after(summary);
+    }
+    function step(label, text) {
+      const row = document.createElement("li");
+      const heading = document.createElement("strong"); heading.textContent = label;
+      const body = document.createElement("p"); body.textContent = text;
+      row.append(heading, body); steps.append(row);
+      return row;
+    }
+    function details(row, label, value) {
+      const box = document.createElement("details");
+      const summary = document.createElement("summary"); summary.textContent = label;
+      const data = document.createElement("pre"); data.textContent = JSON.stringify(value, null, 2);
+      box.append(summary, data); row.append(box);
+    }
+    step("Dein Auftrag", item.user_content || "Die ursprüngliche Nachricht ist nicht mehr vorhanden.");
+    const actions = item.recognized_actions || [];
+    const recognition = step("Zuordnung", actions.length
+      ? actions.map(action => `${action.display_text} (heutiger Status: ${action.lifecycle})`).join("\n")
+      : "Aus diesem Lerneintrag ist keine verknüpfte bekannte Aktion nachweisbar.");
+    if (actions.length) details(recognition, "Gespeicherte Aktionsdaten", actions);
+    const tools = item.tool_events || [];
+    if (!tools.length) step("Ausführung", "Für diesen Gesprächsschritt ist kein Werkzeugaufruf gespeichert. Eine Ausführung lässt sich hier nicht belegen.");
+    for (const tool of tools) {
+      const row = step("Ausführung", `${tool.tool}: ${tool.summary || "Ohne Zusammenfassung"}`);
+      details(row, "Gesendeter Befehl", tool.input);
+      const labels = {completed: "Erfolg gemeldet", success: "Erfolg gemeldet", error: "Fehler gemeldet", failed: "Fehler gemeldet"};
+      const result = step("Rückmeldung des Werkzeugs", labels[tool.status] || `Gespeicherter Status: ${tool.status}`);
+      details(result, "Originalergebnis", tool.result);
+    }
+    if (tools.length) {
+      const note = document.createElement("p");
+      note.textContent = "Eine Erfolgsmeldung bestätigt die gemeldete Ausführung. Ob das Gerät den gewünschten Zustand erreicht hat, muss das Ergebnis selbst belegen.";
+      trace.append(note);
+    }
+    step("EVEs Antwort", item.assistant_content || "Keine Antwort gespeichert.");
+    const claims = item.claims || [];
+    const learning = step("Dauerhaftes Lernen", `${conversationLearningDecisionLabels[item.decision_type] || "Noch keine abgeschlossene Lernentscheidung"}. ${claims.length} Wissenseinträge, ${item.evidence_count || 0} Belege aus diesem Gesprächsschritt.`);
+    for (const claim of claims) {
+      const text = document.createElement("p");
+      text.textContent = claim.payload?.kind === "recognition"
+        ? `Zuordnung ${claim.payload.polarity === "positive" ? "bestätigt" : claim.payload.polarity === "negative" ? "abgelehnt" : "bewertet"}: „${claim.payload.input_formulation}“. ${claim.payload.basis || ""}`
+        : claim.display_text;
+      learning.append(text);
+    }
+    return trace;
+  }
+
   function conversationLearningJobCard(item) {
     const statusHelp = window.EveLearningHelp.status(item.status);
     const card = document.createElement("article"); card.className = `conversation-learning-job is-${item.status}`;
@@ -6821,6 +6896,7 @@
       error.append(label, learningHelpButton(help), code); decision.append(error);
     }
     card.append(decision);
+    card.append(conversationLearningTrace(item));
     if (item.status === "failed" || item.status === "reviewed") {
       if (item.latest_attempt) {
         const attempt = document.createElement("details");

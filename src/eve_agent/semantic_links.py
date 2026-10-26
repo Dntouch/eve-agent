@@ -1108,7 +1108,9 @@ class SemanticLinks:
     def learn(self, utterance, context, provider, plan, result, *, source_ref,
               provider_validated=False, supersedes=None, interpretation_utterance=None,
               published_actions=None, differential_evidence=None,
-              exact_replay_authorized=False, provenance_root=None):
+              exact_replay_authorized=False, provenance_root=None, interpretation_source='llm', _connection=None):
+        if interpretation_source not in {'llm', 'differential_composition'}:
+            raise ValueError('Unknown interpretation source')
         if not source_ref or not plan.get('actions') or plan.get('clarification'):
             return None
         if plan.get('replay_safe') is False:
@@ -1131,6 +1133,7 @@ class SemanticLinks:
             strong_semantic_evidence=strong, origin_ref=source_ref,
             differential_provenance_root=source_ref if provenance_root is None else provenance_root,
             differential_origin='composition' if differential_evidence else 'planner_experience',
+            interpretation_source=interpretation_source,
             differential_evidence=differential_evidence,
             provider_validated=provider_validated is True,
             technical_status=result.get('status', 'unknown'), confirmation='unconfirmed',
@@ -1140,13 +1143,16 @@ class SemanticLinks:
             last_success=now if result.get('status') == 'success' else None, version=1))
         if payload['utterance'] != utterance or payload['original_context'] != context or payload['plan'] != plan:
             return None
-        with self.database.connect() as c:
+        with nullcontext(_connection) if _connection is not None else self.database.connect() as c:
             c.execute('''INSERT INTO memory_claims
             (id,claim_kind,scope,canonical_key,display_text,payload_json,lifecycle,
              verification_policy,created_at,updated_at)
             VALUES (?,'opaque_fact',?,?,?,?,'candidate','dynamic',?,?)''',
                       (claim_id, SCOPE, claim_id, utterance, identity(payload), now, now))
-            self._evidence(c, claim_id, 'llm_interpretation', dict(plan=plan, context=context), source_ref)
+            self._evidence(c, claim_id, 'llm_interpretation' if interpretation_source == 'llm'
+                           else 'differential_interpretation', dict(plan=plan, context=context,
+                           **({'differential_evidence': differential_evidence}
+                              if interpretation_source == 'differential_composition' else {})), source_ref)
             self._evidence(c, claim_id, 'provider_result', result, source_ref)
             if provider_validated:
                 self._evidence(c, claim_id, 'provider_validation', {'validated': True}, source_ref)
@@ -1189,7 +1195,7 @@ class SemanticLinks:
                     replay_authorization='runtime_revalidation_required',
                 )
             self._update(c, claim_id, payload, 'active' if payload['usability'] == 'automatic' else 'candidate')
-        self.differential.refresh_claim(claim_id)
+            self.differential.refresh_claim(claim_id, _connection=c)
         return claim_id
 
     def action_candidates(self, provider, *, context, effect=None, resources=None,
@@ -1405,8 +1411,8 @@ class SemanticLinks:
             c.execute("INSERT INTO memory_relations VALUES (?,?,?,'refines',?,?)",
                       (str(uuid.uuid4()), claim_id, r['id'], evidence_id, _now()))
 
-    def experience(self, claim_id):
-        with self.database.connect() as c:
+    def experience(self, claim_id, *, _connection=None):
+        with nullcontext(_connection) if _connection is not None else self.database.connect() as c:
             row = c.execute('SELECT id,lifecycle,created_at,payload_json FROM memory_claims WHERE scope=? AND id=?', (SCOPE,claim_id)).fetchone()
             if row is None:
                 raise KeyError(claim_id)
@@ -1815,8 +1821,8 @@ class SemanticLinks:
             self._evidence(c, claim_id, 'reuse_result', result, source_ref)
             self.differential.refresh_claim(claim_id, _connection=c)
 
-    def attach_turn_provenance(self, source_ref, turn_id, user_message_id):
-        with self.database.connect() as c:
+    def attach_turn_provenance(self, source_ref, turn_id, user_message_id, *, _connection=None):
+        with nullcontext(_connection) if _connection is not None else self.database.connect() as c:
             c.execute("""UPDATE memory_evidence SET source_turn_id=?,
                 source_message_id=CASE WHEN evidence_type IN ('user_confirmation','user_correction','llm_interpretation',
                                       'explicit_language_relation','explicit_language_relation_reaffirmed',

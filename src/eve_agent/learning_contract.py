@@ -72,6 +72,33 @@ def learning_response_format(*, batch=False, contexts=None):
                 'observed_value': {'description': 'Original JSON value at result_pointer; preserve type, e.g. boolean true rather than string true.'},
             }}},
     }}
+    from .conversation_semantics import formulation_schema
+    semantic_schema = formulation_schema()
+    semantic_schema['type'] = ['object', 'null']
+    proposal['properties']['semantic_formulation'] = semantic_schema
+    proposal['properties']['semantic_learning_reason'] = {'type': 'string'}
+    proposal['properties']['decision_type']['description'] = (
+        'General knowledge decision only. If only a semantic formulation is learned, use no_persist '
+        'with claim=null, evidence=[], matched_claim_ids=[] and relations=[]. Semantic action matching '
+        'belongs only in semantic_formulation.assessment.action_link, never in the general append decision.')
+    if any((context.get('semantic_learning') or {}).get('available') for context in contexts or []):
+        proposal['required'] += ['semantic_formulation', 'semantic_learning_reason']
+    if contexts and len(contexts) == 1:
+        semantic_context = contexts[0].get('semantic_learning') or {}
+        if semantic_context.get('executions'):
+            semantic_schema['properties']['call_references']['items']['enum'] = sorted(semantic_context['executions'])
+        if semantic_context.get('observations'):
+            semantic_schema['properties']['evidence']['items']['properties']['call_reference']['enum'] = sorted(semantic_context['observations'])
+        if semantic_context.get('available'):
+            declaration_schema = semantic_schema['properties']['assessment']['properties']['action_link']
+            candidates = semantic_context.get('action_candidates', [])
+            declaration_schema['anyOf'] = [
+                {'properties': {'kind': {'const': 'existing'},
+                                'representation_id': {'const': item['representation_id']},
+                                'anchor_claim_id': {'enum': [e['claim_id'] for e in item['examples']]}},
+                 'required': ['representation_id', 'anchor_claim_id']}
+                for item in candidates if item.get('examples')
+            ] + declaration_schema['anyOf'][1:]
     source_ids = set()
     claim_ids = set()
     for context in contexts or []:

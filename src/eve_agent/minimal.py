@@ -1,10 +1,10 @@
-"""EVE's native model/tool runtime.
+"""EVE's native model/tool runtime with verified reuse of confirmed experiences.
 
 Qwen receives the short identity prompt, current conversation, retrieved Memory
 evidence and the real contracts published by connected providers.  Python does
 not classify utterances, infer provider intent, translate Home Assistant
-actions or run a second planner.  It validates and dispatches the exact native
-tool call selected by the model and returns the real provider result.
+actions or run a second planner. Confirmed exact experiences can execute through
+the same provider transport after live validation, without a new model decision.
 """
 from __future__ import annotations
 
@@ -736,8 +736,10 @@ class NativeToolRuntime:
         if capability == "working_memory":
             return self.working_session.execute(operation, parameters), Route.MEMORY
         if capability == "home_assistant":
-            from .transient_credentials import resolve_credentials
+            from .transient_credentials import contains_credentials, resolve_credentials
             result = a.home_assistant.execute_native_operation(operation, resolve_credentials(parameters))
+            result = {**result, "provider_identity": a.home_assistant.semantic_provider_identity(),
+                      "semantic_execution_recordable": not contains_credentials(parameters)}
             a._presentation_resources.extend(deepcopy(result.get("resources", [])))
             return result, Route.HOME
         if capability == "web":
@@ -988,6 +990,8 @@ class NativeToolRuntime:
         a._presentation_resources = []
         a._turn_state = "conversational"
         a._turn_state_details = {"decision_origin": "native_tool"}
+        if self.semantic_session:
+            a._turn_state_details["semantic_context"] = deepcopy(self.semantic_session.context)
         a._knowledge_flow = {"version": 1, "stages": []}
         a.last_sources = []
 
@@ -995,6 +999,10 @@ class NativeToolRuntime:
             "work_task_discoveries": [], "loaded_capabilities": [],
             "turn_query": text, "trace_id": trace_id,
         }
+        from .learned_execution import try_replay
+        replayed = try_replay(self, text, images, state)
+        if replayed is not None:
+            return replayed
         semantic_memory, semantic_claims = self._semantic_memory_context(text, trace_id)
         if self.semantic_session:
             self.semantic_session.retrieved = {item["memory_id"]: deepcopy(item) for item in semantic_memory}

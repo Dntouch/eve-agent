@@ -85,6 +85,12 @@ class HomeAssistant:
         )]
 
     def native_contract(self) -> dict:
+        learning_guidance = (
+            " Verify a requested service action with a subsequent GET /api/states/{entity_id} observation. "
+            "Then load semantic_learning and record the "
+            "evidenced interpretation with semantic_learning.record_action, including context "
+            "dependencies and actual goal observations, so released requests can run without a new model call."
+        )
         return {
             "description": (
                 "Native Home Assistant REST and WebSocket transport. Use Home Assistant paths and "
@@ -101,7 +107,7 @@ class HomeAssistant:
                         "/api/services/{domain}/{service} and its native JSON body, for example "
                         "{\"entity_id\":\"light.example\"}. Home Assistant validates the request. "
                         "A response with an image/* content type is attached to the next model turn "
-                        "as native image input."
+                        "as native image input." + learning_guidance
                     ),
                     "parameters_schema": {
                         "type": "object", "additionalProperties": False,
@@ -127,7 +133,7 @@ class HomeAssistant:
                         "{\"type\":\"call_service\",\"domain\":\"light\","
                         "\"service\":\"turn_on\",\"target\":{\"entity_id\":\"light.example\"},"
                         "\"service_data\":{}}; a service name such as light.turn_on is never the "
-                        "WebSocket command type. EVE adds only authentication and the transport id."
+                        "WebSocket command type. EVE adds only authentication and the transport id." + learning_guidance
                     ),
                     "parameters_schema": {
                         "type": "object", "additionalProperties": False,

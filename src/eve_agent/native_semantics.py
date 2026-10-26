@@ -49,7 +49,8 @@ class NativeSemanticSession:
                  "executed": deepcopy(execution), "meaning_assessed": False} if execution else {"call_reference": reference})
 
     def contract(self):
-        keys = {"type": "array", "items": {"enum": list(CONTEXT_KEYS)}, "uniqueItems": True}
+        keys = {"type": "array", "items": {"enum": list(CONTEXT_KEYS)}, "uniqueItems": True,
+                "description": "Only context necessary to resolve this request, not all context present. Existing history or focus alone is not a dependency. Matching a complete request to durable Memory does not require conversational history."}
         assessment = obj({"status": {"enum": ["resolved", "uncertain"]}, "context_keys": keys,
             "user_grounding": {"enum": ["explicit", "contextual", "unknown"]},
             "utterance_quote": text(), "basis": text(minLength=1),
@@ -136,7 +137,7 @@ class NativeSemanticSession:
                 source_ref=self.trace_id, basis=args["basis"], user_utterance=self.utterance)
         raise ValueError("Unknown semantic learning operation")
 
-    def record(self, args):
+    def record(self, args, *, _connection=None):
         refs = tuple(args["call_references"])
         if refs in self.recorded:
             if self.record_arguments[refs] != args:
@@ -163,6 +164,21 @@ class NativeSemanticSession:
         plan = {"effect": executions[0]["effect"],
             "actions": [deepcopy(action) for item in executions for action in item["actions"]],
             "semantic_learning": deepcopy(args["assessment"])}
+        # Preserve actual goal observations for later verified replay. No service
+        # name or user wording is translated into an assumed target state.
+        observations = []
+        for item in evidence:
+            source = self.calls[item["call_reference"]]
+            parameters = source["parameters"]
+            path = parameters.get("path", "")
+            if (source["operation"] == "http_request" and parameters.get("method") == "GET"
+                    and path.startswith("/api/states/")
+                    and (item["pointer"] == "/response/body/state"
+                         or item["pointer"].startswith("/response/body/attributes/"))):
+                observations.append({"entity_id": path[len("/api/states/"):],
+                                     "pointer": item["pointer"], "value": deepcopy(item["value"])})
+        if observations:
+            plan["replay_observations"] = observations
         if assessment_conditions(plan["semantic_learning"], self.context, self.utterance, plan) is None:
             raise ValueError("Invalid model-authored semantic assessment or user grounding")
         outcome = {"status": args["outcome"], "basis": args["outcome_basis"], "evidence": evidence,
@@ -180,8 +196,9 @@ class NativeSemanticSession:
                 root = self.links.experience(args["based_on"]).get("differential_provenance_root") or ""
         claim_id = self.links.learn(self.utterance, self.context, provider, plan, outcome,
             source_ref=self.trace_id, provider_validated=True,
+            exact_replay_authorized=args["outcome"] == "success" and bool(observations),
             published_actions=self.published.get(executions[0]["capability"], []),
-            differential_evidence=differential_evidence, provenance_root=root)
+            differential_evidence=differential_evidence, provenance_root=root, _connection=_connection)
         if not claim_id:
             raise ValueError("The experience cannot be stored without changing its source identity")
         audit = self.agent._turn_state_details.setdefault("native_semantic_references", {})
@@ -197,7 +214,7 @@ class NativeSemanticSession:
             self.agent._turn_state = "operational_resolved"
             self.agent._turn_state_details.update(operational_execution=True)
         result = {"status": "completed", "claim_id": claim_id, "action_executed": False,
-                  "experience": self.links.experience(claim_id)}
+                  "experience": self.links.experience(claim_id, _connection=_connection)}
         self.recorded[refs] = deepcopy(result)
         self.record_arguments[refs] = deepcopy(args)
         return result

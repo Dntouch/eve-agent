@@ -5,7 +5,7 @@ import tempfile
 from types import SimpleNamespace
 import unittest
 import uuid
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 from eve_agent.agent import EveAgent
 from eve_agent.home_assistant import HomeAssistant
@@ -82,7 +82,10 @@ class NativeSemanticLearningTest(unittest.TestCase):
                 return self.call("semantic_learning__record_action", record)
             return {"content": "Ausgeführt und bewertet.", "tool_calls": []}
         self.llm.request_tool_turn.side_effect = turn
-        self.agent.respond(text)
+        # This helper explicitly exercises model-authored learning. Replay is
+        # tested separately with the model forbidden from being called.
+        with patch("eve_agent.learned_execution.try_replay", return_value=None):
+            self.agent.respond(text)
         events = self.agent._tool_events
         record = next(e for e in events if e.get("operation") == "record_action")
         return record["result"]
@@ -107,7 +110,8 @@ class NativeSemanticLearningTest(unittest.TestCase):
         result = self.action("do xa p")
         self.assertEqual("completed", result["status"], result)
         claim = self.agent.semantic_links.experience(result["claim_id"])
-        self.assertEqual("candidate", claim["lifecycle"])
+        self.assertEqual("active", claim["lifecycle"])
+        self.assertEqual("operationally_grounded", claim["confirmation"])
         self.assertEqual("created", claim["action_link_status"])
         self.assertEqual("light.A", claim["plan"]["actions"][0]["entity_id"])
         with self.db.connect() as c:

@@ -1154,6 +1154,20 @@ class ConversationLearningTest(unittest.TestCase):
         pipeline.accept_turn(turn)
         pipeline.process_batch([turn])
 
+        other_turn = self.turn('unrelated-execution')
+        with self.database.connect() as connection:
+            for source_turn, event_id, entity in [(turn, 'trace-own', 'light.hall'),
+                                                   (other_turn, 'trace-other', 'light.kitchen')]:
+                source = connection.execute('SELECT * FROM turns WHERE id=?', (source_turn,)).fetchone()
+                connection.execute(
+                    'INSERT INTO conversation_tool_events '
+                    '(id,conversation_id,message_id,ordinal,tool,status,summary,input_json,result_json,created_at) '
+                    'VALUES (?,?,?,0,?,?,?,?,?,?)',
+                    (event_id, source['conversation_id'], source['assistant_message_id'],
+                     'home_assistant', 'success', 'Licht ausschalten',
+                     json.dumps({'entity_id': entity}), json.dumps({'status': 'success'}), source['created_at']),
+                )
+
         page = pipeline.learning_jobs('evidenced', limit=10)
 
         self.assertEqual(1, page['total'])
@@ -1167,6 +1181,19 @@ class ConversationLearningTest(unittest.TestCase):
         self.assertEqual(1, len(item['claims']))
         self.assertEqual('Dauerhafte Information 1', item['claims'][0]['display_text'])
         self.assertEqual(turn, item['claims'][0]['evidence'][0]['source_turn_id'])
+        self.assertEqual(['trace-own'], [event['id'] for event in item['tool_events']])
+        self.assertEqual({'entity_id': 'light.hall'}, item['tool_events'][0]['input'])
+        self.assertEqual({'status': 'success'}, item['tool_events'][0]['result'])
+        self.assertEqual([], item['recognized_actions'])
+        self.assertEqual({'execution': 'unknown', 'learning': 'yes'}, item['llm_usage'])
+        for origin, expected in [('native_tool', 'yes'), ('semantic_replay', 'no')]:
+            with self.database.connect() as connection:
+                connection.execute('UPDATE turns SET knowledge_flow_json=? WHERE id=?',
+                                   (json.dumps({'stages': [{'kind': 'turn_state', 'details': {
+                                       'decision_origin': origin, 'semantic_reuse': 'composition'}}]}), turn))
+            refreshed = pipeline.learning_jobs('evidenced')['items'][0]
+            self.assertEqual(expected, refreshed['llm_usage']['execution'])
+            self.assertEqual('composition' if origin == 'semantic_replay' else None, refreshed['execution_path'])
 
     def test_learning_job_details_distinguish_no_persist_and_reject_unknown_status(self):
         turn = self.turn('transient')

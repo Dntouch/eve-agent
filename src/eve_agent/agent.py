@@ -425,9 +425,11 @@ class EveAgent:
             statuses = {
                 str(event.get("status")) for event in self._tool_events
                 if isinstance(event, dict) and event.get("tool") == "home_assistant"
+                and not event.get("replay_preflight")
             }
             for event in self._tool_events:
-                if not isinstance(event, dict) or event.get("tool") != "home_assistant":
+                if (not isinstance(event, dict) or event.get("tool") != "home_assistant"
+                        or event.get("replay_preflight")):
                     continue
                 result = event.get("result", {})
                 if not isinstance(result, dict):
