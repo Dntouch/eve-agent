@@ -61,6 +61,8 @@ class ScheduledTasks:
         self._monitor_thread: threading.Thread | None = None
         self._stop = threading.Event()
         self.output_targets_provider = lambda: []
+        from .scheduled_execution import restore_scheduled_origins
+        restore_scheduled_origins(database)
         with self.database.connect() as connection:
             connection.execute("""CREATE TABLE IF NOT EXISTS scheduled_deliveries (
                 id TEXT PRIMARY KEY, target_json TEXT NOT NULL, payload_json TEXT NOT NULL,
@@ -104,23 +106,29 @@ class ScheduledTasks:
                 "weekdays": {"type": "array", "minItems": 1, "items": {
                     "type": "integer", "minimum": 0, "maximum": 6,
                 }},
+                "ends_at": {"type": ["string", "null"], "format": "date-time",
+                            "description": "Optional inclusive end instant. No execution after this time; omit/null for no end."},
             },
         }
-        targets = [{"id": "current", "name": "Current conversation"}] + self.output_targets_provider()
-        target_schema = {"type": "string", "enum": [t["id"] for t in targets],
-                         "description": "Output destination; omitted means current conversation."}
-        task_ids = [item["id"] for item in self.list_tasks(include_finished=True)]
-        task_id_schema = {"type": "string"}
-        if task_ids:
-            task_id_schema["enum"] = task_ids
+        # Inventories belong in tool results, not repeated in every function
+        # schema: hundreds of conversation IDs can exceed the model context.
+        # resolve_output_target/get_task still validate IDs and access at use.
+        target_schema = {"type": "string", "minLength": 1,
+                         "description": (
+                             "Omit or use current for this conversation. For another destination, "
+                             "use an ID returned by list_output_targets."
+                         )}
+        task_id_schema = {"type": "string", "minLength": 1,
+                          "description": "Task ID returned by create or list."}
         return {
             "description": "Future and recurring EVE turns: create, inspect, pause, change or delete schedules.",
-            "output_targets": targets,
             "operations": {
                 "list_output_targets": {"effect": "read", "parameters_schema": {
                     "type": "object", "additionalProperties": False, "properties": {}}},
                 "create": {"effect": "write", "description": (
-                    "Store the instruction EVE shall execute later. delay is one-shot; interval repeats. "
+                    "Store a self-contained instruction EVE shall execute when due, not a confirmation or editing instruction. "
+                    "For reminders, instruct EVE to address the recipient now. Use schedule.ends_at when recurrence must stop. "
+                    "delay is one-shot; interval repeats. "
                     "once uses schedule.at; delay uses seconds; interval uses seconds and optional first_at; "
                     "daily uses hour/minute; weekly additionally uses weekdays where Monday=0."
                 ), "parameters_schema": {
@@ -201,6 +209,7 @@ class ScheduledTasks:
                 raise ValueError("Ungültiger geplanter Auftrag")
             schedule = self._validate_schedule(schedule_type, arguments.get("schedule"), timezone_name)
             next_run = self._next_for_update(schedule_type, schedule, timezone_name)
+            self._validate_first_run(next_run, schedule)
             task_id = str(uuid.uuid4())
             now = _utc_iso(datetime.now(timezone.utc))
             action = {
@@ -380,7 +389,9 @@ class ScheduledTasks:
                 if "schedule_type" not in changes or "schedule" not in changes:
                     raise ValueError("Zeitplantyp und Zeitplandaten müssen gemeinsam geändert werden")
                 schedule = self._validate_schedule(schedule_type, changes["schedule"], timezone_name)
-                next_run = _utc_iso(self._next_for_update(schedule_type, schedule, timezone_name))
+                candidate = self._next_for_update(schedule_type, schedule, timezone_name)
+                self._validate_first_run(candidate, schedule)
+                next_run = _utc_iso(candidate)
             elif "next_run_at" in changes:
                 value = str(changes["next_run_at"]).strip()
                 try:
@@ -392,6 +403,15 @@ class ScheduledTasks:
                 if parsed <= datetime.now(timezone.utc):
                     raise ValueError("Der Ausführungszeitpunkt muss in der Zukunft liegen")
                 next_run = _utc_iso(parsed)
+                self._validate_first_run(parsed, schedule)
+            if status == "active" and not next_run:
+                candidate = self._next_for_update(schedule_type, schedule, timezone_name)
+                self._validate_first_run(candidate, schedule)
+                if candidate <= datetime.now(timezone.utc):
+                    raise ValueError("Für die Fortsetzung muss ein zukünftiger Termin gesetzt werden")
+                next_run = _utc_iso(candidate)
+            if schedule.get("ends_at") and _from_iso(schedule["ends_at"]) < datetime.now(timezone.utc):
+                status, next_run = "completed", None
             now = _utc_iso(datetime.now(timezone.utc))
             connection.execute(
                 "UPDATE scheduled_tasks SET name=?, action_json=?, status=?, schedule_type=?, schedule_json=?, next_run_at=?, timezone=?, metadata_json=?, updated_at=? WHERE id=?",
@@ -404,6 +424,25 @@ class ScheduledTasks:
 
     @classmethod
     def _validate_schedule(cls, schedule_type: str, raw: object, timezone_name: str = "local") -> dict:
+        result = cls._validate_timing(schedule_type, raw, timezone_name)
+        if raw.get("ends_at") is not None:
+            try:
+                end = datetime.fromisoformat(raw["ends_at"].replace("Z", "+00:00"))
+                if end.tzinfo is None:
+                    end = end.replace(tzinfo=_timezone(timezone_name))
+                result["ends_at"] = _utc_iso(end)
+            except (AttributeError, TypeError, ValueError, OverflowError) as exc:
+                raise ValueError("Ungültiges Enddatum") from exc
+        return result
+
+    @staticmethod
+    def _validate_first_run(candidate, schedule):
+        end = _from_iso(schedule.get("ends_at"))
+        if end is not None and candidate > end:
+            raise ValueError("Das Enddatum liegt vor dem nächsten Ausführungstermin")
+
+    @classmethod
+    def _validate_timing(cls, schedule_type: str, raw: object, timezone_name: str = "local") -> dict:
         if schedule_type not in {"once", "delay", "daily", "weekly", "interval"} or not isinstance(raw, dict):
             raise ValueError("Ungültiger Zeitplan")
         _timezone(timezone_name)
@@ -510,6 +549,15 @@ class ScheduledTasks:
 
     def _run_due(self, limit: int | None) -> None:
         now = datetime.now(timezone.utc)
+        # Expire before claiming work, including overdue tasks after downtime.
+        # Paused tasks also finish when their deadline passes.
+        with self.database.connect() as connection:
+            for task in connection.execute("SELECT * FROM scheduled_tasks WHERE status IN ('active','paused') AND json_extract(schedule_json,'$.ends_at') IS NOT NULL").fetchall():
+                end = _from_iso(json.loads(task["schedule_json"]).get("ends_at"))
+                if end is not None and now > end:
+                    connection.execute("UPDATE scheduled_tasks SET status='completed',next_run_at=NULL,updated_at=? WHERE id=?",
+                                       (_utc_iso(now), task["id"]))
+                    self._audit(connection, task["id"], task["conversation_id"], "task.expired", "scheduler", "Enddatum erreicht")
         suffix = "" if limit is None else " LIMIT ?"
         parameters: tuple[object, ...] = (_utc_iso(now),)
         if limit is not None:
@@ -537,6 +585,7 @@ class ScheduledTasks:
                 action.setdefault("conversation_id", row["conversation_id"])
                 action["scheduled_for"] = scheduled_for
                 action["run_id"] = run_id
+                action["ends_at"] = json.loads(row["schedule_json"]).get("ends_at")
                 tool = str(action.get("tool", ""))
                 if tool not in self._executors:
                     raise RuntimeError(f"Kein Executor für {tool}")
@@ -557,15 +606,23 @@ class ScheduledTasks:
 
     def _finish(self, task, run_id: str, *, result: dict | None = None, error: str | None = None) -> None:
         finished = datetime.now(timezone.utc)
-        schedule = json.loads(task["schedule_json"])
-        scheduled_for = _from_iso(task["next_run_at"])
-        next_run = self._next_after(
-            task["schedule_type"], schedule, scheduled_for, finished,
-            task["timezone"] or "local",
-        )
         run_status = "failed" if error else "succeeded"
-        task_status = "active" if next_run else ("failed" if error else "completed")
         with self.database.connect() as connection:
+            # Respect end dates, pauses and deletions edited during a model turn.
+            current = connection.execute("SELECT * FROM scheduled_tasks WHERE id=?", (task["id"],)).fetchone()
+            schedule = json.loads(current["schedule_json"])
+            next_run = self._next_after(current["schedule_type"], schedule, _from_iso(task["next_run_at"]),
+                                        finished, current["timezone"] or "local")
+            if any(current[key] != task[key] for key in ("schedule_type", "schedule_json", "next_run_at", "timezone")):
+                next_run = _from_iso(current["next_run_at"])
+                end = _from_iso(schedule.get("ends_at"))
+                if end is not None and (finished > end or next_run is not None and next_run > end):
+                    next_run = None
+            task_status = "active" if next_run else ("failed" if error else "completed")
+            if schedule.get("ends_at") and finished > _from_iso(schedule["ends_at"]):
+                task_status = "completed"
+            if current["status"] in {"paused", "deleted", "completed"}:
+                task_status = current["status"]
             connection.execute(
                 "UPDATE task_runs SET status=?, finished_at=?, result_json=?, error_text=? WHERE id=?",
                 (run_status, _utc_iso(finished), json.dumps(result, ensure_ascii=False) if result else None,
@@ -590,6 +647,13 @@ class ScheduledTasks:
     @classmethod
     def _next_after(cls, schedule_type: str, schedule: dict, scheduled_for: datetime,
                     finished: datetime, timezone_name: str = "local") -> datetime | None:
+        candidate = cls._next_after_unbounded(schedule_type, schedule, scheduled_for, finished, timezone_name)
+        end = _from_iso(schedule.get("ends_at"))
+        return None if end is not None and (finished > end or candidate is not None and candidate > end) else candidate
+
+    @classmethod
+    def _next_after_unbounded(cls, schedule_type: str, schedule: dict, scheduled_for: datetime,
+                              finished: datetime, timezone_name: str = "local") -> datetime | None:
         if schedule_type in {"once", "delay", "event"}: return None
         if schedule_type == "interval":
             step = timedelta(seconds=max(1, int(schedule["seconds"])))

@@ -563,13 +563,14 @@ class EveAgent:
         persistence_start_ms = self.telemetry.elapsed_ms() if self.telemetry else None
         self._cancel_checkpoint(commit=True)
         assistant_message_id = None
+        from .scheduled_execution import input_metadata
+        turn_input_metadata = input_metadata()
         if self.conversations and self.conversation_id:
             user_message, assistant_message = self.conversations.append_turn(
                 self.conversation_id,
                 user,
                 answer,
-                user_metadata={"image_count": self._input_image_count,
-                               **({"conversation_source": source} if (source := transport_metadata()) else {})},
+                user_metadata={"image_count": self._input_image_count, **turn_input_metadata},
                 assistant_metadata={
                     "route": route.value, "sources": list(self.last_sources),
                     "turn_state": self._turn_state,
@@ -595,7 +596,7 @@ class EveAgent:
                 self.memory.revisions.attach_turn(turn_id, user_message["id"])
         self.history.extend([
             {"role": "user", "content": user,
-             **({"conversation_source": source} if (source := transport_metadata()) else {})},
+             **turn_input_metadata},
             {"role": "assistant", "content": answer},
         ])
         if self.conversations and self.conversation_id:
@@ -1016,6 +1017,9 @@ class EveAgent:
         so the response remains bound to the view that submitted it. EVE keeps
         that conversation active until the user explicitly selects another.
         """
+        from .scheduled_execution import scheduled_metadata
+        if scheduled_metadata() is not None:
+            return self.prepare_conversation_view(conversation_id)
         lifecycle = self.prepare_user_turn_view(conversation_id)
         if self.conversation_id:
             self._last_user_interaction[self.conversation_id] = self._monotonic_clock()

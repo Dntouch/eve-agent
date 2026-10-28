@@ -87,8 +87,14 @@ def learning_response_format(*, batch=False, contexts=None):
         semantic_context = contexts[0].get('semantic_learning') or {}
         if semantic_context.get('executions'):
             semantic_schema['properties']['call_references']['items']['enum'] = sorted(semantic_context['executions'])
-        if semantic_context.get('observations'):
-            semantic_schema['properties']['evidence']['items']['properties']['call_reference']['enum'] = sorted(semantic_context['observations'])
+        references = set(semantic_context.get('observations') or {}) | set(semantic_context.get('executions') or {})
+        if references:
+            # Candidates may cite an execution receipt without treating it as goal proof.
+            semantic_schema['properties']['evidence']['items']['properties']['call_reference']['enum'] = sorted(references)
+        if semantic_context.get('available') and semantic_context.get('goal_observation_refs') == []:
+            # A declared success cannot satisfy its proof contract without any
+            # eligible post-action reference. The model still chooses the outcome.
+            semantic_schema['properties']['outcome']['enum'] = ['partial', 'failed', 'outcome_uncertain']
         if semantic_context.get('available'):
             declaration_schema = semantic_schema['properties']['assessment']['properties']['action_link']
             candidates = semantic_context.get('action_candidates', [])

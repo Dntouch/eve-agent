@@ -176,6 +176,24 @@ Chatto-Gesprächen/Threads gebildet. Raumbezeichnungen werden nicht in Python au
 dem Auftrag herausinterpretiert. Die Entscheidung trifft das Modell anhand der
 veröffentlichten Ressourcen und ihrer Referenzen.
 
+Bei Fälligkeit erhält das Modell ausdrücklich einen geplanten Ausführungsturn:
+Aufgaben-ID, Lauf-ID, Fälligkeit, Herkunft und Ausgabeziel stehen unter
+`scheduled_execution`. Bei Erinnerungen ist die Antwort die jetzt zuzustellende
+Erinnerung, keine erneute Bestätigung ihrer Einrichtung. Die Herkunft bleibt auch
+im Verlauf und nach einem Kontextwechsel erhalten; der automatische Auftrag wird
+nicht als neue menschliche Chatto-Nachricht ausgegeben. Die Werkzeugrechte werden
+weiterhin ausschließlich aus dem geprüften Herkunftskontext wiederhergestellt.
+
+`schedule.ends_at` setzt optional ein Enddatum mit Uhrzeit (ISO 8601; bevorzugt mit
+UTC-Offset). Im Webfrontend steht das Feld unter „Geplante Aufgabe → Ändern“.
+Leer beziehungsweise `null` entfernt die Begrenzung. Termine genau am Endzeitpunkt
+sind eingeschlossen; danach beginnt keine weitere Ausführung. Nach einer
+Unterbrechung werden abgelaufene Aufgaben ohne Nachholen abgeschlossen. Eine schon
+laufende Ausführung wird durch das Enddatum nicht abgebrochen. Bestehende Aufgaben
+ohne `ends_at` bleiben unbegrenzt. Beim Erstellen oder Ändern muss mindestens der
+nächste Termin vor oder auf dem Endzeitpunkt liegen. Ein Tagesende lässt sich mit
+23:59 Uhr am gewünschten letzten Tag setzen.
+
 Der lokale Benutzer und Owner-DMs können andere verfügbare Ziele wählen.
 Öffentliche Channels und Member-DMs bleiben auf ihr aktuelles Gespräch begrenzt
 und können keine Aufgaben anderer Gespräche lesen oder umleiten. Bei geplanten

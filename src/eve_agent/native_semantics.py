@@ -20,6 +20,10 @@ class NativeSemanticSession:
                         "focus": list(getattr(agent.home_assistant, "last_entities", []) or []),
                         "pending": deepcopy(agent._pending_context()),
                         "task_active": bool(agent.work_tasks and getattr(agent.work_tasks, "has_active_context", lambda _: False)(agent.conversation_id))}
+        from .scheduled_execution import scheduled_metadata
+        execution = scheduled_metadata()
+        if execution is not None:
+            self.context["scheduled_execution"] = execution
         self.providers = {}
         for name, provider in vars(agent).items():
             identity = getattr(provider, "semantic_provider_identity", None)
@@ -46,11 +50,12 @@ class NativeSemanticSession:
         if execution:
             self.executions[reference] = {**execution, "capability": capability}
         return ({"call_reference": reference, "record_operation": "semantic_learning.record_action",
+                 "learning_status": "awaiting_model_assessment",
                  "executed": deepcopy(execution), "meaning_assessed": False} if execution else {"call_reference": reference})
 
     def contract(self):
         keys = {"type": "array", "items": {"enum": list(CONTEXT_KEYS)}, "uniqueItems": True,
-                "description": "Only context necessary to resolve this request, not all context present. Existing history or focus alone is not a dependency. Matching a complete request to durable Memory does not require conversational history."}
+                "description": "Only dependencies needed to resolve this request. Present history/focus or matching Memory alone is not a dependency."}
         assessment = obj({"status": {"enum": ["resolved", "uncertain"]}, "context_keys": keys,
             "user_grounding": {"enum": ["explicit", "contextual", "unknown"]},
             "utterance_quote": text(), "basis": text(minLength=1),
@@ -59,18 +64,24 @@ class NativeSemanticSession:
                 "meaning": text(), "representation_id": text(), "anchor_claim_id": text(), "basis": text()},
                 ["kind", "basis"])},
             ["status", "context_keys", "user_grounding", "utterance_quote", "basis", "uncertainties", "action_link"])
+        assessment["properties"]["action_link"]["anyOf"] = [
+            {"properties": {"kind": {"const": "existing"}, "representation_id": {"minLength": 1},
+                            "anchor_claim_id": {"minLength": 1}}, "required": ["representation_id", "anchor_claim_id"]},
+            {"properties": {"kind": {"const": "new"}, "meaning": {"minLength": 1}}, "required": ["meaning"]},
+            {"properties": {"kind": {"const": "none"}}},
+        ]
         evidence = obj({"call_reference": text(), "pointer": text("RFC6901 path into the original result, e.g. /response/body/state; no dot/bracket syntax. Empty selects root"), "value": {"description": "Exact original JSON value, including its type"}}, ["call_reference", "pointer", "value"])
         def operation(description, schema, effect="write"):
             return {"description": description, "effect": effect, "parameters_schema": schema}
-        return {"description": "Learn semantic action experiences from completed native calls and goal evidence; record explicit language relations and confirm/correct earlier meanings. The current model decides meaning; nothing is executed or replayed by these memory tools.",
+        return {"description": "Model-assessed action experiences and explicit language/feedback relations. These tools never execute devices.",
             "operations": {
-                "inspect": operation("Read current execution receipts, earlier meanings and causal feedback references before selecting exact IDs.", obj(), "read"),
-                "action_candidates": operation("Read published meanings and anchors for an existing-equivalence declaration; equal API calls alone do not prove equal meaning.",
+                "inspect": operation("Read original receipts and feedback references.", obj(), "read"),
+                "action_candidates": operation("Publish known meanings and source examples before selecting existing IDs.",
                     obj({"capability": ({"enum": list(self.providers)} if self.providers else text())}, ["capability"]), "read"),
-                "record_action": operation("Record your interpretation of a completed action. Cite actual goal-result values, not merely transport acceptance. Infer no user confirmation. Use uncertain if meaning or outcome is unresolved. This never executes an action.",
+                "record_action": operation("Record a model-assessed action. success requires subsequent target-state evidence; otherwise use outcome_uncertain (evidence may be empty). Existing meanings require action_candidates references. Never executes actions.",
                     obj({"call_references": {"type": "array", "minItems": 1, "items": text("Use only references carrying semantic_execution; observation/read references belong in evidence"), "uniqueItems": True},
                          "assessment": assessment, "outcome": {"enum": ["success", "partial", "failed", "outcome_uncertain"]},
-                         "outcome_basis": text(minLength=1), "based_on": text("Optional published learned_action_experience memory_id used for this interpretation"), "evidence": {"type": "array", "minItems": 1, "items": evidence}},
+                         "outcome_basis": text(minLength=1), "based_on": text("Optional published learned_action_experience memory_id used for this interpretation"), "evidence": {"type": "array", "items": evidence}},
                         ["call_references", "assessment", "outcome", "outcome_basis", "evidence"])),
                 "feedback": operation("Record explicit evaluation of an earlier published occurrence. Quote the current user and its antecedent exactly. This changes memory, never repeats the action.",
                     obj({"link_id": text(), "occurrence_ref": text(), "decision": {"enum": ["confirm", "contradict"]},
@@ -138,6 +149,7 @@ class NativeSemanticSession:
         raise ValueError("Unknown semantic learning operation")
 
     def record(self, args, *, _connection=None):
+        observations = self.validate_record(args, _connection=_connection)
         refs = tuple(args["call_references"])
         if refs in self.recorded:
             if self.record_arguments[refs] != args:
@@ -154,29 +166,11 @@ class NativeSemanticSession:
         if any(item["provider"] != provider for item in executions):
             raise ValueError("One experience must reference one provider identity")
         evidence = deepcopy(args["evidence"])
-        for item in evidence:
-            source = self.calls[item["call_reference"]]
-            if source["capability"] != executions[0]["capability"] or not isinstance(source["result"], dict) or source["result"].get("status") != "completed":
-                raise ValueError("Goal evidence needs a successful observation from the same provider")
-            actual = WorkingMemoryStore.pointer(source["result"], item["pointer"])
-            if json.dumps(actual, sort_keys=True, ensure_ascii=False) != json.dumps(item["value"], sort_keys=True, ensure_ascii=False):
-                raise ValueError("Goal evidence does not match the original result value and type")
         plan = {"effect": executions[0]["effect"],
             "actions": [deepcopy(action) for item in executions for action in item["actions"]],
             "semantic_learning": deepcopy(args["assessment"])}
         # Preserve actual goal observations for later verified replay. No service
         # name or user wording is translated into an assumed target state.
-        observations = []
-        for item in evidence:
-            source = self.calls[item["call_reference"]]
-            parameters = source["parameters"]
-            path = parameters.get("path", "")
-            if (source["operation"] == "http_request" and parameters.get("method") == "GET"
-                    and path.startswith("/api/states/")
-                    and (item["pointer"] == "/response/body/state"
-                         or item["pointer"].startswith("/response/body/attributes/"))):
-                observations.append({"entity_id": path[len("/api/states/"):],
-                                     "pointer": item["pointer"], "value": deepcopy(item["value"])})
         if observations:
             plan["replay_observations"] = observations
         if assessment_conditions(plan["semantic_learning"], self.context, self.utterance, plan) is None:
@@ -218,3 +212,65 @@ class NativeSemanticSession:
         self.recorded[refs] = deepcopy(result)
         self.record_arguments[refs] = deepcopy(args)
         return result
+
+    def validate_record(self, args, *, _connection=None):
+        """Validate model declarations against original receipts, never wording."""
+        from jsonschema import Draft202012Validator
+        Draft202012Validator(self.contract()['operations']['record_action']['parameters_schema']).validate(args)
+        refs = args['call_references']
+        if not refs or any(ref not in self.executions for ref in refs):
+            raise ValueError('semantic_execution_reference_unavailable')
+        if refs != [ref for ref in self.executions if ref in refs]:
+            raise ValueError('semantic_execution_scope_or_order_mismatch')
+        executions = [self.executions[ref] for ref in refs]
+        provider = executions[0]['provider']
+        if any(e['provider'] != provider for e in executions):
+            raise ValueError('semantic_mixed_provider_identity')
+        plan = {'effect': executions[0]['effect'], 'actions': [a for e in executions for a in e['actions']]}
+        if assessment_conditions(args['assessment'], self.context, self.utterance, plan) is None:
+            raise ValueError('semantic_invalid_context_assessment')
+        declaration = args['assessment']['action_link']
+        if declaration['kind'] == 'existing':
+            candidates = self.published.get(executions[0]['capability'], [])
+            if not any(p['representation_id'] == declaration['representation_id'] and any(
+                    e['claim_id'] == declaration['anchor_claim_id'] for e in p['examples']) for p in candidates):
+                raise ValueError('semantic_unpublished_action_reference')
+            anchor = self.links.experience(declaration['anchor_claim_id'], _connection=_connection)
+            if anchor['provider'] != provider or action_identity(anchor['plan']) != action_identity(plan):
+                raise ValueError('semantic_action_execution_mismatch')
+            conditions = assessment_conditions(args['assessment'], self.context, self.utterance, plan)
+            if anchor['context'] != conditions:
+                raise ValueError('semantic_action_context_mismatch')
+        order = {ref: index for index, ref in enumerate(self.calls)}
+        targets = {a['entity_id'] for a in plan['actions']}
+        observed, observations = set(), []
+        for item in args['evidence']:
+            ref = item['call_reference']
+            call = self.calls.get(ref)
+            if not call or call['capability'] != executions[0]['capability'] or call['result'].get('status') != 'completed':
+                raise ValueError('semantic_evidence_reference_unavailable')
+            try:
+                actual = WorkingMemoryStore.pointer(call['result'], item['pointer'])
+            except (KeyError, IndexError, TypeError, ValueError) as exc:
+                raise ValueError('semantic_evidence_pointer_not_found:' + ref + ':' + item['pointer']) from exc
+            if json.dumps(actual, sort_keys=True) != json.dumps(item['value'], sort_keys=True):
+                raise ValueError('semantic_goal_value_mismatch')
+            if args['outcome'] != 'success':
+                continue  # Pre-action observations are evidence, but never proof of success.
+            if order[ref] <= max(order[r] for r in refs):
+                raise ValueError('semantic_goal_must_follow_execution')
+            parameters = call['parameters']; path = parameters.get('path', '')
+            entity = path.removeprefix('/api/states/')
+            body = call['result'].get('response', {}).get('body')
+            if (call['operation'] != 'http_request' or parameters.get('method') != 'GET'
+                    or not path.startswith('/api/states/') or entity not in targets
+                    or not isinstance(body, dict) or body.get('entity_id') != entity
+                    or not (item['pointer'] == '/response/body/state' or item['pointer'].startswith('/response/body/attributes/'))):
+                raise ValueError('semantic_goal_requires_target_observation')
+            if item['pointer'] == '/response/body/state' and (not isinstance(actual, str) or actual in {'unknown', 'unavailable'}):
+                raise ValueError('semantic_goal_state_unavailable')
+            observed.add(entity)
+            observations.append({'entity_id': entity, 'pointer': item['pointer'], 'value': deepcopy(actual)})
+        if args['outcome'] == 'success' and observed != targets:
+            raise ValueError('semantic_goal_targets_incomplete')
+        return observations

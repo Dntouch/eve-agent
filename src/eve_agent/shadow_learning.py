@@ -7,6 +7,7 @@ import threading
 import time
 import uuid
 from contextlib import nullcontext
+from copy import deepcopy
 from datetime import datetime, timezone
 from types import SimpleNamespace
 
@@ -45,6 +46,23 @@ def _source_excerpt(text: str, source: str) -> str | None:
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _input_provenance(snapshot):
+    return {key: snapshot[key] for key in ("conversation_source", "scheduled_execution") if snapshot.get(key)}
+
+
+def _schema_field_errors(error):
+    """Return structural locations, never echo the rejected instance/full schema."""
+    if error.context:
+        return [item for child in error.context for item in _schema_field_errors(child)]
+    item = {'path': '/' + '/'.join(str(part).replace('~', '~0').replace('/', '~1')
+                                 for part in error.absolute_path), 'keyword': error.validator}
+    if error.validator == 'required':
+        item['message'] = error.message
+    elif error.validator in {'type', 'pattern', 'const'}:
+        item['expected'] = error.validator_value
+    return [item]
 
 
 def _stable_id(kind: str, value: str) -> str:
@@ -346,7 +364,7 @@ class ShadowLearningPipeline:
                 (turn['conversation_id'], turn_id),
             ).fetchall()
             dialog = connection.execute(
-                "SELECT role,content FROM messages WHERE conversation_id=? AND ordinal<? "
+                "SELECT role,content,metadata_json FROM messages WHERE conversation_id=? AND ordinal<? "
                 "ORDER BY ordinal",
                 (turn["conversation_id"], user["ordinal"]),
             ).fetchall() if user else []
@@ -375,6 +393,7 @@ class ShadowLearningPipeline:
         return {
             "dialog_context": [{"role": row["role"],
                                 "content": redact_sensitive(str(row["content"])),
+                                **_input_provenance(json.loads(row['metadata_json'] or '{}')),
                                 "context_only": True} for row in dialog],
             "failure_episodes": linked,
             "episode_source_turn_ids": list(dict.fromkeys(source for episode in episodes
@@ -385,6 +404,7 @@ class ShadowLearningPipeline:
             "assistant_message_id": str(turn["assistant_message_id"]) if turn["assistant_message_id"] else None,
             "user_content": redact_sensitive(str(user["content"] if user else "")),
             "conversation_source": user_meta.get("conversation_source"),
+            "scheduled_execution": user_meta.get("scheduled_execution"),
             "assistant_content": redact_sensitive(str(assistant["content"] if assistant else "")),
             "route": str(assistant_meta.get("route") or "unknown"),
             "created_at": str(turn["created_at"]),
@@ -637,8 +657,9 @@ class ShadowLearningPipeline:
             },
             "turn_id": snapshot["turn_id"], "route": snapshot["route"],
             "user_message": {"id": snapshot["user_message_id"], "content": snapshot["user_content"],
-                **({"conversation_source": _audit_value(snapshot["conversation_source"])}
-                   if snapshot.get("conversation_source") else {}),
+                **_audit_value(_input_provenance(snapshot)),
+                **({"source_role": "system", "input_kind": "scheduled", "fresh_human_message": False}
+                   if snapshot.get("scheduled_execution") else {}),
                 "evidence_reference": {"source_type": "user_message", "source_id": snapshot["user_message_id"]}},
             "evidence_contract": EVIDENCE_CONTRACT, "provenance_contract": PROVENANCE_CONTRACT,
             "dialog_context": snapshot.get("dialog_context", []),
@@ -732,22 +753,32 @@ class ShadowLearningPipeline:
         return context
 
     def _validate_proposal(self, raw: dict, snapshot: dict, candidates: list[dict]) -> dict:
+        general = self._validate_general_proposal(raw, snapshot, candidates)
+        semantics = getattr(self, 'conversation_semantics', None)
+        if semantics is None or not isinstance(raw, dict):
+            return general
+        result = deepcopy(general)
+        try:
+            available = semantics.context(snapshot)['available']
+            if available and ('semantic_formulation' not in raw
+                    or not isinstance(raw.get('semantic_learning_reason'), str)
+                    or not raw['semantic_learning_reason'].strip()):
+                raise ValueError('semantic_learning_decision_missing')
+            semantic = semantics.validate(snapshot, raw.get('semantic_formulation'))
+            if semantic is not None:
+                result['semantic_formulation'] = semantic
+            if raw.get('semantic_learning_reason'):
+                result['semantic_learning_reason'] = raw['semantic_learning_reason']
+        except (ValueError, KeyError, TypeError, ValidationError) as exc:
+            result = self._undetermined(str(getattr(exc, 'message', exc))[:1000], clarification=False)
+            result['general_proposal'] = general
+            result['semantic_learning_error'] = result['reason_code']
+            result['details']['raw_proposal'] = _audit_value(raw)
+        return result
+
+    def _validate_general_proposal(self, raw: dict, snapshot: dict, candidates: list[dict]) -> dict:
         episodes = snapshot.get("failure_episodes") or []
         result = self._validate_proposal_contract(raw, snapshot, candidates)
-        semantics = getattr(self, 'conversation_semantics', None)
-        if semantics is not None and isinstance(raw, dict) and result['decision_type'] != 'undetermined':
-            try:
-                available = semantics.context(snapshot)['available']
-                if available and ('semantic_formulation' not in raw
-                                  or not isinstance(raw.get('semantic_learning_reason'), str)
-                                  or not raw['semantic_learning_reason'].strip()):
-                    raise ValueError('semantic_learning_decision_missing')
-                semantic = semantics.validate(snapshot, raw.get('semantic_formulation'))
-                if semantic is not None:
-                    result['semantic_formulation'] = semantic
-                result['semantic_learning_reason'] = raw.get('semantic_learning_reason')
-            except (ValueError, KeyError, TypeError, ValidationError) as exc:
-                result = self._undetermined(str(exc), clarification=False)
         if result["decision_type"] == "undetermined":
             result["details"]["raw_proposal"] = _audit_value(raw)
         if not episodes or result["decision_type"] in {"no_persist", "undetermined"}:
@@ -1169,12 +1200,12 @@ class ShadowLearningPipeline:
                 """INSERT OR IGNORE INTO memory_observations
                    (id,source_role,source_type,message_id,excerpt,structured_value_json,
                     observed_at,scope,metadata_json,created_at)
-                   VALUES (?,'user','user_message',?,?,?,?,?,?,?)""",
-                (user_observation_id, snapshot["user_message_id"], snapshot["user_content"][:240],
+                   VALUES (?,?,'user_message',?,?,?,?,?,?,?)""",
+                (user_observation_id, 'system' if snapshot.get('scheduled_execution') else 'user',
+                 snapshot["user_message_id"], snapshot["user_content"][:240],
                  json.dumps({"content_location": "messages.content"}, ensure_ascii=False),
                  snapshot["created_at"], "conversation:" + snapshot["conversation_id"],
-                 json.dumps({"conversation_source": snapshot["conversation_source"]}
-                            if snapshot.get("conversation_source") else {}, ensure_ascii=False), _now()),
+                 json.dumps(_input_provenance(snapshot), ensure_ascii=False), _now()),
             )
             tool_observations = []
             tool_by_id = {str(item["id"]): item for item in snapshot["tools"]}
@@ -1425,6 +1456,7 @@ class ProductiveLearningPipeline(ShadowLearningPipeline):
                 f"""SELECT j.*,t.conversation_id,t.created_at turn_created_at,
                            t.completed_at turn_completed_at,t.knowledge_flow_json,c.title conversation_title,
                            user_message.content user_content,assistant_message.content assistant_content,
+                           assistant_message.metadata_json assistant_metadata_json,
                            d.decision_type,d.method,d.rationale,d.uncertainty,
                            d.policy_version,d.model_version,d.created_at decision_created_at,d.metadata_json decision_metadata_json
                     FROM memory_learning_jobs j
@@ -1441,7 +1473,10 @@ class ProductiveLearningPipeline(ShadowLearningPipeline):
             items = []
             for row in rows:
                 item = dict(row)
-                item['semantic_learning'] = json.loads(item.pop('decision_metadata_json') or '{}').get('semantic_learning')
+                decision_metadata = json.loads(item.pop('decision_metadata_json') or '{}')
+                assistant_details = json.loads(item.pop('assistant_metadata_json') or '{}').get('turn_state_details', {})
+                item['semantic_learning'] = decision_metadata.get('semantic_learning') or assistant_details.get('semantic_learning')
+                item['general_learning'] = decision_metadata.get('general_learning') or assistant_details.get('general_learning')
                 flow = json.loads(item.pop("knowledge_flow_json") or "{}")
                 origins = {stage.get("details", {}).get("decision_origin")
                            for stage in flow.get("stages", []) if isinstance(stage, dict)}
@@ -1768,6 +1803,23 @@ class ProductiveLearningPipeline(ShadowLearningPipeline):
             if key in inline_fields and size <= min(6000, remaining):
                 entry['inline'][key] = value
                 remaining -= size
+        semantic = context.get('semantic_learning') or {}
+        if semantic.get('available') and 'semantic_learning' not in entry['inline']:
+            # Keep exact protocol references visible even if historical context
+            # makes the complete semantic section too large. No text interpretation.
+            compact = {key: semantic[key] for key in
+                       ('available', 'current_formulation', 'goal_observation_refs') if key in semantic}
+            compact['original_pointer'] = root + '/semantic_learning'
+            for key in ('executions', 'action_candidates'):
+                value = semantic.get(key)
+                if len(json.dumps(value, ensure_ascii=False)) <= min(4000, remaining):
+                    compact[key] = value
+                else:
+                    compact[key + '_pointer'] = root + '/semantic_learning/' + key
+            size = len(json.dumps(compact, ensure_ascii=False))
+            if size <= remaining:
+                entry['inline']['semantic_learning'] = compact
+                remaining -= size
         for index, tool in enumerate(context.get('tool_events', [])[:12]):
             item = {key: tool[key] for key in ('id', 'tool', 'status', 'evidence_reference') if key in tool}
             item['pointer'] = root + '/tool_events/' + str(index)
@@ -1808,11 +1860,23 @@ class ProductiveLearningPipeline(ShadowLearningPipeline):
         session.input['text'] = entry
         capabilities, tools, bindings = self._working_memory_tools()
         state = {'loaded_capabilities': ['working_memory']}
+        schema = learning_response_format(batch=True, contexts=[context])['json_schema']['schema']
+        structured_semantics = bool((context.get('semantic_learning') or {}).get('available'))
+        if structured_semantics:
+            # Publish structure as a native tool, not a schema copied into prose.
+            capabilities['learning'] = {'operations': {'submit': {'effect': 'write', 'parameters_schema': schema}}}
+            state['loaded_capabilities'].append('learning')
+            tools.append({'type': 'function', 'function': {'name': 'learning__submit',
+                'description': 'Submit the model-assessed learning decision. Executes no provider action.',
+                'parameters': schema}})
+            bindings['learning__submit'] = {'capability': 'learning', 'operation': 'submit',
+                                           'effect': 'write', 'schema': schema}
 
         def publish(_capabilities, _loaded):
             return tools, bindings
 
-        schema = learning_response_format(batch=True, contexts=[context])['json_schema']['schema']
+        completion_contract = ('Finish with learning__submit.' if structured_semantics else
+            'Return exactly one JSON object matching this schema: ' + json.dumps(schema, ensure_ascii=False, separators=(',', ':')))
         core_prompt = (
             OpenAICompatibleLLM._conversation_learning_messages([])[0]['content'] + '\n'
             'Evaluate one completed turn for stable cross-conversation knowledge. '
@@ -1825,8 +1889,7 @@ class ProductiveLearningPipeline(ShadowLearningPipeline):
             'Inline evidence is already available and need not be read again. '
             'Identical reads add no evidence. Finish with a grounded proposal or no_persist for transient content. '
             'This attempt is bounded to 24 model rounds and 48 tool calls; six calls without new material stop it. '
-            'Use only claim and evidence IDs from this turn. Return exactly one JSON object matching this schema: '
-            + json.dumps(schema, ensure_ascii=False, separators=(',', ':'))
+            'Use only claim and evidence IDs from this turn. ' + completion_contract
         )
         messages = [
             {'role': 'system', 'content': core_prompt},
@@ -1859,6 +1922,7 @@ class ProductiveLearningPipeline(ShadowLearningPipeline):
                             messages, tools,
                             getattr(self.llm, 'generation_max_tokens', getattr(self.llm, 'max_tokens', None)),
                             0.0, role='conversation_learning_working_memory',
+                            **({'tool_choice': 'required'} if structured_semantics else {}),
                         )
                         cancellation.checkpoint()
                 except EmptyModelResponseError:
@@ -1923,10 +1987,18 @@ class ProductiveLearningPipeline(ShadowLearningPipeline):
                         else:
                             Draft202012Validator(binding['schema']).validate(parameters)
                             session.store.dispatch_call(session.workspace_id, work_call)
+                            if binding['capability'] == 'learning' and binding['operation'] == 'submit':
+                                session.store.finish_call(session.workspace_id, session.turn_id, work_call,
+                                                          {'status': 'completed', 'proposal_submitted': True})
+                                session.finish('completed', {'status': 'completed', 'turn_id': context['turn_id']})
+                                return parameters
                             result = session.execute(binding['operation'], parameters)
+                    except ValidationError as exc:
+                        result = {'status': 'error', 'error_class': 'ValidationError',
+                                  'message': 'schema_validation_failed', 'field_errors': _schema_field_errors(exc)}
                     except Exception as exc:
                         result = {'status': 'error', 'error_class': type(exc).__name__,
-                                  'message': redact_sensitive(str(exc)),
+                                  'message': redact_sensitive(str(getattr(exc, 'message', exc))),
                                   **({'structure': exc.structure} if hasattr(exc, 'structure') else {})}
                     operation = binding['operation'] if binding else name
                     selection = json.dumps({'operation': operation, 'parameters': {
@@ -2264,6 +2336,102 @@ class ProductiveLearningPipeline(ShadowLearningPipeline):
     )
     def _persist(self, snapshot: dict, proposal: dict, method: str,
                  metrics: dict, started: float) -> dict:
+        """Commit independently validated learning branches; retries keep committed work."""
+        general = deepcopy(proposal.get('general_proposal', proposal))
+        for key in ('semantic_formulation', 'semantic_learning_reason', 'semantic_learning_error', 'general_proposal'):
+            general.pop(key, None)
+        general_id = _stable_id('productive-decision', ':'.join((snapshot['turn_id'], self.policy_version,
+                                                               self.prompt_version, self.model_version)))
+        with self.database.connect(lifecycle_audit=False) as c:
+            previous = c.execute("SELECT * FROM memory_learning_decisions WHERE id=? OR "
+                "(json_extract(metadata_json,'$.turn_id')=? AND json_extract(metadata_json,'$.general_learning.status')='applied') "
+                "ORDER BY created_at LIMIT 1", (general_id, snapshot['turn_id'])).fetchone()
+        previous_meta = json.loads(previous['metadata_json']) if previous else {}
+        if previous_meta.get('general_learning', {}).get('status') == 'applied':
+            general_result = {'id': previous['id'], 'turn_id': snapshot['turn_id'],
+                              'decision_type': previous_meta['general_learning'].get('decision_type', previous['decision_type']), 'application_status': 'applied',
+                              'method': previous['method'], 'claim_id': None}
+        else:
+            try:
+                general_result = self._persist_general(snapshot, general, method, metrics, started)
+            except Exception as exc:
+                failure = self._undetermined(type(exc).__name__, clarification=False)
+                failure['decision_type'] = 'shadow_error'
+                failure['details'].update(stage='persistence', error_class=type(exc).__name__)
+                general_result = self._persist_unresolved(snapshot,
+                    failure, method, metrics, update_job=False)
+        general_status = {'status': general_result['application_status'],
+                          'reason': general_result.get('reason_code'), 'decision_type': general_result['decision_type']}
+        decision_id = general_result.get('id')
+        # Checkpoint a completed general branch before trying semantic persistence.
+        if decision_id:
+            with self.database.connect() as c:
+                row = c.execute('SELECT metadata_json FROM memory_learning_decisions WHERE id=?', (decision_id,)).fetchone()
+                metadata = json.loads(row[0]); metadata['general_learning'] = general_status
+                c.execute('UPDATE memory_learning_decisions SET metadata_json=? WHERE id=?',
+                          (json.dumps(metadata, ensure_ascii=False), decision_id))
+        semantic_result = None
+        semantic_error = proposal.get('semantic_learning_error')
+        record = proposal.get('semantic_formulation')
+        try:
+            session = self.conversation_semantics.session(snapshot)
+            if record is not None:
+                self.conversation_semantics.validate(snapshot, record, session=session)
+                with self.database.connect() as c:
+                    semantic_result = self.conversation_semantics.persist(snapshot, record, c, session=session)
+            elif session is not None:
+                with self.database.connect() as c:
+                    semantic_result = self.conversation_semantics.existing(snapshot, c, session=session)
+            if semantic_result is None and proposal.get('semantic_learning_reason') and not semantic_error:
+                semantic_result = {'kind': 'not_reusable', 'reason': proposal['semantic_learning_reason']}
+        except Exception as exc:
+            semantic_error = str(getattr(exc, 'message', exc))[:1000]
+        if semantic_error:
+            semantic_result = {'kind': 'rejected', 'reason': semantic_error}
+        failed = general_status['status'] == 'failed' or bool(semantic_error)
+        decision_type = general_result['decision_type']
+        semantic_claim = (semantic_result or {}).get('claim_id')
+        if semantic_claim and (decision_type in {'no_persist', 'undetermined', 'shadow_error'}):
+            decision_type = ('append_supporting_evidence' if semantic_result['kind'] == 'supporting_evidence'
+                             else 'create_active' if semantic_result['release'] == 'active' else 'create_candidate')
+        with self.database.connect() as c:
+            # A semantic-only result still gets a decision receipt if the general branch failed.
+            if decision_id is None and semantic_claim:
+                decision_id = _stable_id('productive-semantic-decision', snapshot['turn_id'])
+                c.execute('INSERT OR IGNORE INTO memory_learning_decisions '
+                          '(id,decision_type,method,policy_version,model_version,rationale,metadata_json,created_at) '
+                          'VALUES (?,?,?,?,?,?,?,?)',
+                          (decision_id, decision_type, method, self.policy_version, self.model_version,
+                           proposal.get('semantic_learning_reason'), '{}', _now()))
+            if decision_id:
+                metadata = json.loads(c.execute('SELECT metadata_json FROM memory_learning_decisions WHERE id=?',
+                                               (decision_id,)).fetchone()[0])
+                metadata.update(mode='productive', status='failed' if failed else 'applied',
+                                turn_id=snapshot['turn_id'], general_learning=general_status)
+                if semantic_result is not None:
+                    metadata['semantic_learning'] = semantic_result
+                c.execute('UPDATE memory_learning_decisions SET decision_type=?,metadata_json=? WHERE id=?',
+                          (decision_type, json.dumps(metadata, ensure_ascii=False), decision_id))
+                if semantic_claim:
+                    c.execute('INSERT OR IGNORE INTO memory_learning_decision_claims VALUES (?,?)',
+                              (decision_id, semantic_claim))
+            message = c.execute('SELECT metadata_json FROM messages WHERE id=?', (snapshot['assistant_message_id'],)).fetchone()
+            if message:
+                metadata = json.loads(message[0]); details = metadata.setdefault('turn_state_details', {})
+                details['general_learning'] = general_status
+                if semantic_result is not None:
+                    details['semantic_learning'] = semantic_result
+                c.execute('UPDATE messages SET metadata_json=? WHERE id=?',
+                          (json.dumps(metadata, ensure_ascii=False), snapshot['assistant_message_id']))
+            c.execute('UPDATE memory_learning_jobs SET status=?,decision_id=?,error_class=?,completed_at=?,updated_at=? WHERE turn_id=?',
+                      ('failed' if failed else 'no_persist' if decision_type == 'no_persist' else 'applied', decision_id,
+                       semantic_error or (general_status['reason'] if failed else None), _now(), _now(), snapshot['turn_id']))
+        return {**general_result, 'id': decision_id, 'decision_type': decision_type,
+                'application_status': 'failed' if failed else 'applied', 'general_learning': general_status,
+                'semantic_learning': semantic_result, 'claim_id': semantic_claim or general_result.get('claim_id')}
+
+    def _persist_general(self, snapshot: dict, proposal: dict, method: str,
+                 metrics: dict, started: float) -> dict:
         now = _now()
         turn_id = snapshot["turn_id"]
         feedback = self._revision_feedback(turn_id)
@@ -2276,11 +2444,11 @@ class ProductiveLearningPipeline(ShadowLearningPipeline):
         )
         original_type = str(proposal.get("decision_type") or "undetermined")
         if original_type in {"undetermined", "shadow_error"}:
-            return self._persist_unresolved(snapshot, proposal, method, metrics)
+            return self._persist_unresolved(snapshot, proposal, method, metrics, update_job=False)
         if original_type not in _POSITIVE | {"no_persist"}:
             rejected = self._undetermined("invalid_decision_type", clarification=False)
             rejected['details']['raw_proposal'] = _audit_value(proposal)
-            return self._persist_unresolved(snapshot, rejected, method, metrics)
+            return self._persist_unresolved(snapshot, rejected, method, metrics, update_job=False)
         failed = False
         decision_type = original_type
         claim = proposal.get("claim") or {}
@@ -2288,13 +2456,6 @@ class ProductiveLearningPipeline(ShadowLearningPipeline):
         claim_id = _stable_id("productive-claim", decision_id) if claim else None
         observation_by_source = {snapshot["user_message_id"]: user_observation_id}
         metrics = {**metrics, "productive_duration_ms": round((time.perf_counter() - started) * 1000, 3)}
-        semantic_record = proposal.get('semantic_formulation')
-        semantic_session = None
-        if semantic_record is not None:
-            semantic_session = self.conversation_semantics.session(snapshot)
-            self.conversation_semantics.validate(snapshot, semantic_record, session=semantic_session)
-        elif proposal.get('semantic_learning_reason'):
-            semantic_session = self.conversation_semantics.session(snapshot)
         try:
             with self.database.connect() as connection:
                 # A completed direct correction wins over older queued learning.
@@ -2359,13 +2520,13 @@ class ProductiveLearningPipeline(ShadowLearningPipeline):
                     """INSERT OR IGNORE INTO memory_observations
                        (id,source_role,source_type,message_id,turn_id,excerpt,structured_value_json,
                         observed_at,scope,metadata_json,created_at)
-                       VALUES (?,'user','user_message',?,?,?,?,?,?,?,?)""",
-                    (user_observation_id, snapshot["user_message_id"], turn_id,
+                       VALUES (?,?,'user_message',?,?,?,?,?,?,?,?)""",
+                    (user_observation_id, 'system' if snapshot.get('scheduled_execution') else 'user',
+                     snapshot["user_message_id"], turn_id,
                      snapshot["user_content"][:240],
                      json.dumps({"content_location": "messages.content"}, ensure_ascii=False),
                      snapshot["created_at"], "conversation:" + snapshot["conversation_id"],
-                     json.dumps({"conversation_source": snapshot["conversation_source"]}
-                                if snapshot.get("conversation_source") else {}, ensure_ascii=False), now),
+                     json.dumps(_input_provenance(snapshot), ensure_ascii=False), now),
                 )
                 tools = {str(item["id"]): item for item in snapshot["tools"]}
                 for item in evidence:
@@ -2393,6 +2554,8 @@ class ProductiveLearningPipeline(ShadowLearningPipeline):
 
                 metadata = {
                     "mode": "productive", "status": "failed" if failed else "applied",
+                    "general_learning": {"status": "failed" if failed else "applied", "decision_type": decision_type,
+                                         "reason": proposal.get("reason_code")},
                     "turn_id": turn_id, "prompt_version": self.prompt_version,
                     "reason_code": proposal.get("reason_code"),
                     "proposal_decision_type": original_type,
@@ -2484,36 +2647,7 @@ class ProductiveLearningPipeline(ShadowLearningPipeline):
                              now, transition["claim_id"]),
                         )
 
-                semantic_result = None
-                if semantic_record is not None:
-                    semantic_result = self.conversation_semantics.persist(
-                        snapshot, semantic_record, connection, session=semantic_session)
-                elif semantic_session is not None:
-                    semantic_result = self.conversation_semantics.existing(snapshot, connection, session=semantic_session)
-                if semantic_result is not None:
-                    if claim_id is None:
-                        claim_id = semantic_result['claim_id']
-                    connection.execute(
-                        'INSERT OR IGNORE INTO memory_learning_decision_claims(decision_id,claim_id) VALUES (?,?)',
-                        (decision_id, semantic_result['claim_id']))
-                    if decision_type == 'no_persist':
-                        decision_type = ('append_supporting_evidence' if semantic_result['kind'] == 'supporting_evidence'
-                                         else 'create_active' if semantic_result['release'] == 'active' else 'create_candidate')
-                    metadata['semantic_learning'] = semantic_result
-                    metadata['semantic_learning_reason'] = proposal.get('semantic_learning_reason')
-                    connection.execute('UPDATE memory_learning_decisions SET decision_type=?,metadata_json=? WHERE id=?',
-                                       (decision_type, json.dumps(metadata, ensure_ascii=False), decision_id))
-                elif proposal.get('semantic_learning_reason'):
-                    metadata['semantic_learning'] = {'kind': 'not_reusable', 'reason': proposal['semantic_learning_reason']}
-                    connection.execute('UPDATE memory_learning_decisions SET metadata_json=? WHERE id=?',
-                                       (json.dumps(metadata, ensure_ascii=False), decision_id))
-                job_status = "failed" if failed else ("no_persist" if decision_type == "no_persist" else "applied")
-                connection.execute(
-                    """UPDATE memory_learning_jobs SET status=?,decision_id=?,error_class=?,
-                       completed_at=?,updated_at=? WHERE turn_id=?""",
-                    (job_status, decision_id, proposal.get("details", {}).get("error_class") if failed else None,
-                     now, now, turn_id),
-                )
+                # The coordinator finalizes the job after both branches have receipts.
         except Exception:
             with self.database.connect() as connection:
                 connection.execute(
@@ -2527,10 +2661,9 @@ class ProductiveLearningPipeline(ShadowLearningPipeline):
             "decision_type": decision_type,
             "metrics": metrics, "application_status": "failed" if failed else "applied",
             "claim_id": claim_id,
-            "semantic_learning": semantic_result,
         }
 
-    def _persist_unresolved(self, snapshot, proposal, method, metrics):
+    def _persist_unresolved(self, snapshot, proposal, method, metrics, *, update_job=True):
         """Keep rejected output as diagnostics, never as a successful no_persist."""
         identifier = str(uuid.uuid4())
         now = _now()
@@ -2547,8 +2680,9 @@ class ProductiveLearningPipeline(ShadowLearningPipeline):
                 'learning_attempt:' + identifier, json.dumps(payload, ensure_ascii=False), now,
                 'conversation:' + snapshot['conversation_id'],
                 json.dumps({'kind': 'learning_attempt', 'status': 'failed'}), now))
-            c.execute("UPDATE memory_learning_jobs SET status='failed',decision_id=NULL,error_class=?,completed_at=?,updated_at=? WHERE turn_id=?",
-                      (reason, now, now, snapshot['turn_id']))
+            if update_job:
+                c.execute("UPDATE memory_learning_jobs SET status='failed',decision_id=NULL,error_class=?,completed_at=?,updated_at=? WHERE turn_id=?",
+                          (reason, now, now, snapshot['turn_id']))
             c.execute('INSERT INTO audit_events(conversation_id,event_type,actor,summary,details_json,created_at) '
                 "VALUES (?,'learning_failure','system',?,?,?)", (snapshot['conversation_id'],
                 'Lernvorschlag konnte nicht übernommen werden', json.dumps({'turn_id': snapshot['turn_id'],

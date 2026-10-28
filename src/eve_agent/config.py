@@ -77,7 +77,7 @@ DEFAULTS: dict[str, Any] = {
         "channel_capabilities": ["memory", "semantic_learning", "working_memory", "web", "clock", "calculator"],
     },
     "nova_maintenance": {"enabled": False, "command": "codex", "transport": "isolated", "shared_chat_socket": "", "shared_chat_timeout_seconds": 900, "bwrap_command": "bwrap", "timeout_seconds": 180, "verification_timeout_seconds": 180, "pending_ttl_seconds": 600, "require_process_isolation": True, "max_context_records": 20, "max_jobs": 20},
-    "web": {"enabled": False, "searxng_url": "http://127.0.0.1:8888", "image_results": 4, "timeout_seconds": 12},
+    "web": {"enabled": False, "searxng_url": "http://127.0.0.1:8888", "image_results": 4, "timeout_seconds": 12, "max_page_bytes": 5_000_000},
     "image_generation": {"enabled": False, "api_format": "sdapi", "base_url": "http://127.0.0.1:1235", "api_key": "", "model": "", "width": 1024, "height": 1024, "steps": 4, "guidance_scale": 1.0, "timeout_seconds": 3600, "extra_parameters": {}},
     "home_assistant": {"enabled": False, "url": "", "token": "", "language": "de", "timeout_seconds": 12},
     "network_tools": {"enabled": False, "subnet": "192.168.0.0/16", "image": "docker.io/instrumentisto/nmap:latest", "timeout_seconds": 35},
@@ -323,6 +323,10 @@ UI_FIELDS: dict[str, dict[str, Any]] = {
     "web.timeout_seconds": {
         "label": "Timeout (Sekunden)", "type": "integer", "min": 1, "max": 300,
         "description": "Maximale Wartezeit je Suche, Seitenabruf oder Bildabruf.",
+    },
+    "web.max_page_bytes": {
+        "label": "Maximale Seitengröße (Bytes)", "type": "integer", "min": 750_000, "max": 20_000_000,
+        "description": "Abruflimit vor der Textextraktion. Größere Seiten werden mit erkennbarem Fehler abgelehnt.",
     },
     "nova_maintenance.enabled": {
         "label": "Aktiviert", "type": "boolean",
@@ -592,7 +596,8 @@ def _validate(root: Path, config: dict[str, Any]) -> None:
 
     web = config["web"]
     web["searxng_url"] = _url(web.get("searxng_url"), "web.searxng_url")
-    for key, low, high in (("image_results", 1, 8), ("timeout_seconds", 1, 300)):
+    for key, low, high in (("image_results", 1, 8), ("timeout_seconds", 1, 300),
+                           ("max_page_bytes", 750_000, 20_000_000)):
         _integer(web, key, low, high, f"web.{key}")
 
     shell = config["shell"]

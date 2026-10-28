@@ -4,6 +4,9 @@ from __future__ import annotations
 import base64
 import json
 import uuid
+from copy import deepcopy
+
+from jsonschema import Draft202012Validator, ValidationError
 
 from .context_budget import WorkingContextBudgetError
 from .working_memory import WorkingMemoryStore
@@ -23,6 +26,10 @@ class WorkingMemorySession:
             if isolated else self.store.open(agent.conversation_id)
         )
         self.input = {'text': text, 'images': images, 'trace_id': trace_id}
+        from .scheduled_execution import scheduled_metadata
+        execution = scheduled_metadata()
+        if execution is not None:
+            self.input['scheduled_execution'] = execution
         self.turn_id, self.request = self.store.begin_turn(self.workspace_id, agent.conversation_id, self.input, trace_id)
         self.original_context = None
         self.tool_refs = {}
@@ -40,6 +47,10 @@ class WorkingMemorySession:
         self.reset_reason = 'capacity'
         self.defer_images = False
         self.last_rejected_measurement = None
+        self.last_checkpoint_signature = None
+        self.checkpoint_capture = None
+        self.delta_reference = None
+        self.delta_signature = None
         agent._working_memory_context = self.identity()
 
     def identity(self):
@@ -48,14 +59,39 @@ class WorkingMemorySession:
 
     def entry(self):
         manifest = self.store.manifest(self.workspace_id, current_turn_id=self.turn_id)
+        self._update_delta(manifest['checkpoint_reference'])
         return {**self.identity(), 'revision': manifest['revision'],
                 'checkpoint_reference': manifest['checkpoint_reference'],
+                **({'execution_delta_reference': self.delta_reference} if self.delta_reference else {}),
                 'uncertain_call_count': len(manifest['uncertain_calls']),
                 'unfinished_turn_count': len(manifest['unfinished_turns']),
                 'last_unfinished_turn': manifest['unfinished_turns'][-1] if manifest['unfinished_turns'] else None,
                 'activity': self.store.activity(self.workspace_id),
                 'access': 'working_memory', 'checkpoint_author': 'model',
                 'checkpoint_is_verified_fact': False}
+
+    def _update_delta(self, checkpoint):
+        """References after the checkpoint, including a previous terminal turn.
+
+        Model answers remain labelled as such; none becomes provider evidence.
+        The same immutable delta is reused until its database records change.
+        """
+        if not checkpoint:
+            return
+        since = self.store.describe(self.workspace_id, checkpoint)['created_at']
+        calls = [call for call in self.store.calls(self.workspace_id)['items'] if call['created_at'] > since
+                 and not (call['capability'] == 'working_memory' and call['operation'] == 'checkpoint')]
+        with self.store.database.connect(lifecycle_audit=False) as c:
+            turns = [dict(row) for row in c.execute(
+                "SELECT id,status,request_id AS request_reference,answer_id AS model_answer_reference,"
+                "error_id AS error_reference FROM memory_work_turns "
+                "WHERE workspace_id=? AND id!=? AND status!='running' AND updated_at>? ORDER BY created_at,id",
+                (self.workspace_id, self.turn_id, since))]
+        delta = {'calls': calls, 'terminal_turns': turns, 'model_answers_are_verified_facts': False}
+        signature = encoded([checkpoint, delta])
+        if signature != self.delta_signature:
+            self.delta_reference = self.archive_frame(delta, kind='execution_delta')['reference']
+            self.delta_signature = signature
 
     def execute(self, operation, parameters):
         p = parameters; s = self.store; w = self.workspace_id
@@ -84,6 +120,7 @@ class WorkingMemorySession:
             result = s.checkpoint(w, p['state'], expected_revision=p['expected_revision'],
                                   references=p.get('references', ()), turn_id=self.turn_id)
             self.agent._working_memory_context = {**self.identity(), 'checkpoint_reference': result['checkpoint']['reference']}
+            self.last_checkpoint_signature = self._material_signature()
             return result
         if operation == 'review_call':
             return s.review_call(w, p['call_reference'], p['decision'], p['evidence_references'],
@@ -137,7 +174,120 @@ class WorkingMemorySession:
         self.original_context = None
         self.tool_refs.clear(); self.read_frames.clear(); self.read_requests.clear(); self.last_round_start = None
         self.last_recovery_signature = None
+        self.last_checkpoint_signature = None
+        self.checkpoint_capture = None
+        self.delta_reference = None
+        self.delta_signature = None
         self.agent._working_memory_context = self.identity()
+
+    def _material_signature(self):
+        """Immutable inputs/outcomes, not a semantic judgement of progress."""
+        inputs = set()
+        for call in self.store.calls(self.workspace_id)['items']:
+            if call['turn_id'] != self.turn_id or call['status'] != 'returned':
+                continue
+            capability, operation = call['capability'], call['operation']
+            if capability == 'eve_runtime' or (capability == 'working_memory' and operation not in {'read', 'inspect'}):
+                continue
+            parameters = self.store.value(self.workspace_id, call['request_reference'])
+            outcome = (self.store.describe(self.workspace_id, call['result_reference'])['sha256']
+                       if capability != 'working_memory' else None)
+            inputs.add(encoded([capability, operation, parameters, outcome]))
+        return encoded([self.request['reference'], sorted(inputs)])
+
+    def capture_checkpoint(self, messages, core_prompt, reason, *, completion=None):
+        """Persist a model-authored state before externalizing its source frames.
+
+        Only the checkpoint tool is offered. No provider can be executed here;
+        Python validates protocol, revision and workspace references only.
+        """
+        from .llm import LocalLLMError
+        from .working_memory import contract
+        request = getattr(self.agent.llm, 'request_working_checkpoint', None)
+        signature = self._material_signature()
+        if completion is not None:
+            signature = encoded([signature, completion])
+        if not callable(request) or signature == self.last_checkpoint_signature:
+            return
+        revision = self.entry()['revision']
+        operation = deepcopy(contract()['operations']['checkpoint'])
+        schema = operation['parameters_schema']
+        schema['properties']['expected_revision'] = {'type': 'integer', 'const': revision}
+        schema['properties']['state']['minProperties'] = 1
+        evidence = {self.request['reference']}
+        completion_reference = None
+        if completion is not None:
+            completion_reference = self.store.put(self.workspace_id, {'content': completion,
+                'author': 'model', 'verified_fact': False}, kind='model_answer', source='assistant',
+                turn_id=self.turn_id)['reference']
+            evidence.add(completion_reference)
+        previous = self.entry()['checkpoint_reference']
+        if previous:
+            evidence.add(previous)
+        evidence.update(self.tool_refs[id(frame)]['reference'] for frame in messages if id(frame) in self.tool_refs)
+        schema['properties']['references'] = {'type': 'array', 'minItems': 1,
+            'items': {'type': 'string', 'enum': sorted(evidence)}}
+        schema['required'] = ['state', 'expected_revision', 'references']
+        tools = [{'type': 'function', 'function': {'name': 'working_memory__checkpoint',
+                  'description': operation['description'] + ' Persistence only; do not continue the task in this call.',
+                  'parameters': schema}}]
+        control = {'role': 'user', 'content': encoded({'checkpoint_boundary': {
+            'reason': reason, 'expected_revision': revision,
+            'request_reference': self.request['reference'],
+            'previous_checkpoint_reference': self.entry()['checkpoint_reference'],
+            **({'completion_reference': completion_reference} if completion_reference else {})}})}
+        frames = [dict(message) for message in messages]
+        clones = []
+        for original, frame in zip(messages, frames):
+            if id(original) in self.tool_refs:
+                self.tool_refs[id(frame)] = self.tool_refs[id(original)]
+                clones.append(id(frame))
+        if completion is not None:
+            frames.append({'role': 'assistant', 'content': completion})
+        frames.append(control)
+        call_id = None
+        try:
+            self._externalize_tools(frames, keep_read_round=False, tools=tools)
+            if not self._fits(frames, tools):
+                self._defer_structures(frames)
+            if not self._fits(frames, tools):
+                original = self.archive_frame(messages, kind='checkpoint_source')
+                frames = self._seed(core_prompt, tools) + [{'role': 'user', 'content': encoded({
+                    'checkpoint_source_reference': original['reference'], 'source_content_in_context': False})}, control]
+            if not self._fits(frames, tools):
+                raise WorkingContextBudgetError(self.workspace_id, 'Checkpoint-Anfrage passt nicht in das Modellbudget.')
+            context = self.archive_frame(frames, kind='checkpoint_context')
+            response = request(frames, tools)
+            self.archive_frame(response, kind='checkpoint_response')
+            calls = response.get('tool_calls') or []
+            if len(calls) != 1 or calls[0].get('name') != 'working_memory__checkpoint':
+                raise ValueError('Checkpoint-Protokoll: genau ein Checkpoint-Aufruf erforderlich')
+            parameters = calls[0].get('arguments')
+            Draft202012Validator(schema).validate(parameters)
+            if not isinstance(calls[0].get('id'), str) or not calls[0]['id']:
+                raise ValueError('Checkpoint-Protokoll: Aufruf-ID fehlt')
+            # Model call IDs are scoped to one RPC. Internal persistence RPCs
+            # need their own journal identity when a server reuses those IDs.
+            call_id = self.store.start_call(self.workspace_id, self.turn_id, 'checkpoint_' + uuid.uuid4().hex,
+                'working_memory', 'checkpoint', 'write', parameters)
+            self.store.dispatch_call(self.workspace_id, call_id)
+            # checkpoint() atomically rejects stale revisions and foreign evidence.
+            result = self.execute('checkpoint', parameters)
+            self.store.finish_call(self.workspace_id, self.turn_id, call_id, result)
+            self.checkpoint_capture = {'status': 'saved', 'reason': reason,
+                'checkpoint_reference': result['checkpoint']['reference'], 'context_reference': context['reference']}
+        except (LocalLLMError, ValueError, KeyError, ValidationError, WorkingContextBudgetError) as exc:
+            # A failed serialization must never overwrite a valid previous state.
+            self.checkpoint_capture = {'status': 'failed', 'reason': reason,
+                'class': type(exc).__name__, 'message': str(exc)}
+            if call_id is not None:
+                self.store.finish_call(self.workspace_id, self.turn_id, call_id, self.checkpoint_capture)
+            self.archive_frame(self.checkpoint_capture, kind='checkpoint_error')
+        finally:
+            for identifier in clones:
+                self.tool_refs.pop(identifier, None)
+        # One serialization per unchanged set of source results, also on failure.
+        self.last_checkpoint_signature = signature
 
     def archive_frame(self, message, kind='context_frame'):
         return self.store.put(self.workspace_id, message, kind=kind, source='system', turn_id=self.turn_id)
@@ -213,6 +363,13 @@ class WorkingMemorySession:
                 'transition': {'reason': self.reset_reason, 'prepared': True,
                                'requested_reset_completed': self.reset_reason == 'model_requested'},
                 'execution_journal_reference': self.journal_reference}
+        if self.input.get('scheduled_execution') is not None:
+            data['scheduled_execution'] = self.input['scheduled_execution']
+        if self.checkpoint_capture is not None:
+            data['checkpoint_capture'] = self.checkpoint_capture
+        if entry['checkpoint_reference']:
+            data['execution_delta_reference'] = self.delta_reference
+            data['checkpoint_content_in_context'] = bool(include_checkpoint)
         standing_reader = getattr(self.agent.memory, 'standing_instructions', None)
         if callable(standing_reader):
             data['standing_memory'] = standing_reader(telemetry_context={
@@ -252,8 +409,11 @@ class WorkingMemorySession:
 
     def prepare(self, messages, tools, capabilities, state, core_prompt, publish, *, force=False):
         """Return a valid bounded chat frame sequence, retaining all originals."""
+        switched = bool(self.pending_workspace)
         if self.pending_workspace:
+            self.capture_checkpoint(messages, core_prompt, 'workspace_open')
             self.switch_workspace()
+            messages = self._seed(core_prompt, tools)
             force = True
         if not force and not self.reset_requested and self._fits(messages, tools):
             if self.context_number == 0:
@@ -261,6 +421,8 @@ class WorkingMemorySession:
             return messages, tools, None
         if self.original_context is None:
             self.original_context = self.archive_frame(messages, kind='archived_context')
+        if not switched:
+            self.capture_checkpoint(messages, core_prompt, self.reset_reason if self.reset_requested else 'capacity')
         self._externalize_tools(messages, tools=tools)
         if not self._fits(messages, tools):
             self._defer_structures(messages)
@@ -320,9 +482,11 @@ class WorkingMemorySession:
 
     def recover(self, messages, error):
         """Retry only if a context reset can change the rejected model input."""
-        signature = encoded([self.request['reference'], self.entry()['checkpoint_reference'],
-                             [m.get('tool_calls') for m in messages if m.get('tool_calls')]])
+        signature = self._material_signature()
         if signature == self.last_recovery_signature:
+            from .llm import EmptyModelResponseError, LocalLLMOutputLimitError
+            if isinstance(error, (EmptyModelResponseError, LocalLLMOutputLimitError)):
+                raise error
             raise WorkingContextBudgetError(self.workspace_id, 'Der Modellserver lehnt auch den frischen Kontext ab.') from error
         self.last_recovery_signature = signature
         refresh = getattr(self.agent.llm, 'runtime_model_info', None)
@@ -331,7 +495,9 @@ class WorkingMemorySession:
         self.archive_frame({'class': type(error).__name__, 'message': str(error),
                             'partial_response': getattr(error, 'partial_response', '')}, kind='model_context_error')
         self.reset_requested = True
-        self.reset_reason = 'provider_context_rejection'
+        from .llm import EmptyModelResponseError, LocalLLMOutputLimitError
+        self.reset_reason = ('empty_model_response' if isinstance(error, EmptyModelResponseError) else
+                             'output_limit' if isinstance(error, LocalLLMOutputLimitError) else 'provider_context_rejection')
         self.defer_images = True
 
     def finish(self, status, value):

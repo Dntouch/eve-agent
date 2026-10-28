@@ -9,7 +9,7 @@
   <link rel="icon" type="image/png" sizes="32x32" href="assets/favicon-32.png">
   <link rel="apple-touch-icon" sizes="180x180" href="assets/apple-touch-icon.png">
   <link rel="manifest" href="manifest.webmanifest">
-  <link rel="stylesheet" href="styles.css?v=20261025-config-choices1">
+  <link rel="stylesheet" href="styles.css?v=20261028-scheduled-origin1">
   <title>EVE // Living Signal</title>
 </head>
 <body data-state="idle">
@@ -539,6 +539,8 @@
         <label>Abstand<input id="taskIntervalValue" type="number" min="1" value="30"></label>
         <label>Einheit<select id="taskIntervalUnit"><option value="60">Minuten</option><option value="3600">Stunden</option><option value="86400">Tage</option></select></label>
       </div>
+      <label>Enddatum und Uhrzeit (optional)<input id="taskEndsAt" type="datetime-local" aria-describedby="taskEndsAtHelp"></label>
+      <p id="taskEndsAtHelp">Leer lassen für unbegrenzte Wiederholung. Nach diesem Zeitpunkt wird die Aufgabe nicht mehr ausgeführt.</p>
       <label class="task-status"><input id="taskActive" type="checkbox"> Aufgabe aktiv</label>
       <p class="task-editor-error" id="taskEditorError" role="alert"></p>
       <footer><button id="taskEditorCancel" type="button">ABBRECHEN</button><button class="send" type="submit">SPEICHERN</button></footer>
@@ -553,6 +555,6 @@
   <script src="neurocloud-xr.js?v=6" defer></script>
   <script src="vendor/html2canvas.min.js" defer></script>
   <script src="chat-export.js" defer></script>
-  <script src="app.js?v=20261025-config-choices1" defer></script>
+  <script src="app.js?v=20261028-scheduled-origin1" defer></script>
 </body>
 </html>

@@ -9,20 +9,12 @@ from jsonschema import Draft202012Validator
 from .home_assistant import HomeAssistant
 from .native_semantics import NativeSemanticSession
 from .semantic_links import CONTEXT_KEYS, SemanticLinks, action_identity, assessment_conditions
-from .working_memory import WorkingMemoryStore
 
 
 def formulation_schema():
     session = SimpleNamespace(providers={"home_assistant": None})
     schema = deepcopy(NativeSemanticSession.contract(session)["operations"]["record_action"]["parameters_schema"])
     schema["properties"].pop("based_on", None)
-    declaration = schema['properties']['assessment']['properties']['action_link']
-    declaration['anyOf'] = [
-        {'properties': {'kind': {'const': 'existing'}, 'representation_id': {'minLength': 1},
-                        'anchor_claim_id': {'minLength': 1}}, 'required': ['representation_id', 'anchor_claim_id']},
-        {'properties': {'kind': {'const': 'new'}, 'meaning': {'minLength': 1}}, 'required': ['meaning']},
-        {'properties': {'kind': {'const': 'none'}}},
-    ]
     schema["description"] = "Optional semantic learning alongside the general Memory decision. References name original tool event IDs from this turn, never execute actions."
     return schema
 
@@ -94,8 +86,14 @@ class ConversationSemantics:
         return {"available": True, "current_formulation": snapshot["user_content"],
             "context_at_execution": session.context, "executions": session.executions,
             "observations": {ref: call for ref, call in session.calls.items() if ref not in session.executions},
+            "goal_observation_refs": [ref for ref, call in session.calls.items()
+                if session.tool_ordinals[ref] > max(session.tool_ordinals[r] for r in session.executions)
+                and call['result'].get('status') == 'completed'
+                and call['parameters'].get('method') == 'GET'
+                and call['parameters'].get('path') in {'/api/states/' + a['entity_id']
+                    for execution in session.executions.values() for a in execution['actions']}],
             "action_candidates": session.published["home_assistant"], "existing_formulations": existing,
-            "contract": "Use semantic_formulation to learn the complete original formulation. Prefer an existing meaning when equivalent; equal API calls alone do not prove equivalence. Cite successful state observations AFTER the actions. Keep context-dependent or uncertain interpretations as candidates. Never infer user confirmation. A null semantic_formulation requires semantic_learning_reason."}
+            "contract": "Return semantic_formulation or null with semantic_learning_reason. Meaning is model-assessed. success requires goal_observation_refs; outcome_uncertain may retain a candidate with empty evidence. Existing meanings require published action and anchor IDs."}
 
     def validate(self, snapshot, raw, *, session=None):
         if raw is None:
@@ -107,54 +105,38 @@ class ConversationSemantics:
         refs = raw["call_references"]
         if refs != list(session.executions):
             raise ValueError("semantic_execution_scope_or_order_mismatch")
-        if any(row["status"] not in {"completed", "returned"} for row in snapshot["tools"]
-               if row["tool"] == "home_assistant") and raw["outcome"] == "success":
-            raise ValueError("semantic_unresolved_execution")
-        provider = next(iter(session.executions.values()))["provider"]
-        plan = {"effect": "write", "actions": [a for ref in refs for a in session.executions[ref]["actions"]]}
-        if assessment_conditions(raw["assessment"], session.context, snapshot["user_content"], plan) is None:
-            raise ValueError("semantic_invalid_context_assessment")
-        declaration = raw["assessment"]["action_link"]
-        if declaration["kind"] == "existing":
-            published = next((p for p in session.published["home_assistant"]
-                if p["representation_id"] == declaration.get("representation_id")
-                and any(e["claim_id"] == declaration.get("anchor_claim_id") for e in p["examples"])), None)
-            if not published:
-                raise ValueError("semantic_unpublished_action_reference")
-            anchor = self.links.experience(declaration["anchor_claim_id"])
-            if anchor["provider"] != provider or action_identity(anchor["plan"]) != action_identity(plan):
-                raise ValueError("semantic_action_execution_mismatch")
-        targets = {a["entity_id"] for a in plan["actions"]}
-        observed = set()
-        for evidence in raw["evidence"]:
-            ref = evidence["call_reference"]
-            call = session.calls.get(ref)
-            if not call or session.tool_ordinals[ref] <= max(session.tool_ordinals[r] for r in refs):
-                raise ValueError("semantic_goal_must_follow_execution")
-            result, parameters = call["result"], call["parameters"]
-            entity = parameters.get("path", "").removeprefix("/api/states/")
-            body = result.get("response", {}).get("body")
-            if (call["operation"] != "http_request" or parameters.get("method") != "GET"
-                    or not parameters.get("path", "").startswith("/api/states/") or entity not in targets
-                    or result.get("status") != "completed" or not isinstance(body, dict)
-                    or body.get("entity_id") != entity
-                    or not (evidence["pointer"] == "/response/body/state"
-                            or evidence["pointer"].startswith("/response/body/attributes/"))):
-                raise ValueError("semantic_goal_requires_target_observation")
-            actual = WorkingMemoryStore.pointer(result, evidence["pointer"])
-            if json.dumps(actual, sort_keys=True) != json.dumps(evidence["value"], sort_keys=True):
-                raise ValueError("semantic_goal_value_mismatch")
-            if evidence["pointer"] == "/response/body/state" and (not isinstance(actual, str)
-                    or actual in ("unknown", "unavailable")):
-                raise ValueError("semantic_goal_state_unavailable")
-            observed.add(entity)
-        if raw["outcome"] == "success" and observed != targets:
-            raise ValueError("semantic_goal_targets_incomplete")
+        # Online and deferred learning share the same receipt/goal checks.
+        # Earlier failed transports do not invalidate a later successful receipt.
+        session.validate_record(raw)
         return deepcopy(raw)
 
     def persist(self, snapshot, raw, connection, *, session):
         existing = self.existing(snapshot, connection, session=session)
         if existing:
+            assessment = raw['assessment']
+            if (existing.get('link_status') == 'insufficient_evidence' and raw['outcome'] == 'success'
+                    and assessment['status'] == 'resolved' and not assessment['uncertainties']
+                    and assessment['user_grounding'] != 'unknown'
+                    and assessment['action_link']['kind'] in {'new', 'existing'}):
+                # Reassess the same proven occurrence, preserving its independent root.
+                claim = self.links.experience(existing['claim_id'], _connection=connection)
+                if claim.get('strong_semantic_evidence') and claim.get('validity') == 'valid':
+                    payload = {key: value for key, value in claim.items() if key not in {'id', 'lifecycle', 'created_at'}}
+                    old_assessment = deepcopy(payload['semantic_assessment'])
+                    payload['semantic_assessment'] = deepcopy(raw['assessment'])
+                    payload['plan']['semantic_learning'] = deepcopy(raw['assessment'])
+                    payload['context'] = assessment_conditions(raw['assessment'], session.context,
+                                                               snapshot['user_content'], payload['plan'])
+                    self.links._link_action(connection, claim['id'], payload, session.published['home_assistant'])
+                    if payload['action_link_status'] not in {'created', 'linked'}:
+                        raise ValueError('semantic_relink_not_established:' + payload.get('action_link_reason', 'unknown'))
+                    self.links._evidence(connection, claim['id'], 'semantic_link_reassessment',
+                        {'previous_assessment': old_assessment, 'assessment': raw['assessment'],
+                         'same_execution': True}, snapshot['turn_id'])
+                    self.links._update(connection, claim['id'], payload, claim['lifecycle'])
+                    self.links.differential.refresh_claim(claim['id'], _connection=connection)
+                    return self.summary(self.links.experience(claim['id'], _connection=connection),
+                                        'relinked' if payload['action_link_status'] in {'created', 'linked'} else 'semantic_candidate')
             return existing
         result = session.record(raw, _connection=connection)
         claim = result["experience"]
@@ -197,4 +179,6 @@ class ConversationSemantics:
         return {"kind": kind, "claim_id": claim["id"], "release": claim["lifecycle"],
                 "action_id": claim.get("action_representation_id"),
                 "context_dependent": bool(claim.get("context")),
-                "direct_execution": claim["lifecycle"] == "active" and replay_recipe(self.links, claim) is not None}
+                "direct_execution": claim["lifecycle"] == "active" and replay_recipe(self.links, claim) is not None,
+                "link_status": claim.get("action_link_status"), "reason": claim.get("action_link_reason") or (
+                    "goal_unverified" if claim.get("technical_status") != "success" else None)}

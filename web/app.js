@@ -62,6 +62,7 @@
     taskScheduleType: $("#taskScheduleType"),
     taskOnceRow: $("#taskOnceRow"),
     taskOnceAt: $("#taskOnceAt"),
+    taskEndsAt: $("#taskEndsAt"),
     taskTimeRow: $("#taskTimeRow"),
     taskTime: $("#taskTime"),
     taskWeekdays: $("#taskWeekdays"),
@@ -776,6 +777,22 @@
       if (media.childElementCount) article.append(media);
     }
     const toolEvents = Array.isArray(message.tool_events) ? message.tool_events : [];
+    const scheduled = message.role === "assistant" ? message.metadata?.scheduled_execution : null;
+    const activity = document.createElement("div");
+    activity.className = "message-activity";
+    if (scheduled) {
+      const details = document.createElement("details");
+      details.className = "message-scheduled-task";
+      const summary = document.createElement("summary");
+      summary.textContent = "Geplante Aufgabe";
+      const origin = document.createElement("p");
+      origin.textContent = "Automatisch ausgeführt" + (scheduled.name ? ` · ${scheduled.name}` : "");
+      const request = document.createElement("div");
+      request.className = "scheduled-task-request";
+      request.textContent = scheduled.request || "";
+      details.append(summary, origin, request);
+      activity.append(details);
+    }
     if (toolEvents.length) {
       const details = document.createElement("details");
       details.className = "message-tool-events";
@@ -795,8 +812,9 @@
         details.append(createDiagnosticCopyControl(toolEvents, "Alle Rohdaten kopieren"));
       }
       details.append(list);
-      article.append(details);
+      activity.append(details);
     }
+    if (activity.childElementCount) article.append(activity);
     const sources = Array.isArray(message.metadata?.sources) ? message.metadata.sources : [];
     if (sources.length) {
       const sourceRow = document.createElement("details");
@@ -1327,10 +1345,16 @@
   }
 
   function renderMessages(messages = []) {
-    elements.chatMessages.replaceChildren(...messages.map(message => message.failure_report ? createFailureCard(message.failure_report) : createMessageNode(message)));
+    const visible = visibleChatMessages(messages);
+    elements.chatMessages.replaceChildren(...visible.map(message => message.failure_report ? createFailureCard(message.failure_report) : createMessageNode(message)));
     restorePresentationTurnStatuses();
-    elements.chatEmpty.hidden = messages.length > 0;
+    elements.chatEmpty.hidden = visible.length > 0;
     scrollChatToLatest();
+  }
+
+  function visibleChatMessages(messages) {
+    return messages.filter(message => !(message.role === "user"
+      && (message.metadata?.input_kind === "scheduled" || message.metadata?.scheduled_execution)));
   }
 
   async function exportConversationPng() {
@@ -1362,7 +1386,7 @@
       const timestamp = document.createElement("p"); timestamp.textContent = `Exportiert am ${new Date().toLocaleString("de-DE")}`;
       header.append(brand, title, timestamp); root.append(header);
       const messages = document.createElement("div"); messages.className = "chat-export-messages";
-      for (const message of timeline) messages.append(message.failure_report ? createFailureCard(message.failure_report) : createMessageNode(message));
+      for (const message of visibleChatMessages(timeline)) messages.append(message.failure_report ? createFailureCard(message.failure_report) : createMessageNode(message));
       // Closed disclosures retain their current default presentation; interactive
       // controls are omitted from the shareable snapshot.
       messages.querySelectorAll("button, .action-feedback, .message-reasoning, .presentation-work-status").forEach(node => node.remove());
@@ -1539,7 +1563,8 @@
       ? conversationTime(date.toISOString())
       : "Kein nächster Termin";
     const labels = { once: "Einmalig", delay: "Einmalig verzögert", daily: "Täglich", weekly: "Wöchentlich", interval: "Intervall", event: "Ereignis" };
-    return `${labels[task.schedule_type] || task.schedule_type} · ${next}`;
+    const end = task.schedule?.ends_at ? ` · Ende: ${conversationTime(task.schedule.ends_at)}` : "";
+    return `${labels[task.schedule_type] || task.schedule_type} · ${next}${end}`;
   }
 
   function renderTaskList() {
@@ -1581,7 +1606,8 @@
       remove.type = "button";
       remove.textContent = "LÖSCHEN";
       remove.addEventListener("click", () => deleteTask(task));
-      actions.append(pause, edit, remove);
+      if (["active", "paused"].includes(task.status)) actions.append(pause);
+      actions.append(edit, remove);
       article.append(body, actions);
       return article;
     });
@@ -1629,6 +1655,7 @@
     elements.taskScheduleType.value = ["once", "delay", "daily", "weekly", "interval"].includes(task.schedule_type)
       ? task.schedule_type : "once";
     elements.taskOnceAt.value = localDateTimeValue(task.schedule?.at || task.next_run_at);
+    elements.taskEndsAt.value = task.schedule?.ends_at ? localDateTimeValue(task.schedule.ends_at) : "";
     const hour = String(task.schedule?.hour ?? new Date(task.next_run_at).getHours()).padStart(2, "0");
     const minute = String(task.schedule?.minute ?? new Date(task.next_run_at).getMinutes()).padStart(2, "0");
     elements.taskTime.value = `${hour}:${minute}`;
@@ -1653,22 +1680,28 @@
 
   function taskSchedulePayload() {
     const type = elements.taskScheduleType.value;
+    const end = elements.taskEndsAt.value ? new Date(elements.taskEndsAt.value) : null;
+    if (end && (Number.isNaN(end.valueOf()) || end.valueOf() <= Date.now())) {
+      throw new Error("Das Enddatum muss in der Zukunft liegen.");
+    }
+    const bounds = end ? { ends_at: end.toISOString() } : {};
     if (type === "once") {
       const date = new Date(elements.taskOnceAt.value);
       if (Number.isNaN(date.valueOf())) throw new Error("Bitte Datum und Uhrzeit auswählen.");
-      return { type, schedule: { at: date.toISOString() } };
+      if (end && date > end) throw new Error("Das Enddatum liegt vor dem Ausführungstermin.");
+      return { type, schedule: { at: date.toISOString(), ...bounds } };
     }
     if (["delay", "interval"].includes(type)) {
       const seconds = Number(elements.taskIntervalValue.value) * Number(elements.taskIntervalUnit.value);
       if (!Number.isFinite(seconds) || seconds < 60) throw new Error("Das Intervall muss mindestens eine Minute betragen.");
-      return { type, schedule: { seconds } };
+      return { type, schedule: { seconds, ...bounds } };
     }
     const [hour, minute] = elements.taskTime.value.split(":").map(Number);
     if (!Number.isInteger(hour) || !Number.isInteger(minute)) throw new Error("Bitte eine Uhrzeit auswählen.");
-    if (type === "daily") return { type, schedule: { hour, minute } };
+    if (type === "daily") return { type, schedule: { hour, minute, ...bounds } };
     const weekdays = [...elements.taskWeekdays.querySelectorAll('input[type="checkbox"]:checked')].map((input) => Number(input.value));
     if (!weekdays.length) throw new Error("Bitte mindestens einen Wochentag auswählen.");
-    return { type, schedule: { weekdays, hour, minute } };
+    return { type, schedule: { weekdays, hour, minute, ...bounds } };
   }
 
   async function deleteTask(task) {
@@ -6810,7 +6843,9 @@
         new_action: "Neue semantische Aktion samt Formulierung gespeichert",
         semantic_candidate: "Semantische Formulierung als Kandidat gespeichert",
         supporting_evidence: "Bereits gespeicherte semantische Erfahrung nachgewiesen",
-        not_reusable: "Keine wiederverwendbare Formulierung gelernt"};
+        not_reusable: "Bewusst keine wiederverwendbare Formulierung gelernt",
+        pending: "Formulierungsprüfung steht aus", rejected: "Formulierungsprüfung gescheitert",
+        relinked: "Vorhandene Erfahrung mit der Handlung verknüpft"};
       const summary = document.createElement("p");
       summary.textContent = `Was wurde gelernt? ${labels[learned.kind] || learned.kind}. ${learned.reason || ""}`;
       if (learned.release) summary.textContent += learned.direct_execution
@@ -7489,6 +7524,7 @@
       ["Bekannte Handlungen", c.action_representations, "Mehrere Sätze können dieselbe Handlung meinen", "", "actions"],
       ["Gelernte Formulierungen", c.linked_formulations, "Mit einer Handlung verknüpfte Sätze", "", "formulations"],
       ["Noch zu prüfen", c.candidates, "Noch nicht freigegebene Lernerfahrungen", "attention", "candidates"],
+      ["Ohne Verknüpfung", c.unlinked_experiences, "Gespeichert, aber keiner Handlung zugeordnet", "attention", "unlinked"],
       ["Bestätigt", (c.automatic_active || 0) + (c.explicit_active || 0), "Automatisch oder ausdrücklich aktiviert", "success", "active"],
       ["Widersprüche", c.link_conflicts, "Mehrdeutige oder gegensätzliche Handlungsverknüpfungen", c.link_conflicts ? "warning" : "success", "conflicts"],
       ["Zurückgewiesen", c.invalid, "Als ungültig markierte Erfahrungen", "", "invalid"],
@@ -7509,6 +7545,7 @@
         const filters = {
           formulations: ["", "usable", `${c.linked_formulations || 0} mit Handlungen verknüpfte Formulierung(en)`],
           candidates: ["candidate", "", `${c.candidates || 0} noch nicht freigegebene Lernerfahrung(en)`],
+          unlinked: ["", "insufficient_evidence", `${c.unlinked_experiences || 0} Erfahrung(en) ohne Handlungsverknüpfung`],
           active: ["active", "", `${(c.automatic_active || 0) + (c.explicit_active || 0)} bestätigte Lernerfahrung(en)`],
           conflicts: ["", "conflict", `${c.link_conflicts || 0} widersprüchliche Handlungsverknüpfung(en)`],
           invalid: ["invalid", "", `${c.invalid || 0} zurückgewiesene Lernerfahrung(en)`],
@@ -7735,6 +7772,26 @@
     semanticJson(language, "Allgemeine Äquivalenzen, Ressourcenaliase, Kontext, Evidenz, Versionen und Korrekturen", data.language_relations || []);
     semanticComposition.append(language, hypotheses, evaluations);
   }
+  function renderSemanticOutcomes(summary) {
+    const outcomes = document.createElement("details");
+    const outcomeTitle = document.createElement("summary"); outcomeTitle.textContent = "Letzte Formulierungsprüfungen";
+    outcomes.append(outcomeTitle);
+    const labels = {pending: "Prüfung ausstehend", rejected: "Prüfung gescheitert",
+      semantic_candidate: "Ungeprüfter Kandidat", new_action: "Neue Handlung und Formulierung",
+      new_formulation: "Neue Formulierung verknüpft", relinked: "Verknüpfung korrigiert",
+      supporting_evidence: "Vorhandene Erfahrung", not_reusable: "Bewusst nichts gelernt"};
+    for (const item of summary.recent_learning || []) {
+      const row = document.createElement("p");
+      row.textContent = `${labels[item.kind] || item.kind}: „${item.utterance}“${item.reason ? ` · ${item.reason}` : ""}`;
+      if (item.general_learning?.status === "failed") row.textContent += " · Allgemeine Lernprüfung gescheitert";
+      outcomes.append(row);
+    }
+    if (!(summary.recent_learning || []).length) {
+      const empty = document.createElement("p"); empty.textContent = "Noch keine Formulierungsprüfung aufgezeichnet."; outcomes.append(empty);
+    }
+    return outcomes;
+  }
+
   async function loadSemanticLearning(append = false) {
     const params = new URLSearchParams({q: semanticSearch.value, status: semanticFilter.value,
       action_link_status: semanticLinkFilter.value, limit: "20", cursor: String(append ? semanticCursor || 0 : 0)});
@@ -7745,6 +7802,7 @@
     semanticSummary.textContent = `${page.items.length} Erfahrung(en) geladen · ${c.action_representations || 0} gemeinsame Handlungen · ${c.link_conflicts || 0} Konflikte.`;
     if (!append) {
       semanticRows.replaceChildren();
+      semanticRows.append(renderSemanticOutcomes(summary));
       const trends = document.createElement("details"); trends.className = "semantic-technical-details"; const title = document.createElement("summary"); title.textContent = "Tageswerte der Lernereignisse";
       trends.append(title);
       const table = document.createElement("table");

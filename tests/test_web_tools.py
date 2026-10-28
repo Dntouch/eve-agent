@@ -2,10 +2,12 @@ import json
 import unittest
 from unittest import mock
 import urllib.parse
+import urllib.error
 
 from eve_agent.web_tools import (
     WebResearch,
     WebNoResults,
+    WebReadError,
     _assert_public_url,
     _TextExtractor,
     _is_http_source,
@@ -113,15 +115,65 @@ class WebToolTest(unittest.TestCase):
 
     def test_oversized_page_is_rejected_instead_of_silently_truncated(self):
         research = WebResearch({})
-        response = FakeResponse(b"x" * 750_001)
+        response = FakeResponse(b"x" * (research.max_page_bytes + 1))
+        response.read = mock.Mock(return_value=response.payload)
         response.headers = FakeHeaders()
         opener = mock.Mock()
         opener.open.return_value = response
         with mock.patch("eve_agent.web_tools._assert_public_url"), mock.patch(
             "eve_agent.web_tools.urllib.request.build_opener", return_value=opener,
         ):
-            with self.assertRaisesRegex(RuntimeError, "750000"):
+            with self.assertRaisesRegex(RuntimeError, "5000000"):
                 research.read_page("https://example.org/large")
+        response.read.assert_called_once_with(5_000_001)
+
+    def test_large_html_is_fully_read_and_scripts_are_removed(self):
+        response = FakeResponse(b'<script>' + b'x' * 800_000 + b'</script><p>Wetterbericht</p>')
+        response.headers = FakeHeaders()
+        opener = mock.Mock()
+        opener.open.return_value = response
+        with mock.patch("eve_agent.web_tools._assert_public_url"), mock.patch(
+            "eve_agent.web_tools.urllib.request.build_opener", return_value=opener,
+        ):
+            self.assertEqual("Wetterbericht", WebResearch({}).read_page("https://example.org/large"))
+            with self.assertRaisesRegex(RuntimeError, "750000"):
+                WebResearch({"max_page_bytes": 750_000}).read_page("https://example.org/large")
+
+    def test_failed_urls_keep_individual_http_statuses_in_runtime_error(self):
+        research = WebResearch({})
+        urls = ["https://example.org/blocked", "https://example.org/missing"]
+        errors = [urllib.error.HTTPError(url, status, reason, {}, None)
+                  for url, status, reason in zip(urls, [403, 404], ["Forbidden", "Not Found"])]
+        with mock.patch.object(research, "read_page", side_effect=errors):
+            with self.assertRaises(WebReadError) as caught:
+                research.execute_native_operation("read_urls", {"urls": urls})
+        failures = caught.exception.structure["url_errors"]
+        self.assertEqual([403, 404], [item["http_status"] for item in failures])
+        self.assertEqual(urls, [item["url"] for item in failures])
+        self.assertIn("403", str(caught.exception))
+        self.assertIn("404", str(caught.exception))
+
+    def test_partial_success_preserves_source_and_reports_failed_url_without_retry(self):
+        research = WebResearch({})
+        good, bad = "https://example.org/good", "https://example.org/bad"
+        with mock.patch.object(research, "read_page", side_effect=["Inhalt", TimeoutError("timed out")]) as read:
+            result = research.execute_native_operation("read_urls", {"urls": [good, bad, good]})
+        self.assertEqual(2, read.call_count)
+        self.assertEqual([good], [source["url"] for source in result["sources"]])
+        self.assertEqual("TimeoutError", result["url_errors"][0]["error_class"])
+        self.assertIn(bad, result["context"])
+        self.assertIn("Inhalt", result["context"])
+
+    def test_empty_page_is_reported_as_failure(self):
+        response = FakeResponse(b"<script>only scripts</script>")
+        response.headers = FakeHeaders()
+        opener = mock.Mock()
+        opener.open.return_value = response
+        with mock.patch("eve_agent.web_tools._assert_public_url"), mock.patch(
+            "eve_agent.web_tools.urllib.request.build_opener", return_value=opener,
+        ):
+            with self.assertRaisesRegex(WebReadError, "keinen lesbaren Text"):
+                WebResearch({}).read_urls(["https://example.org/empty"])
 
     def test_empty_successful_search_has_distinct_no_results_outcome(self):
         payload = json.dumps({"results": []}).encode()

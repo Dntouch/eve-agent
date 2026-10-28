@@ -124,7 +124,16 @@ def identity(value):
 
 
 def action_identity(plan):
-    return identity({'effect': plan.get('effect'), 'actions': plan.get('actions')})
+    # The executor already accepts both storage names for the same service-data
+    # object (see replay_recipe). Compare their wire payloads, retaining all
+    # values/types/unknown fields. This does not interpret utterances or goals.
+    actions = deepcopy(plan.get('actions'))
+    if isinstance(actions, list):
+        for action in actions:
+            if (isinstance(action, dict) and action.get('type') == 'call_service'
+                    and 'data' in action and 'parameters' not in action):
+                action['parameters'] = action.pop('data')
+    return identity({'effect': plan.get('effect'), 'actions': actions})
 
 
 def authoritative_interpretation(payload):
@@ -1295,7 +1304,7 @@ class SemanticLinks:
                            {'reason':code, 'declaration':declaration}, payload['origin_ref'],
                            'contradicts' if conflict else 'supports')
         if not payload['strong_semantic_evidence'] or not isinstance(declaration, dict):
-            unavailable(reason); return
+            unavailable('unverified_goal_or_interpretation' if isinstance(declaration, dict) else reason); return
         kind = declaration.get('kind')
         if (kind not in {'new','existing'} or not isinstance(declaration.get('basis'),str)
                 or not declaration['basis'].strip() or len(declaration['basis']) > 2000):
@@ -1344,7 +1353,7 @@ class SemanticLinks:
                 unavailable('anchor_invalid',conflict=True); return
             if (group['binding']!=payload['provider'] or reference['provider']!=payload['provider']
                     or group['context']!=payload['context'] or reference['context']!=payload['context']
-                    or identity(group['actions'])!=identity(payload['plan']['actions'])
+                    or action_identity({'effect':group['representation']['effect'],'actions':group['actions']})!=action_identity(payload['plan'])
                     or group['representation']['effect']!=payload['plan']['effect']
                     or action_identity(reference['plan'])!=action_identity(payload['plan'])):
                 unavailable('operational_or_context_mismatch',conflict=True); return
@@ -1370,6 +1379,7 @@ class SemanticLinks:
         if target_relation_ids:
             payload.update(action_target_relation_ids=target_relation_ids,
                            action_target_relation_policy=ACTION_TARGET_POLICY)
+        payload.pop('action_link_reason', None)
 
     def _invalidate_membership(self, c, claim_id, payload, source_ref, reason):
         if payload.get('action_representation_id') and payload.get('action_link_status')!='invalid':

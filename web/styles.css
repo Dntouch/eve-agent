@@ -6584,6 +6584,30 @@ body[data-state="offline"] .command-dock {
   border-radius: 22px;
   background: var(--eve-surface-raised);
 }
+.message-activity {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  gap: 0 18px;
+}
+.message-activity > details {
+  min-width: 0;
+  max-width: 100%;
+  margin-top: 10px;
+}
+.message-activity > details[open] { flex-basis: 100%; }
+.message-scheduled-task {
+  color: var(--eve-text-secondary);
+  font-size: 12px;
+}
+.message-scheduled-task summary { cursor: pointer; }
+.message-scheduled-task p { margin: 10px 0 6px; }
+.scheduled-task-request {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font-size: 13px;
+  line-height: 1.6;
+}
 .chat-workspace .chat-empty { width: min(480px, 85%); gap: 14px; top: 48%; }
 .chat-workspace .chat-empty strong { font-size: clamp(22px, 3vw, 30px); font-weight: 550; letter-spacing: -.035em; line-height: 1.25; }
 .chat-workspace .chat-empty span { max-width: 360px; margin: auto; font-size: 14px; color: var(--eve-text-secondary); line-height: 1.6; }

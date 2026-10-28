@@ -351,6 +351,35 @@ class OpenAICompatibleLLM:
         self._runtime_model_info: dict = {}
         self._runtime_model_info_checked_at = 0.0
         self._token_count_supported = None
+        self._observed_completion_tokens = 0
+
+    def _observe_generation(self, usage):
+        # Provider tokens include reasoning. Never estimate them from characters.
+        tokens = usage.get("completion_tokens") if isinstance(usage, dict) else None
+        if type(tokens) is int and tokens > 0:
+            self._observed_completion_tokens = max(self._observed_completion_tokens, tokens)
+
+    def _server_generation_limit(self, parsed):
+        """Read Strata's published defaults; nonpositive means remaining context."""
+        values = {}
+        for path in ("/props", "/settings"):
+            request = urllib.request.Request(urlunsplit((parsed.scheme, parsed.netloc, path, "", "")),
+                headers={"Authorization": f"Bearer {self.api_key}"})
+            try:
+                with urllib.request.urlopen(request, timeout=min(3, self.timeout)) as response:
+                    payload = json.load(response)
+                if path == "/props":
+                    values["props"] = payload.get("default_generation_settings", {}).get("params", {}).get("n_predict")
+                else:
+                    defaults = payload.get("defaults", {})
+                    if "max_tokens" in defaults:
+                        values["settings"] = defaults["max_tokens"]
+            except (OSError, ValueError, TypeError, AttributeError):
+                continue
+        value = values.get("settings", values.get("props"))
+        return {"server_output_tokens": value if type(value) is int and value > 0 else None,
+                "server_output_limit_source": ("settings" if "settings" in values else
+                                               "props" if "props" in values else "unknown")}
 
     def runtime_model_info(self, *, refresh: bool = False) -> dict:
         """Read the limits of the model instance that LM Studio actually loaded.
@@ -426,6 +455,7 @@ class OpenAICompatibleLLM:
                                 health = json.load(response)
                             if health.get("service") == "strata" and health.get("model") == self.model:
                                 self._runtime_model_info["provider"] = "strata"
+                                self._runtime_model_info.update(self._server_generation_limit(parsed))
                                 if isinstance(health.get("images"), bool):
                                     self._runtime_model_info["vision"] = health["images"]
                         except (OSError, ValueError, TypeError, AttributeError):
@@ -486,12 +516,22 @@ class OpenAICompatibleLLM:
         # Strata's documented serving path requires 8 protocol tokens beyond
         # prompt + output. This is transport space, not a task/material cap.
         margin = 8 if info.get("provider") == "strata" else 0
-        output = self.generation_max_tokens if self.generation_max_tokens is not None else 1
+        server_output = info.get("server_output_tokens")
+        if self.generation_max_tokens is not None:
+            output, output_basis = self.generation_max_tokens, "configured"
+        elif type(server_output) is int and server_output > 0:
+            output, output_basis = server_output, "server_default"
+        elif self._observed_completion_tokens:
+            output, output_basis = self._observed_completion_tokens, "observed_completion_high_water"
+        else:
+            output, output_basis = None, "unknown"
         remaining = capacity - count - margin
         images = sum(1 for m in messages for p in (m.get("content") if isinstance(m.get("content"), list) else [])
                      if p.get("type") in {"image", "image_url"})
         return {"input_tokens": count, "context_tokens": capacity, "remaining_tokens": remaining,
-                "requested_output_tokens": output, "fits": remaining >= output,
+                "requested_output_tokens": output, "output_budget_basis": output_basis,
+                "observed_completion_tokens": self._observed_completion_tokens,
+                "fits": remaining >= (output if output is not None else 1),
                 "measurement": "server_tokenizer", "image_placeholders": images,
                 "encoded_image_tokens_included": not bool(images)}
 
@@ -1073,6 +1113,7 @@ class OpenAICompatibleLLM:
         temperature: float = 0.0,
         *,
         role: str = "native_tool",
+        tool_choice="auto",
     ) -> dict:
         """Return one native assistant message with optional function calls.
 
@@ -1087,13 +1128,13 @@ class OpenAICompatibleLLM:
             or self._tool_preview_callback.get() is not None
         ):
             return self._request_tool_turn_stream_transport(
-                messages, tools, max_tokens, temperature, role=role,
+                messages, tools, max_tokens, temperature, role=role, tool_choice=tool_choice,
             )
         payload = {
             "model": self.model,
             "messages": messages,
             "tools": tools,
-            "tool_choice": "auto",
+            "tool_choice": tool_choice,
             "temperature": temperature,
             "stream": False,
         }
@@ -1119,6 +1160,7 @@ class OpenAICompatibleLLM:
                 })
                 response_payload = json.load(response)
             usage = response_payload.get("usage") or {}
+            self._observe_generation(usage)
             self._request_metrics({key: usage.get(key) for key in
                 ("prompt_tokens", "completion_tokens", "total_tokens")})
             self._cancel_checkpoint()
@@ -1204,6 +1246,18 @@ class OpenAICompatibleLLM:
                 f"Lokales LLM unter {self.base_url} lieferte keinen gültigen Tool-Turn: {exc}"
             ) from exc
 
+    def request_working_checkpoint(self, messages, tools):
+        """A forced persistence call; never publish its text as the user's answer."""
+        tokens = [(variable, variable.set(None)) for variable in
+                  (self._stream_callback, self._tool_preview_callback, self._tool_preview_reset)]
+        try:
+            return self.request_tool_turn(messages, tools, self.generation_max_tokens, 0.0,
+                role="working_checkpoint", tool_choice={"type": "function", "function": {
+                    "name": "working_memory__checkpoint"}})
+        finally:
+            for variable, token in reversed(tokens):
+                variable.reset(token)
+
     def _request_tool_turn_stream_transport(
         self,
         messages: list[dict],
@@ -1212,13 +1266,14 @@ class OpenAICompatibleLLM:
         temperature: float,
         *,
         role: str,
+        tool_choice="auto",
     ) -> dict:
         """Stream a native tool turn so provider reasoning stays observable."""
         payload = {
             "model": self.model,
             "messages": messages,
             "tools": tools,
-            "tool_choice": "auto",
+            "tool_choice": tool_choice,
             "temperature": temperature,
             "stream": True,
             "stream_options": {"include_usage": True},
@@ -1309,6 +1364,7 @@ class OpenAICompatibleLLM:
                         raise LocalLLMStreamError(event["error"])
                     usage = event.get("usage") or usage
                     if usage:
+                        self._observe_generation(usage)
                         self._request_metrics({key: usage.get(key) for key in
                             ("prompt_tokens", "completion_tokens", "total_tokens")})
                     details = event.get("timings") or event.get("stats") or details

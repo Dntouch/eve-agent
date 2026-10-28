@@ -5,6 +5,7 @@ import ipaddress
 import json
 import re
 import socket
+import urllib.error
 import urllib.parse
 import urllib.request
 from html.parser import HTMLParser
@@ -12,6 +13,15 @@ from html.parser import HTMLParser
 
 class WebNoResults(RuntimeError):
     """The search backend answered successfully but returned no usable results."""
+
+
+class WebReadError(RuntimeError):
+    """Preserve per-URL failures, including in the native runtime's error envelope."""
+
+    def __init__(self, failures: list[dict]):
+        self.structure = {"url_errors": failures}
+        details = "; ".join(f"{item['url']}: {item['message']}" for item in failures)
+        super().__init__(f"Die angegebenen Webseiten konnten nicht gelesen werden: {details}")
 
 
 class _TextExtractor(HTMLParser):
@@ -77,6 +87,7 @@ class WebResearch:
         self.timeout = int(config.get("timeout_seconds", 12))
         self.image_results = min(max(int(config.get("image_results", 4)), 1), 8)
         self.max_image_bytes = 5 * 1024 * 1024
+        self.max_page_bytes = int(config.get("max_page_bytes", 5_000_000))
 
     @staticmethod
     def self_descriptions():
@@ -184,10 +195,11 @@ class WebResearch:
             }
         if kind == "read_urls":
             urls = operation.get("urls")
-            if not isinstance(urls, list) or any(not isinstance(url, str) for url in urls):
+            if not isinstance(urls, list) or not urls or any(not isinstance(url, str) or not url.strip() for url in urls):
                 raise ValueError("Seitenabruf benötigt urls")
-            context, sources = self.read_urls(urls)
-            return {"operation": kind, "context": context, "sources": sources, "resources": []}
+            context, sources, failures = self._read_urls(urls)
+            return {"operation": kind, "context": context, "sources": sources,
+                    "resources": [], "url_errors": failures}
         if kind == "search_images":
             query = operation.get("query")
             if not isinstance(query, str) or not query.strip():
@@ -257,18 +269,28 @@ class WebResearch:
             content_type = response.headers.get_content_type()
             if content_type not in {"text/html", "text/plain", "application/xhtml+xml"}:
                 raise ValueError("Kein lesbares Textdokument")
-            raw = response.read(750_001)
-            if len(raw) > 750_000:
-                raise RuntimeError("Die Webseite überschreitet die technische Abrufgröße von 750000 Bytes")
+            raw = response.read(self.max_page_bytes + 1)
+            if len(raw) > self.max_page_bytes:
+                raise RuntimeError(
+                    f"Die Webseite überschreitet die technische Abrufgröße von {self.max_page_bytes} Bytes"
+                )
             charset = response.headers.get_content_charset() or "utf-8"
         text = raw.decode(charset, errors="replace")
         if content_type == "text/plain":
-            return text.strip()
-        parser = _TextExtractor(); parser.feed(text)
-        return parser.text()
+            text = text.strip()
+        else:
+            parser = _TextExtractor(); parser.feed(text)
+            text = parser.text()
+        if not text:
+            raise ValueError("Die Webseite enthält keinen lesbaren Text")
+        return text
 
     def read_urls(self, urls: list[str]) -> tuple[str, list[dict[str, str]]]:
         """Read user-supplied public pages without routing them through search."""
+        context, sources, _ = self._read_urls(urls)
+        return context, sources
+
+    def _read_urls(self, urls: list[str]) -> tuple[str, list[dict[str, str]], list[dict]]:
         unique = list(dict.fromkeys(urls))
         if not unique:
             raise ValueError("Keine URL angegeben")
@@ -277,16 +299,24 @@ class WebResearch:
         for url in unique:
             try:
                 page = self.read_page(url)
-            except (OSError, RuntimeError, ValueError) as exc:
-                failures.append(f"{url}: {exc}")
+            except (OSError, RuntimeError, ValueError, LookupError) as exc:
+                failure = {"url": url, "error_class": type(exc).__name__, "message": str(exc)}
+                if isinstance(exc, urllib.error.HTTPError):
+                    failure["http_status"] = exc.code
+                    exc.close()
+                failures.append(failure)
                 continue
             parsed = urllib.parse.urlparse(url)
             title = parsed.hostname or url
             sources.append({"title": title, "url": url, "snippet": page})
             sections.append(f"[{len(sources)}] {title}\nURL: {url}\n{page}")
         if not sections:
-            raise RuntimeError("Die angegebenen Webseiten konnten nicht gelesen werden")
-        return "\n\n".join(sections), sources
+            raise WebReadError(failures)
+        if failures:
+            sections.append("Nicht gelesene URLs:\n" + "\n".join(
+                f"{item['url']}: {item['message']}" for item in failures
+            ))
+        return "\n\n".join(sections), sources, failures
 
     def search_images(self, query: str) -> dict:
         """Fetch bounded, untrusted image results without semantic ranking."""

@@ -9,6 +9,24 @@ from eve_agent.storage import EveDatabase
 
 
 class SemanticInspectorTests(unittest.TestCase):
+    def test_recent_learning_distinguishes_candidate_rejection_and_partial_success(self):
+        from eve_agent.storage import ConversationStore
+        store = ConversationStore(self.db); conversation = store.create('Learning outcomes')['id']
+        rows = [('candidate', {'kind':'semantic_candidate','release':'candidate','reason':'goal_unverified'}, 'applied'),
+                ('rejected', {'kind':'rejected','reason':'semantic_unpublished_action_reference'}, 'failed'),
+                ('partial', {'kind':'new_formulation','claim_id':'fixture-claim'}, 'failed'),
+                ('skip', {'kind':'not_reusable','reason':'Model declined reuse.'}, 'no_persist')]
+        for turn, learning, status in rows:
+            store.append_turn(conversation, turn, 'Answer', turn_id=turn,
+                assistant_metadata={'turn_state_details':{'semantic_learning':learning,
+                    'general_learning':{'status':'failed' if turn=='partial' else 'applied'}}})
+            with self.db.connect() as c:
+                c.execute('INSERT INTO memory_learning_jobs (turn_id,status,accepted_at,updated_at) VALUES (?,?,?,?)',
+                          (turn,status,'2026-10-28', '2026-10-28'))
+        outcomes = self.inspector.summary()['recent_learning']
+        self.assertEqual({'semantic_candidate','rejected','new_formulation','not_reusable'}, {r['kind'] for r in outcomes})
+        self.assertEqual('failed', next(r for r in outcomes if r['utterance']=='partial')['general_learning']['status'])
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory(); self.addCleanup(self.tmp.cleanup)
         self.db = EveDatabase(Path(self.tmp.name)/'eve.db')

@@ -36,6 +36,41 @@ class NativeHome(HomeAssistant):
 
 
 class NativeRuntimeTest(unittest.TestCase):
+    def test_scheduled_reminder_has_execution_context_and_retains_origin_in_history(self):
+        from eve_agent.scheduled_execution import scheduled_execution, scheduled_metadata, EXECUTION_PROMPT
+        from eve_agent.storage import ConversationStore
+        from eve_agent.transport_access import transport_access
+        from unittest.mock import patch
+        self.agent.conversations = ConversationStore(self.database)
+        self.agent.conversation_id = self.agent.conversations.create('Channel')['id']
+        origin = {'sender_name': 'Stefan', 'message_id': 'old-message', 'room_id': 'channel'}
+        action = {'task_id': 'task-1', 'run_id': 'run-1', 'scheduled_for': '2026-10-28T08:00:00Z',
+                  'execution_context': origin, 'output_target': {'transport': 'chatto', 'room_id': 'channel'}}
+        text = 'Nur ZappyZwo soll nicht arbeiten gehen. Nicht an den Rest richten.'
+        self.llm.request_tool_turn.return_value = {'content': 'ZappyZwo, du musst heute nicht arbeiten!', 'tool_calls': []}
+        with transport_access(origin, public=True), scheduled_execution(action), patch('eve_agent.learned_execution.try_replay') as replay:
+            self.runtime.respond(text)
+            replay.assert_not_called()
+            messages = self.llm.request_tool_turn.call_args.args[0]
+            self.assertIn(EXECUTION_PROMPT, messages[0]['content'])
+            self.assertIn('JETZT AUSZUFÜHRENDER GESPEICHERTER AUFTRAG', messages[-1]['content'])
+            self.assertIn('"task_id":"task-1"', messages[-1]['content'])
+            self.assertNotIn('BENUTZERANFRAGE:', messages[-1]['content'])
+            # Context-budget rebuilds must retain the execution identity too.
+            seed = self.runtime.working_session._seed(messages[0]['content'], [])
+            self.assertIn('scheduled_execution', seed[-1]['content'])
+        self.assertIsNone(scheduled_metadata())
+        stored = self.agent.conversations.messages(self.agent.conversation_id)['messages'][0]['metadata']
+        self.assertEqual(stored['input_kind'], 'scheduled')
+        self.assertNotIn('conversation_source', stored)
+        self.assertEqual(stored['scheduled_execution']['origin_source'], origin)
+        self.assertIsNone(self.agent.conversations.last_user_interaction(self.agent.conversation_id))
+        history = self.agent.conversations.recent_history(self.agent.conversation_id)
+        self.assertEqual(history[0]['scheduled_execution']['run_id'], 'run-1')
+        self.assertIn('scheduled_execution', self.runtime._conversation_history(history)[0]['content'])
+        self.runtime.respond('Was war das für eine Nachricht?')
+        self.assertEqual(self.llm.request_tool_turn.call_args.args[0][0]['content'], CORE_PROMPT)
+
     def test_repeated_memory_submission_is_complete_and_retained_for_later_learning(self):
         from eve_agent.storage import ConversationStore
         self.agent.conversations = ConversationStore(self.database)
@@ -495,6 +530,35 @@ class NativeRuntimeTest(unittest.TestCase):
             if item["role"] == "tool"
         )
         self.assertIn("native validation detail", tool_result["content"])
+
+    def test_web_url_diagnostics_are_readable_from_working_memory(self):
+        from urllib.error import HTTPError
+        from eve_agent.storage import ConversationStore
+        from eve_agent.web_tools import WebResearch
+
+        self.agent.conversations = ConversationStore(self.database)
+        self.agent.conversation_id = self.agent.conversations.create("URL diagnosis")["id"]
+        self.agent.web = WebResearch({})
+        url = "https://example.org/blocked"
+        self.agent.web.read_page = Mock(side_effect=HTTPError(url, 403, "Forbidden", {}, None))
+        self.llm.request_tool_turn.side_effect = [
+            {"content": "", "tool_calls": [{"id": "load-web", "name": "eve__load_capabilities",
+             "arguments": {"capabilities": ["web"]}}]},
+            {"content": "", "tool_calls": [{"id": "read-web", "name": "web__read_urls",
+             "arguments": {"urls": [url]}}]},
+            {"content": "Diese Quelle verweigert den Zugriff mit HTTP 403.", "tool_calls": []},
+        ]
+        self.runtime.respond("Prüfe diese URL: " + url)
+        session = self.runtime.working_session
+        with self.database.connect() as connection:
+            reference = connection.execute(
+                "SELECT result_id FROM memory_work_calls WHERE turn_id=? AND capability='web'",
+                (session.turn_id,),
+            ).fetchone()[0]
+        stored = session.store.read(session.workspace_id, reference, pointer="/structure/url_errors")
+        self.assertEqual(403, stored["content"][0]["http_status"])
+        self.assertEqual(url, stored["content"][0]["url"])
+        self.agent.web.read_page.assert_called_once_with(url)
 
     def test_binary_tool_resource_is_visible_to_the_next_model_turn(self):
         result = {

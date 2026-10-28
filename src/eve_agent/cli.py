@@ -799,8 +799,10 @@ def main(argv: list[str] | None = None) -> int:
                 )
                 bus.set("thinking", "Geplante Aufgabe wird ausgeführt …")
                 from contextlib import nullcontext
+                from .scheduled_execution import scheduled_execution, ensure_scheduled_deadline
+                ensure_scheduled_deadline(action)
                 context = action.get("execution_context")
-                with chatto_bridge.scheduled_access(context) if context else nullcontext():
+                with scheduled_execution(action), (chatto_bridge.scheduled_access(context) if context else nullcontext()):
                     response = browser_response(request, conversation_id=conversation_id)
             except Exception as exc:
                 remember_turn_failure(exc, text=request, conversation_id=conversation_id)
@@ -819,8 +821,11 @@ def main(argv: list[str] | None = None) -> int:
         if target.get("transport") == "eve" and target.get("conversation_id") and target["conversation_id"] != output_conversation:
             output_conversation = target["conversation_id"]
             conversations.get(output_conversation)
+            from .scheduled_execution import scheduled_execution, input_metadata
+            with scheduled_execution(action):
+                copied_metadata = input_metadata()
             conversations.append_turn(output_conversation, request, response["answer"],
-                user_metadata={"context_copy": True, "origin_turn_id": response.get("turn_id"), "scheduled_task_id": action.get("task_id")},
+                user_metadata={**copied_metadata, "context_copy": True, "origin_turn_id": response.get("turn_id"), "scheduled_task_id": action.get("task_id")},
                 assistant_metadata={"context_copy": True, "origin_turn_id": response.get("turn_id")},
                 assistant_attachments=response.get("resources", []))
         return {

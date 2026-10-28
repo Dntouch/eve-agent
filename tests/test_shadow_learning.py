@@ -43,6 +43,27 @@ def proposal(
 
 
 class ShadowLearningTest(unittest.TestCase):
+    def test_scheduled_input_keeps_automatic_origin_in_learning_and_evidence(self):
+        metadata = {'input_kind': 'scheduled', 'scheduled_execution': {
+            'task_id': 'task', 'run_id': 'run', 'origin_source': {'sender_name': 'Stefan'}}}
+        user, _ = self.conversations.append_turn(self.conversation_id, 'Erinnere ZappyZwo jetzt',
+            'ZappyZwo, heute hast du frei.', turn_id='scheduled-turn', user_metadata=metadata)
+        for pipeline_type in (ShadowLearningPipeline, ProductiveLearningPipeline):
+            fake = FakeLearningLLM(proposal(decision='no_persist'))
+            pipeline = pipeline_type(self.database, fake)
+            snapshot = pipeline._snapshot('scheduled-turn')
+            context = pipeline._model_context(snapshot, [])
+            self.assertEqual(context['user_message']['scheduled_execution']['run_id'], 'run')
+            self.assertFalse(context['user_message']['fresh_human_message'])
+            pipeline.evaluate_turn('scheduled-turn')
+        with self.database.connect() as c:
+            observation = c.execute('SELECT source_role,metadata_json FROM memory_observations WHERE message_id=?', (user['id'],)).fetchone()
+        self.assertEqual(observation['source_role'], 'system')
+        self.assertEqual(json.loads(observation['metadata_json'])['scheduled_execution']['task_id'], 'task')
+        next_turn, _ = self.turn('Was war das?')
+        history = ShadowLearningPipeline(self.database)._snapshot(next_turn)['dialog_context']
+        self.assertEqual(history[0]['scheduled_execution']['run_id'], 'run')
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.database = EveDatabase(Path(self.temp.name) / "eve.db")

@@ -261,10 +261,26 @@ class SemanticInspector(BrainwatchInspector):
                 COALESCE(SUM(json_extract(payload_json,'$.action_link_status')='conflict'),0) link_conflicts,
                 COALESCE(SUM(json_extract(payload_json,'$.action_link_status')='invalid'),0) invalid_memberships
                 FROM memory_claims WHERE scope=?""",(SCOPE,)).fetchone()))
+            recent_learning = []
+            for row in db.execute("""SELECT j.status,j.error_class,j.updated_at,u.content utterance,
+                a.metadata_json FROM memory_learning_jobs j JOIN turns t ON t.id=j.turn_id
+                JOIN messages u ON u.id=t.user_message_id JOIN messages a ON a.id=t.assistant_message_id
+                WHERE json_type(a.metadata_json,'$.turn_state_details.semantic_learning')='object'
+                OR (j.status='failed' AND json_type(a.metadata_json,'$.turn_state_details.semantic_context')='object'
+                    AND EXISTS (SELECT 1 FROM conversation_tool_events e WHERE e.message_id=a.id AND e.tool='home_assistant'))
+                ORDER BY j.updated_at DESC LIMIT 20"""):
+                details = json.loads(row['metadata_json']).get('turn_state_details', {})
+                learning = details.get('semantic_learning')
+                if not learning:
+                    learning = {'kind': 'rejected', 'reason': row['error_class']}
+                if row['status'] == 'failed' and learning.get('kind') == 'pending':
+                    learning = {'kind': 'rejected', 'reason': row['error_class']}
+                recent_learning.append(public({'utterance': row['utterance'], 'updated_at': row['updated_at'],
+                    'job_status': row['status'], 'general_learning': details.get('general_learning'), **learning}))
             daily = [dict(r) for r in db.execute("""SELECT substr(e.created_at,1,10) day,e.evidence_type,COUNT(*) count FROM memory_evidence e
                 JOIN memory_claims c ON c.id=e.claim_id WHERE c.scope=? AND e.evidence_type IN ('llm_interpretation','automatic_release','reuse_result','user_correction')
                 GROUP BY day,e.evidence_type ORDER BY day DESC LIMIT 120""", (SCOPE,))]
-        return dict(stock=counts, daily_evidence=daily, historical_telemetry=dict(available=False,
+        return dict(stock=counts, recent_learning=recent_learning, daily_evidence=daily, historical_telemetry=dict(available=False,
                     planner_fallbacks=None, planner_free_proportion=None, llm_calls=None, tokens=None, duration_ms=None,
                     reason='Turn-Telemetrie ist nicht dauerhaft gespeichert. Tageswerte zählen persistierte Evidenzen, keine vollständigen Turns.'),
                     count_kind='Bestand: Erfahrungen und Zustände; historische Zähler: erfolgreiche Wiederverwendungen und Evidenzereignisse')

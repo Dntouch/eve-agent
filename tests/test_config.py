@@ -11,6 +11,16 @@ from eve_agent.llm import OpenAICompatibleLLM
 
 
 class ConfigurationTest(unittest.TestCase):
+    def test_page_fetch_limit_is_defaulted_editable_and_bounded(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = self.write_config(Path(directory), {})
+            self.assertEqual(5_000_000, load_config(path, environ={})[1]["web"]["max_page_bytes"])
+            update_editable_config(path, {"values": {"web.max_page_bytes": 8_000_000}}, environ={})
+            self.assertEqual(8_000_000, load_config(path, environ={})[1]["web"]["max_page_bytes"])
+            for value in (0, 20_000_001):
+                with self.subTest(value=value), self.assertRaises(ConfigError):
+                    update_editable_config(path, {"values": {"web.max_page_bytes": value}}, environ={})
+
     def test_external_mcp_is_portable_editable_and_channel_access_is_explicit(self):
         with tempfile.TemporaryDirectory() as directory:
             path = self.write_config(Path(directory), {})

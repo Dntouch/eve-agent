@@ -747,7 +747,9 @@ class SpeechPerspectiveTest(unittest.TestCase):
 
         with unittest.mock.patch(
             "urllib.request.urlopen",
-            side_effect=[native_catalogue, openai_catalogue, health],
+            side_effect=[native_catalogue, openai_catalogue, health,
+                         io.BytesIO(b'{"default_generation_settings":{"params":{"n_predict":-1}}}'),
+                         io.BytesIO(b'{"defaults":{}}')],
         ) as opened:
             info = llm.runtime_model_info(refresh=True)
 
@@ -758,6 +760,8 @@ class SpeechPerspectiveTest(unittest.TestCase):
             "http://127.0.0.1:8813/api/v1/models",
             "http://127.0.0.1:8813/v1/models",
             "http://127.0.0.1:8813/health",
+            "http://127.0.0.1:8813/props",
+            "http://127.0.0.1:8813/settings",
         ], [call.args[0].full_url for call in opened.call_args_list])
 
     def test_server_managed_generation_omits_eve_output_cap(self):

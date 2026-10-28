@@ -412,13 +412,13 @@ class WorkingRuntimeTest(unittest.TestCase):
         self.assertEqual(large_value, session.store.value(session.workspace_id, descriptors[1]['reference']))
         session.finish('completed', 'checked')
 
-    def test_empty_model_response_is_archived_without_automatic_retry(self):
+    def test_empty_model_response_is_archived_and_unchanged_recovery_stops(self):
         from eve_agent.llm import EmptyModelResponseError
         error = EmptyModelResponseError(finish_reason='stop', stream_done=True, reasoning_chars=42)
         self.llm.request_tool_turn.side_effect = error
         with self.assertRaises(EmptyModelResponseError):
             self.runtime.respond('Auftrag')
-        self.assertEqual(1, self.llm.request_tool_turn.call_count)
+        self.assertEqual(2, self.llm.request_tool_turn.call_count)
         session = self.runtime.working_session
         with self.db.connect() as c:
             row = c.execute("SELECT o.structured_value_json,o.source_role FROM memory_work_objects w "
@@ -480,6 +480,45 @@ class WorkingRuntimeTest(unittest.TestCase):
         self.assertFalse(data['execution_activity']['task_progress_assessed'])
         self.assertIn('execution_journal_reference',data)
         self.assertNotIn('execution_journal',data)
+
+    def test_scheduler_stays_callable_after_context_reset_with_many_targets(self):
+        from eve_agent.scheduler import ScheduledTasks
+        from eve_agent.transport_access import transport_access
+        self.agent.reminders = ScheduledTasks(self.db, start_monitor=False)
+        self.agent.reminders.output_targets_provider = lambda: [
+            {'id': f'eve:conversation:{i:032x}', 'name': f'Chat {i}',
+             'transport': 'eve', 'conversation_id': f'{i:032x}'} for i in range(1000)]
+        self.budget(32768)
+        context = {'transport': 'chatto', 'room_id': 'owner-room',
+                   'room_kind': 'dm', 'access_profile': 'owner_dm'}
+
+        def model(messages, tools, *args, **kwargs):
+            self.assertTrue(self.llm.context_budget(messages, tools)['fits'])
+            names = {tool['function']['name'] for tool in tools}
+            round_number = self.llm.request_tool_turn.call_count
+            if round_number == 1:
+                return call('eve__load_capabilities', {'capabilities': ['scheduled_tasks', 'working_memory']})
+            self.assertIn('scheduled_tasks__create', names)
+            if round_number == 2:
+                return call('working_memory__reset_context')
+            if round_number == 3:
+                fresh = json.loads(messages[2]['content'].split(': ', 1)[1])
+                self.assertEqual('fresh', fresh['context'])
+                self.assertTrue(fresh['transition']['requested_reset_completed'])
+                return call('scheduled_tasks__create', {'name': 'Test-Erinnerung',
+                    'request': 'Arbeiten gehen', 'schedule_type': 'delay', 'schedule': {'seconds': 3600}})
+            self.assertEqual('active', json.loads(messages[-1]['content'])['status'])
+            return {'content': 'Erinnerung angelegt.', 'tool_calls': []}
+
+        self.llm.request_tool_turn.side_effect = model
+        with transport_access(context):
+            self.assertEqual('Erinnerung angelegt.', self.runtime.respond('Erinnere mich in einer Stunde.'))
+            tasks = self.agent.reminders.list_tasks()
+        self.assertEqual(4, self.llm.request_tool_turn.call_count)
+        self.assertEqual(1, len(tasks))
+        self.assertEqual('Arbeiten gehen', tasks[0]['action']['request'])
+        self.assertEqual('owner-room', tasks[0]['action']['output_target']['room_id'])
+        self.assertEqual('owner_dm', tasks[0]['action']['execution_context']['access_profile'])
 
     def test_huge_tool_result_is_durable_before_next_request_and_retrieved_selectively(self):
         # Fit the published tool schemas while keeping the original far above context capacity.

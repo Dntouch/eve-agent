@@ -1878,6 +1878,7 @@ class ConversationStore:
             legacy = connection.execute(
                 """SELECT created_at FROM messages
                    WHERE conversation_id=? AND role='user'
+                     AND COALESCE(json_extract(metadata_json,'$.input_kind'),'')!='scheduled'
                    ORDER BY ordinal DESC LIMIT 1""",
                 (str(conversation_id),),
             ).fetchone()
@@ -2003,6 +2004,21 @@ class ConversationStore:
             assistant_ids = {str(row["id"]) for row in rows if row["role"] == "assistant"}
             seen_assets = set()
             events: dict[str, list[dict]] = {}
+            scheduled_inputs = {}
+            if assistant_ids:
+                placeholders = ",".join("?" for _ in assistant_ids)
+                for item in connection.execute(
+                    f"""SELECT a.id AS assistant_id, u.content, u.metadata_json
+                        FROM messages a JOIN messages u
+                          ON u.conversation_id=a.conversation_id AND u.ordinal=a.ordinal-1
+                        WHERE a.id IN ({placeholders}) AND u.role='user'""",
+                    list(assistant_ids),
+                ).fetchall():
+                    metadata = json.loads(item["metadata_json"] or "{}")
+                    if metadata.get("input_kind") == "scheduled" or metadata.get("scheduled_execution"):
+                        scheduled_inputs[item["assistant_id"]] = {
+                            **metadata.get("scheduled_execution", {}), "request": item["content"],
+                        }
             if message_ids:
                 placeholders = ",".join("?" for _ in message_ids)
                 for item in connection.execute(
@@ -2030,6 +2046,8 @@ class ConversationStore:
             message = self._message_dict(row)
             message["attachments"] = assets.get(message["id"], [])
             message["tool_events"] = events.get(message["id"], [])
+            if message["id"] in scheduled_inputs:
+                message["metadata"]["scheduled_execution"] = scheduled_inputs[message["id"]]
             messages.append(message)
         return {"messages": messages, "has_more": has_more}
 
@@ -2173,8 +2191,10 @@ class ConversationStore:
                     f"kein aktueller Providerzustand: {summaries}]"
                 )
             source = item.get("metadata", {}).get("conversation_source")
+            scheduled = item.get("metadata", {}).get("scheduled_execution")
             history.append({"role": item["role"], "content": content,
-                            **({"conversation_source": source} if source else {})})
+                            **({"conversation_source": source} if source else {}),
+                            **({"scheduled_execution": scheduled} if scheduled else {})})
         return history
 
     def append_turn(

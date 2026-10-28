@@ -1,4 +1,5 @@
 import tempfile
+import json
 import unittest
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
@@ -89,6 +90,44 @@ class ScheduledDeliveryTest(unittest.TestCase):
         self.assertEqual(self.scheduler.pop_due()[0]['message'], 'Neuigkeiten')
         self.assertEqual(self.scheduler.claim_deliveries(), [])
 
+    def test_legacy_run_restores_origin_without_reclassifying_identical_human_input(self):
+        store = ConversationStore(self.database)
+        task = self.create()
+        human, _ = store.append_turn(self.source, 'Prüfe Neuigkeiten', 'Gerne', turn_id='human')
+        automatic, answer = store.append_turn(
+            self.source, 'Prüfe Neuigkeiten', 'Neuigkeiten', turn_id='scheduled',
+            user_metadata={'image_count': 0, 'conversation_source': {'sender_name': 'Stefan'}},
+        )
+        payload = {'turn': {'turn_id': 'scheduled', 'conversation_id': self.source,
+                            'assistant_message_id': answer['id']}}
+        with self.database.connect() as connection:
+            connection.execute("""INSERT INTO task_runs
+                (id,task_id,status,scheduled_for,idempotency_key,created_at,result_json)
+                VALUES ('legacy',?,'succeeded','2026-10-28T08:00:00Z','legacy','2026',?)""",
+                (task['id'], json.dumps(payload)))
+        for _ in range(2):
+            ScheduledTasks(self.database, start_monitor=False)
+        messages = {m['id']: m for m in store.messages(self.source)['messages']}
+        self.assertNotIn('input_kind', messages[human['id']]['metadata'])
+        restored = messages[automatic['id']]['metadata']
+        self.assertEqual(restored['input_kind'], 'scheduled')
+        self.assertEqual(restored['image_count'], 0)
+        self.assertNotIn('conversation_source', restored)
+        self.assertEqual(restored['scheduled_execution']['run_id'], 'legacy')
+        # The answer still carries its disclosure when the input is on another page.
+        last = store.messages(self.source, limit=1)['messages'][0]
+        self.assertEqual(last['metadata']['scheduled_execution']['request'], 'Prüfe Neuigkeiten')
+        self.assertEqual(last['metadata']['scheduled_execution']['task_id'], task['id'])
+
+    def test_legacy_output_copy_is_presented_as_a_scheduled_task(self):
+        store = ConversationStore(self.database)
+        store.append_turn(self.source, 'Gespeicherter Auftrag', 'Ergebnis',
+                          user_metadata={'context_copy': True, 'scheduled_task_id': 'task'})
+        ScheduledTasks(self.database, start_monitor=False)
+        messages = store.messages(self.source)['messages']
+        self.assertEqual(messages[0]['metadata']['input_kind'], 'scheduled')
+        self.assertEqual(messages[1]['metadata']['scheduled_execution']['request'], 'Gespeicherter Auftrag')
+
 
 class ScheduledTurnIntegrationTest(unittest.TestCase):
     def setUp(self):
@@ -112,6 +151,7 @@ class ScheduledTurnIntegrationTest(unittest.TestCase):
         tree = ast.parse((Path(__file__).parents[1] / 'src/eve_agent/cli.py').read_text())
         function = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == 'execute_scheduled_eve_turn')
         namespace = dict(agent=Mock(conversation_id=self.source), telemetry=Mock(), bus=Mock(),
+                         __package__='eve_agent',
                          turn_lock=threading.RLock(), chatto_bridge=self.bridge, conversations=self.store,
                          browser_response=self.response, remember_turn_failure=Mock())
         exec(compile(ast.Module(body=[function], type_ignores=[]), '<scheduled-turn>', 'exec'), namespace)
@@ -130,6 +170,28 @@ class ScheduledTurnIntegrationTest(unittest.TestCase):
         self.assertIsNone(transport_metadata())
         self.assertEqual(output['resources'], result['resources'])
 
+    def test_executor_passes_scheduled_origin_and_destination_without_leaking_scope(self):
+        from eve_agent.scheduled_execution import scheduled_metadata
+        observed = []
+        result = self.response.return_value
+        def response(*args, **kwargs):
+            observed.append(scheduled_metadata())
+            return result
+        self.response.side_effect = response
+        target = {'transport': 'chatto', 'room_id': 'general'}
+        self.execute({'request': 'Erinnere jetzt', 'conversation_id': self.source,
+                      'task_id': 'task', 'run_id': 'run', 'scheduled_for': '2026-10-28T08:00:00Z',
+                      'execution_context': self.context, 'output_target': target})
+        self.assertEqual(observed[0]['task_id'], 'task')
+        self.assertEqual(observed[0]['output_target'], target)
+        self.assertEqual(observed[0]['origin_source'], self.context)
+        self.assertIsNone(scheduled_metadata())
+
+    def test_deadline_expiring_while_waiting_prevents_model_call(self):
+        with self.assertRaisesRegex(ValueError, 'Enddatum'):
+            self.execute({'request': 'Erinnere', 'ends_at': '2000-01-01T00:00:00Z'})
+        self.response.assert_not_called()
+
     def test_revoked_origin_prevents_execution(self):
         self.bridge.configure({**self.bridge.config, 'channel_ids': []})
         with self.assertRaises(PermissionError):
@@ -142,3 +204,8 @@ class ScheduledTurnIntegrationTest(unittest.TestCase):
         self.response.assert_called_once_with('Prüfe', conversation_id=self.source)
         self.assertEqual(result['notification']['conversation_id'], self.target)
         self.assertEqual(self.store.messages(self.target)['messages'][-1]['content'], 'Ergebnis')
+        copied = self.store.messages(self.target)['messages'][0]['metadata']
+        self.assertEqual(copied['input_kind'], 'scheduled')
+        self.assertNotIn('conversation_source', copied)
+        answer = self.store.messages(self.target, limit=1)['messages'][0]
+        self.assertEqual(answer['metadata']['scheduled_execution']['request'], 'Prüfe')
