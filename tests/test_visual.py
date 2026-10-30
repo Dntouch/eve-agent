@@ -30,6 +30,28 @@ class FakeBus:
 
 
 class VisualServerTest(unittest.TestCase):
+    def test_service_api_enforces_auth_origin_and_json_before_actions(self):
+        handler = mock.Mock(return_value=(202, {"operation": {"status": "running"}}))
+        server = self.make_server(service_handler=handler, access_token="service-test-token")
+        server.start()
+        payload = json.dumps({"service": "search", "action": "restart"}).encode()
+        for headers, expected in (({}, 401), ({"X-EVE-Token": "service-test-token", "Origin": "https://evil.invalid"}, 403)):
+            with self.subTest(headers=headers), self.assertRaises(urllib.error.HTTPError) as error:
+                self.request_json(server, "/api/services", data=payload, headers=headers)
+            self.assertEqual(expected, error.exception.code)
+            error.exception.close()
+        handler.assert_not_called()
+        status, _, data = self.request_json(server, "/api/services", data=payload,
+            headers={"X-EVE-Token": "service-test-token"})
+        self.assertEqual(202, status)
+        handler.assert_called_once_with("POST", "/api/services", {"service": "search", "action": "restart"})
+        handler.reset_mock()
+        with self.assertRaises(urllib.error.HTTPError) as error:
+            self.request_json(server, "/api/services", data=b'[]', headers={"X-EVE-Token": "service-test-token"})
+        self.assertEqual(400, error.exception.code)
+        error.exception.close()
+        handler.assert_not_called()
+
     def setUp(self):
         self.temp_dir = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp_dir.cleanup)

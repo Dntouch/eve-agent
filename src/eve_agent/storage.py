@@ -2197,6 +2197,73 @@ class ConversationStore:
                             **({"scheduled_execution": scheduled} if scheduled else {})})
         return history
 
+    def preserve_interrupted_turn(self, work_turn_id: str) -> bool:
+        """Publish the original request and factual outcome of an interrupted run.
+
+        Working material can expire; the conversation must retain its own copy.
+        No model draft or checkpoint is promoted to a completed answer.
+        """
+        with self.database.connect() as connection:
+            row = connection.execute(
+                """SELECT t.*, v.structured_value_json AS request_json
+                   FROM memory_work_turns t
+                   JOIN memory_work_objects o ON o.id=t.request_id
+                   JOIN memory_observations v ON v.id=o.observation_id
+                   JOIN memory_workspaces w ON w.id=t.workspace_id
+                   JOIN conversations c ON c.id=t.conversation_id
+                   WHERE t.id=? AND t.status IN ('cancelled','failed')
+                     AND w.retention_class='standard' AND c.status!='deleted'""",
+                (work_turn_id,),
+            ).fetchone()
+            if row is None:
+                return False
+            request = json.loads(row['request_json'])
+            trace_id = request.get('trace_id')
+            if not trace_id or connection.execute('SELECT 1 FROM turns WHERE id=?', (trace_id,)).fetchone():
+                return False
+        from .working_memory import WorkingMemoryStore
+        working = WorkingMemoryStore(self.database)
+        events = []
+        for call in working.calls(row['workspace_id'])['items']:
+            if call['turn_id'] != work_turn_id:
+                continue
+            result = (working.value(row['workspace_id'], call['result_reference'])
+                      if call.get('result_reference') else {})
+            events.append({
+                'tool': call['capability'],
+                'status': result.get('status', call['status']) if isinstance(result, dict) else call['status'],
+                'summary': call['operation'],
+                'created_at': call['created_at'],
+                'input': _safe_json(working.value(row['workspace_id'], call['request_reference'])),
+                'result': _safe_json(result),
+            })
+        status = row['status']
+        user_metadata = {**request.get('input_metadata', {}),
+                         'image_count': len(request.get('images') or []), 'turn_status': status}
+        if request.get('scheduled_execution') is not None:
+            user_metadata['scheduled_execution'] = request['scheduled_execution']
+        try:
+            self.append_turn(
+                row['conversation_id'], request['text'],
+                'Vorgang abgebrochen.' if status == 'cancelled' else 'Vorgang fehlgeschlagen.',
+                turn_id=trace_id, created_at=row['created_at'], completed_at=row['updated_at'],
+                user_metadata=user_metadata,
+                assistant_metadata={'route': 'runtime', 'turn_state': status,
+                    'runtime_status': status, 'completed_at': row['updated_at'],
+                    'working_memory': {'workspace_id': row['workspace_id'],
+                        'work_turn_id': work_turn_id, 'request_reference': row['request_id']}},
+                user_attachments=[{'type': 'image', 'content': value, 'source': 'user'}
+                                  for value in request.get('images') or []],
+                tool_events=events,
+            )
+        except sqlite3.IntegrityError:
+            # Another finalizer may have persisted the same trace meanwhile.
+            with self.database.connect() as connection:
+                if connection.execute('SELECT 1 FROM turns WHERE id=?', (trace_id,)).fetchone():
+                    return False
+            raise
+        return True
+
     def append_turn(
         self,
         conversation_id: str,
@@ -2212,8 +2279,10 @@ class ConversationStore:
         knowledge_flow: dict | None = None,
         source_memory_ids: list[str] | None = None,
         memory_retrievals: list[dict] | None = None,
+        created_at: str | None = None,
+        completed_at: str | None = None,
     ) -> tuple[dict, dict]:
-        now = _now()
+        now = created_at or _now()
         prepared: list[tuple[dict, bytes]] = []
         for role, attachments in (("user", user_attachments or []), ("assistant", assistant_attachments or [])):
             for ordinal, attachment in enumerate(attachments):
@@ -2228,6 +2297,7 @@ class ConversationStore:
                 os.chmod(path, 0o600)
                 written.append(path)
             with self.database.connect() as connection:
+                connection.execute('BEGIN IMMEDIATE')
                 conversation = connection.execute(
                 "SELECT title FROM conversations WHERE id = ? AND status != 'deleted'",
                 (str(conversation_id),),
@@ -2247,7 +2317,7 @@ class ConversationStore:
                         (str(turn_id), str(conversation_id),
                          json.dumps(_safe_json(knowledge_flow), ensure_ascii=False)
                          if isinstance(knowledge_flow, dict) else None,
-                         now, now),
+                         now, completed_at or now),
                     )
                 connection.execute(
                     """INSERT INTO messages
@@ -2325,7 +2395,7 @@ class ConversationStore:
                          str(event.get("tool", "unknown"))[:80], str(event.get("status", "completed"))[:40],
                          redact_sensitive(str(event.get("summary", "")))[:1000],
                          json.dumps(event_input, ensure_ascii=False),
-                         json.dumps(event.get("result") or {}, ensure_ascii=False), now),
+                         json.dumps(event.get("result") or {}, ensure_ascii=False), event.get('created_at') or now),
                     )
                     if isinstance(working_reference, dict):
                         connection.execute("UPDATE memory_observations SET tool_event_id=? WHERE id=? AND scope=?",
@@ -2341,9 +2411,20 @@ class ConversationStore:
                 if title == "Neue Unterhaltung":
                     title = self._title_from_message(user)
                 connection.execute(
-                "UPDATE conversations SET title = ?, updated_at = ? WHERE id = ?",
+                "UPDATE conversations SET title = ?, updated_at = MAX(updated_at, ?) WHERE id = ?",
                 (title, now, str(conversation_id)),
             )
+                if created_at is not None:
+                    # Historical recovery also restores the original position.
+                    ordered = connection.execute(
+                        'SELECT id FROM messages WHERE conversation_id=? ORDER BY created_at,ordinal',
+                        (str(conversation_id),),
+                    ).fetchall()
+                    connection.execute('UPDATE messages SET ordinal=-ordinal-1 WHERE conversation_id=?',
+                                       (str(conversation_id),))
+                    for position, message in enumerate(ordered):
+                        connection.execute('UPDATE messages SET ordinal=? WHERE id=?', (position, message['id']))
+                    ordinal = next(position for position, message in enumerate(ordered) if message['id'] == user_id)
         except Exception:
             for path in written:
                 path.unlink(missing_ok=True)

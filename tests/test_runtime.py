@@ -169,6 +169,7 @@ class FakeVisualServer:
         self.turn_result_handler = kwargs.get("turn_result_handler")
         self.telemetry_handler = kwargs.get("telemetry_handler")
         self.home_assistant_policy_handler = kwargs.get("home_assistant_policy_handler")
+        self.chatto_handler = kwargs.get("chatto_handler")
         self.started = False
         self.stopped = False
         self.__class__.instances.append(self)
@@ -188,6 +189,57 @@ def runtime_config(root, overrides):
 
 
 class RuntimeTest(unittest.TestCase):
+    def test_local_text_and_voice_publish_aggregate_work_without_chatto_messages(self):
+        FakeVisualServer.instances = []
+        agent = FakeAgent()
+        agent._diagnostic = mock.Mock()
+        config = {
+            "audio": {}, "speech_to_text": {},
+            "text_to_speech": {"engine": "piper"},
+            "visual": {"host": "127.0.0.1", "port": 8790, "open_browser": False},
+        }
+        observed = []
+
+        def working_at_model(*args, **kwargs):
+            bridge = FakeVisualServer.instances[0].chatto_handler
+            observed.append(bridge.presence_activity({}))
+            return FakeAgent.respond_turn(agent, *args, **kwargs)
+
+        def transcribe(path):
+            observed.append(FakeVisualServer.instances[0].chatto_handler.presence_activity({}))
+            return 'Lokales Gespräch'
+
+        agent.respond_turn = mock.Mock(side_effect=working_at_model)
+
+        def exercise():
+            server = FakeVisualServer.instances[0]
+            # No bot is started; enable only the authenticated aggregate read.
+            server.chatto_handler.configure({**server.chatto_handler.config, 'enabled': True})
+            self.assertEqual(server.chatto_handler.presence_activity({}), {'working': False})
+            server.message_handler('Lokal', [])
+            self.assertEqual(server.chatto_handler.presence_activity({}), {'working': False})
+            audio = Path(tmp) / 'voice.wav'
+            audio.write_bytes(b'voice')
+            server.turn_handler(audio)
+            self.assertEqual(server.chatto_handler.presence_activity({}), {'working': False})
+            agent.respond_turn.side_effect = RuntimeError('model failed')
+            with self.assertRaises(RuntimeError):
+                server.message_handler('Fehler', [])
+            self.assertEqual(server.chatto_handler.presence_activity({}), {'working': False})
+
+        memory = mock.Mock()
+        memory.device_aliases.return_value = {}
+        with tempfile.TemporaryDirectory() as tmp, \
+             mock.patch.object(cli, 'load_config', return_value=runtime_config(Path(tmp), config)), \
+             mock.patch.object(cli, 'build', return_value=(FakeBus(), FakeLLM(), memory, agent, FakeReminders())), \
+             mock.patch.object(cli, 'Recorder'), \
+             mock.patch.object(cli, 'Transcriber', return_value=mock.Mock(config={}, transcribe=transcribe)), \
+             mock.patch.object(cli, 'Speaker', return_value=FakeSpeaker()), \
+             mock.patch.object(cli, 'VisualServer', FakeVisualServer), \
+             mock.patch.object(cli, '_wait_for_service_shutdown', side_effect=exercise):
+            self.assertEqual(cli.main(['serve', '--no-tts']), 0)
+        self.assertEqual(observed, [{'working': True}] * 3)
+
     @staticmethod
     def assert_process_gone(pid, timeout=2):
         deadline = time.monotonic() + timeout
@@ -730,6 +782,10 @@ class RuntimeTest(unittest.TestCase):
                         if mode in {"diagram", "artifact"}:
                             self.assertIn("```", result["answer"])
                             self.assertEqual(1 if mode == "artifact" else 0, len(result["artifacts"]))
+                            self.assertEqual(1 if mode == "artifact" else 0, len(result["resources"]))
+                            if mode == "artifact":
+                                self.assertEqual("file", result["resources"][0]["type"])
+                                self.assertEqual(result["artifacts"][0]["filename"], result["resources"][0]["filename"])
                 with tempfile.TemporaryDirectory() as tmp, \
                      mock.patch.object(cli,"load_config",return_value=runtime_config(Path(tmp), config)), \
                      mock.patch.object(cli,"build",return_value=(FakeBus(),llm,FakeMemory(),agent,FakeReminders())), \

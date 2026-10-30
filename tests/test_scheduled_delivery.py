@@ -136,6 +136,8 @@ class ScheduledTurnIntegrationTest(unittest.TestCase):
         from unittest.mock import Mock
         from eve_agent.chatto import ChattoAPI
         from eve_agent.config import DEFAULTS
+        from eve_agent.work_activity import WorkActivity
+        self.work_activity = WorkActivity()
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.store = ConversationStore(EveDatabase(Path(self.tmp.name) / 'turn.db'))
@@ -151,11 +153,29 @@ class ScheduledTurnIntegrationTest(unittest.TestCase):
         tree = ast.parse((Path(__file__).parents[1] / 'src/eve_agent/cli.py').read_text())
         function = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == 'execute_scheduled_eve_turn')
         namespace = dict(agent=Mock(conversation_id=self.source), telemetry=Mock(), bus=Mock(),
+                         work_activity=self.work_activity,
                          __package__='eve_agent',
                          turn_lock=threading.RLock(), chatto_bridge=self.bridge, conversations=self.store,
                          browser_response=self.response, remember_turn_failure=Mock())
         exec(compile(ast.Module(body=[function], type_ignores=[]), '<scheduled-turn>', 'exec'), namespace)
         self.execute = namespace['execute_scheduled_eve_turn']
+
+    def test_scheduled_execution_reports_work_and_releases_on_failure(self):
+        result = self.response.return_value
+        for fail in (False, True):
+            with self.subTest(fail=fail):
+                def response(*args, **kwargs):
+                    self.assertTrue(self.work_activity.is_working())
+                    if fail:
+                        raise RuntimeError('model failed')
+                    return result
+                self.response.side_effect = response
+                if fail:
+                    with self.assertRaises(RuntimeError):
+                        self.execute({'request': 'Aufgabe', 'conversation_id': self.source})
+                else:
+                    self.execute({'request': 'Aufgabe', 'conversation_id': self.source})
+                self.assertFalse(self.work_activity.is_working())
 
     def test_runtime_reenters_origin_authority_and_preserves_resources(self):
         from eve_agent.transport_access import capability_allowed, transport_metadata

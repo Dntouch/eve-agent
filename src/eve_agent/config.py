@@ -77,7 +77,7 @@ DEFAULTS: dict[str, Any] = {
         "channel_capabilities": ["memory", "semantic_learning", "working_memory", "web", "clock", "calculator"],
     },
     "nova_maintenance": {"enabled": False, "command": "codex", "transport": "isolated", "shared_chat_socket": "", "shared_chat_timeout_seconds": 900, "bwrap_command": "bwrap", "timeout_seconds": 180, "verification_timeout_seconds": 180, "pending_ttl_seconds": 600, "require_process_isolation": True, "max_context_records": 20, "max_jobs": 20},
-    "web": {"enabled": False, "searxng_url": "http://127.0.0.1:8888", "image_results": 4, "timeout_seconds": 12, "max_page_bytes": 5_000_000},
+    "web": {"enabled": False, "searxng_url": "http://127.0.0.1:8888", "image_results": 4, "timeout_seconds": 12, "max_page_bytes": 5_000_000, "max_pdf_bytes": 50 * 1024 * 1024},
     "image_generation": {"enabled": False, "api_format": "sdapi", "base_url": "http://127.0.0.1:1235", "api_key": "", "model": "", "width": 1024, "height": 1024, "steps": 4, "guidance_scale": 1.0, "timeout_seconds": 3600, "extra_parameters": {}},
     "home_assistant": {"enabled": False, "url": "", "token": "", "language": "de", "timeout_seconds": 12},
     "network_tools": {"enabled": False, "subnet": "192.168.0.0/16", "image": "docker.io/instrumentisto/nmap:latest", "timeout_seconds": 35},
@@ -326,7 +326,11 @@ UI_FIELDS: dict[str, dict[str, Any]] = {
     },
     "web.max_page_bytes": {
         "label": "Maximale Seitengröße (Bytes)", "type": "integer", "min": 750_000, "max": 20_000_000,
-        "description": "Abruflimit vor der Textextraktion. Größere Seiten werden mit erkennbarem Fehler abgelehnt.",
+        "description": "Abruflimit für HTML- und Textseiten vor der Textextraktion. Für PDFs gilt die eigene PDF-Größengrenze.",
+    },
+    "web.max_pdf_bytes": {
+        "label": "Maximale PDF-Größe (Bytes)", "type": "integer", "min": 750_000, "max": 200 * 1024 * 1024,
+        "description": "Abruflimit für PDF-Dokumente vor der Textextraktion; standardmäßig 50 MiB (52.428.800 Bytes).",
     },
     "nova_maintenance.enabled": {
         "label": "Aktiviert", "type": "boolean",
@@ -500,6 +504,12 @@ def _validate(root: Path, config: dict[str, Any]) -> None:
     if not str(llm.get("model", "")).strip():
         raise ConfigError("llm.model darf nicht leer sein")
     _integer(llm, "timeout_seconds", 1, 900, "llm.timeout_seconds")
+    temperature = llm.get("temperature")
+    if temperature is not None and (
+        isinstance(temperature, bool) or not isinstance(temperature, (int, float))
+        or not 0 <= temperature <= 2
+    ):
+        raise ConfigError("llm.temperature muss eine Zahl zwischen 0 und 2 sein")
     embedding = config["memory_search"]
     if not isinstance(embedding, Mapping):
         raise ConfigError("memory_search muss ein Objekt sein")
@@ -597,7 +607,8 @@ def _validate(root: Path, config: dict[str, Any]) -> None:
     web = config["web"]
     web["searxng_url"] = _url(web.get("searxng_url"), "web.searxng_url")
     for key, low, high in (("image_results", 1, 8), ("timeout_seconds", 1, 300),
-                           ("max_page_bytes", 750_000, 20_000_000)):
+                           ("max_page_bytes", 750_000, 20_000_000),
+                           ("max_pdf_bytes", 750_000, 200 * 1024 * 1024)):
         _integer(web, key, low, high, f"web.{key}")
 
     shell = config["shell"]

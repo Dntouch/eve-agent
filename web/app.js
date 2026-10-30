@@ -996,6 +996,11 @@
     return control;
   }
 
+  function isScrolledToEnd(element) {
+    // Allow rounding differences in fractional browser scroll positions.
+    return element.scrollHeight - element.clientHeight - element.scrollTop <= 2;
+  }
+
   function scrollChatToLatest() {
     const apply = () => {
       elements.chatMessages.scrollTop = elements.chatMessages.scrollHeight;
@@ -1012,10 +1017,11 @@
   }
 
   function appendChatMessage(message) {
+    const followLatest = message.role === "user" || isScrolledToEnd(elements.chatMessages);
     const node = createMessageNode(message);
     elements.chatMessages.append(node);
     elements.chatEmpty.hidden = true;
-    scrollChatToLatest();
+    if (followLatest) scrollChatToLatest();
     return node;
   }
 
@@ -1065,6 +1071,8 @@
 
   function appendLiveReasoning(state, chunk) {
     if (!state || state.finished || typeof chunk !== "string" || !chunk) return;
+    const followChat = isScrolledToEnd(elements.chatMessages);
+    const followReasoning = !state.content || isScrolledToEnd(state.content);
     if (!state.article) {
       const article = document.createElement("article");
       article.className = "chat-message assistant live-reasoning";
@@ -1091,8 +1099,8 @@
     }
     state.text += chunk;
     state.content.textContent = state.text;
-    state.content.scrollTop = state.content.scrollHeight;
-    elements.chatMessages.scrollTop = elements.chatMessages.scrollHeight;
+    if (followReasoning) state.content.scrollTop = state.content.scrollHeight;
+    if (followChat) elements.chatMessages.scrollTop = elements.chatMessages.scrollHeight;
   }
 
   function finishLiveReasoning(state, outcome = "complete") {
@@ -8834,12 +8842,13 @@
     let backendAccepted = false;
     const paintStream = (final = false) => {
       if (!streamingMessage) return;
+      const followChat = isScrolledToEnd(elements.chatMessages);
       if (streamPaint) window.clearTimeout(streamPaint);
       streamPaint = 0;
       const content = streamingMessage.querySelector(".message-content");
       renderAssistantMarkdown(content, streamedText);
       setReply(streamedText);
-      elements.chatMessages.scrollTop = elements.chatMessages.scrollHeight;
+      if (followChat) elements.chatMessages.scrollTop = elements.chatMessages.scrollHeight;
     };
     const queueStreamPaint = () => {
       if (!streamPaint) streamPaint = window.setTimeout(() => paintStream(false), 50);
@@ -8945,6 +8954,7 @@
         window.localStorage.removeItem("eve.activeBackendTurn");
         paintStream(true);
         messageAccepted = true;
+        await loadConversations(activeConversationId);
         showState("idle");
         return;
       }
@@ -9148,6 +9158,7 @@
       paintResumedAnswer();
       if (turnCancelled) {
         window.localStorage.removeItem("eve.activeBackendTurn");
+        await loadConversations(activeConversationId);
         showState("idle");
         return;
       }

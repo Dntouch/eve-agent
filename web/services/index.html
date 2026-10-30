@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="de">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>EVE · Dienste</title>
+  <link rel="stylesheet" href="services.css?v=2">
+  <script src="services.js?v=2" defer></script>
+</head>
+<body>
+  <main>
+    <header>
+      <div><p class="eyebrow">EVE / SYSTEM</p><h1>Dienste</h1>
+        <p class="intro">Status prüfen. Dienste steuern. EVE wieder erreichen.</p></div>
+      <a id="eveLink" href="#" class="button" target="_top">EVE öffnen ↗</a>
+    </header>
+    <section class="overview" aria-label="Gesamtstatus">
+      <div><span id="summary" role="status">Dienste werden geprüft …</span>
+        <p id="checked">Warte auf die erste Prüfung.</p></div>
+      <button id="refresh" type="button">Ansicht aktualisieren</button>
+    </section>
+    <p class="connection" id="connection" role="alert" hidden></p>
+    <section id="operation" class="operation" aria-live="polite" hidden></section>
+    <section id="services" class="services" aria-label="Einzelne Dienste"></section>
+    <footer>Diese Dienstkonsole läuft unabhängig von EVE weiter. Prüfung alle 15 Sekunden.
+      <br>Starten und Neustarten können beim Laden eines Modells länger dauern.</footer>
+  </main>
+</body>
+</html>

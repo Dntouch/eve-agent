@@ -1,4 +1,5 @@
 import json
+import io
 import unittest
 from unittest import mock
 import urllib.parse
@@ -17,15 +18,17 @@ from eve_agent.web_tools import (
 class FakeResponse:
     def __init__(self, payload: bytes):
         self.payload = payload
+        self.stream = io.BytesIO(payload)
 
     def __enter__(self):
+        self.stream.seek(0)
         return self
 
     def __exit__(self, *args):
         return False
 
     def read(self, limit=-1):
-        return self.payload
+        return self.stream.read(limit)
 
 
 class FakeHeaders:
@@ -34,6 +37,134 @@ class FakeHeaders:
 
 
 class WebToolTest(unittest.TestCase):
+
+    @staticmethod
+    def pdf_bytes(texts=('First page evidence', 'Second page evidence'), *, password=None):
+        from pypdf import PdfWriter
+        from pypdf.generic import DictionaryObject, NameObject, DecodedStreamObject
+        writer = PdfWriter()
+        writer.add_metadata({'/Title': 'PDF test document'})
+        for text in texts:
+            page = writer.add_blank_page(width=200, height=200)
+            if text:
+                font = DictionaryObject({NameObject('/Type'): NameObject('/Font'),
+                    NameObject('/Subtype'): NameObject('/Type1'), NameObject('/BaseFont'): NameObject('/Helvetica')})
+                page[NameObject('/Resources')] = DictionaryObject({NameObject('/Font'):
+                    DictionaryObject({NameObject('/F1'): writer._add_object(font)})})
+                stream = DecodedStreamObject()
+                stream.set_data(f'BT /F1 12 Tf 20 100 Td ({text}) Tj ET'.encode())
+                page[NameObject('/Contents')] = writer._add_object(stream)
+        if password:
+            writer.encrypt(password)
+        output = io.BytesIO(); writer.write(output)
+        return output.getvalue()
+
+    def pdf_response(self, payload, mime='application/pdf'):
+        response = FakeResponse(payload)
+        response.headers = mock.Mock()
+        response.headers.get_content_type.return_value = mime
+        response.headers.get_content_charset.return_value = None
+        opener = mock.Mock(); opener.open.return_value = response
+        return opener
+
+    def test_pdf_url_is_read_with_page_numbers_using_existing_url_operation(self):
+        research = WebResearch({})
+        opener = self.pdf_response(self.pdf_bytes())
+        url = 'https://example.org/download?id=123'
+        with mock.patch('eve_agent.web_tools._assert_public_url'), mock.patch(
+                'eve_agent.web_tools.urllib.request.build_opener', return_value=opener):
+            result = research.execute_native_operation('read_urls', {'urls': [url]})
+        self.assertIn('[Seite 1]', result['context'])
+        self.assertIn('First page evidence', result['context'])
+        self.assertIn('[Seite 2]', result['context'])
+        self.assertIn('Second page evidence', result['context'])
+        self.assertEqual(url, result['sources'][0]['url'])
+        opener.open.assert_called_once()
+
+    def test_pdf_signature_handles_generic_download_content_type(self):
+        opener = self.pdf_response(self.pdf_bytes(), mime='application/octet-stream')
+        with mock.patch('eve_agent.web_tools._assert_public_url'), mock.patch(
+                'eve_agent.web_tools.urllib.request.build_opener', return_value=opener):
+            result = WebResearch({}).execute_native_operation('read_pdf',
+                {'url': 'https://example.org/download', 'pages': [2, 2]})
+        self.assertEqual(2, result['page_count'])
+        self.assertEqual([{'page': 2, 'text': 'Second page evidence'}], result['pages'])
+        self.assertEqual('PDF test document', result['title'])
+        self.assertFalse(result['all_pages_selected'])
+        self.assertNotIn('First page evidence', result['context'])
+        self.assertFalse(result['ocr_performed'])
+
+    def test_blank_pdf_pages_are_reported_without_fabricated_text(self):
+        raw = self.pdf_bytes(('', 'Actual text'))
+        result = WebResearch._pdf_text(raw)
+        self.assertEqual([1], result['empty_text_pages'])
+        self.assertEqual('', result['pages'][0]['text'])
+        self.assertIn('Actual text', WebResearch._pdf_context(result))
+        opener = self.pdf_response(self.pdf_bytes(('',)))
+        with mock.patch('eve_agent.web_tools._assert_public_url'), mock.patch(
+                'eve_agent.web_tools.urllib.request.build_opener', return_value=opener):
+            with self.assertRaisesRegex(WebReadError, 'OCR'):
+                WebResearch({}).read_urls(['https://example.org/scan.pdf'])
+
+    def test_invalid_pdf_pages_and_password_protection_are_explicit_errors(self):
+        raw = self.pdf_bytes()
+        for pages in ([], [0], [True], [3], '2'):
+            with self.subTest(pages=pages), self.assertRaises(ValueError):
+                WebResearch._pdf_text(raw, pages=pages)
+        with self.assertRaisesRegex(ValueError, 'passwortgeschützt'):
+            WebResearch._pdf_text(self.pdf_bytes(password='test-password'))
+
+    def test_corrupt_pdf_and_non_pdf_response_are_not_reported_as_readable(self):
+        with self.assertRaisesRegex(ValueError, 'PDF konnte nicht gelesen'):
+            WebResearch._pdf_text(b'%PDF-1.7\ninvalid')
+        opener = self.pdf_response(b'<p>not a PDF</p>', mime='text/html')
+        with mock.patch('eve_agent.web_tools._assert_public_url'), mock.patch(
+                'eve_agent.web_tools.urllib.request.build_opener', return_value=opener):
+            with self.assertRaisesRegex(ValueError, 'kein PDF'):
+                WebResearch({}).execute_native_operation('read_pdf', {'url': 'https://example.org/file.pdf'})
+
+    def test_pdf_fetch_keeps_existing_public_url_and_download_size_checks(self):
+        with mock.patch('eve_agent.web_tools.socket.getaddrinfo',
+                return_value=[(2, 1, 6, '', ('127.0.0.1', 80))]):
+            with self.assertRaisesRegex(ValueError, 'Lokale Netzwerkziele'):
+                WebResearch({}).execute_native_operation('read_pdf', {'url': 'http://example.test/file.pdf'})
+        opener = self.pdf_response(self.pdf_bytes())
+        with mock.patch('eve_agent.web_tools._assert_public_url'), mock.patch(
+                'eve_agent.web_tools.urllib.request.build_opener', return_value=opener):
+            with self.assertRaisesRegex(RuntimeError, '100 Bytes'):
+                WebResearch({'max_pdf_bytes': 100}).read_page('https://example.org/file.pdf')
+
+    def test_pdf_larger_than_old_limit_is_read_via_both_operations_and_mime_detection(self):
+        raw = self.pdf_bytes() + b'\n%' + b'x' * 6_000_000
+        for mime in ('application/pdf', 'application/octet-stream'):
+            for operation, parameters in (
+                ('read_pdf', {'url': 'https://example.org/download', 'pages': [2]}),
+                ('read_urls', {'urls': ['https://example.org/download']}),
+            ):
+                with self.subTest(mime=mime, operation=operation):
+                    opener = self.pdf_response(raw, mime=mime)
+                    with mock.patch('eve_agent.web_tools._assert_public_url'), mock.patch(
+                            'eve_agent.web_tools.urllib.request.build_opener', return_value=opener):
+                        result = WebResearch({}).execute_native_operation(operation, parameters)
+                    self.assertIn('Second page evidence', result['context'])
+
+    def test_pdf_limit_accepts_exact_size_and_rejects_one_byte_over(self):
+        raw = self.pdf_bytes()
+        for mime in ('application/pdf', 'application/octet-stream'):
+            for limit in (len(raw), len(raw) - 1):
+                opener = self.pdf_response(raw, mime=mime)
+                response = opener.open.return_value
+                response.read = mock.Mock(wraps=response.read)
+                with self.subTest(mime=mime, limit=limit), mock.patch(
+                        'eve_agent.web_tools._assert_public_url'), mock.patch(
+                        'eve_agent.web_tools.urllib.request.build_opener', return_value=opener):
+                    research = WebResearch({'max_pdf_bytes': limit})
+                    if limit == len(raw):
+                        self.assertIn('First page evidence', research.read_page('https://example.org/download'))
+                    else:
+                        with self.assertRaisesRegex(RuntimeError, f'Das PDF.*{limit} Bytes'):
+                            research.read_page('https://example.org/download')
+                self.assertEqual(limit + 1, sum(call.args[0] for call in response.read.call_args_list))
 
     def test_text_extractor_omits_page_chrome_and_keeps_article_content(self):
         parser = _TextExtractor()
@@ -116,7 +247,7 @@ class WebToolTest(unittest.TestCase):
     def test_oversized_page_is_rejected_instead_of_silently_truncated(self):
         research = WebResearch({})
         response = FakeResponse(b"x" * (research.max_page_bytes + 1))
-        response.read = mock.Mock(return_value=response.payload)
+        response.read = mock.Mock(wraps=response.read)
         response.headers = FakeHeaders()
         opener = mock.Mock()
         opener.open.return_value = response
@@ -125,7 +256,7 @@ class WebToolTest(unittest.TestCase):
         ):
             with self.assertRaisesRegex(RuntimeError, "5000000"):
                 research.read_page("https://example.org/large")
-        response.read.assert_called_once_with(5_000_001)
+        self.assertEqual([mock.call(1024), mock.call(5_000_001 - 1024)], response.read.call_args_list)
 
     def test_large_html_is_fully_read_and_scripts_are_removed(self):
         response = FakeResponse(b'<script>' + b'x' * 800_000 + b'</script><p>Wetterbericht</p>')
@@ -242,7 +373,7 @@ class WebToolTest(unittest.TestCase):
         research = WebResearch({})
         context = research.native_contract()
         operations = set(context["operations"])
-        self.assertEqual({"search", "read_urls", "search_images"}, operations)
+        self.assertEqual({"search", "read_urls", "read_pdf", "search_images"}, operations)
         self.assertIn("search_images", context["operations"])
 
     def test_image_search_returns_generic_resources_and_skips_broken_results(self):

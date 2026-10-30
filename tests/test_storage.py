@@ -80,6 +80,40 @@ class ConversationStoreTest(unittest.TestCase):
     def make_store(self, root: Path) -> ConversationStore:
         return ConversationStore(EveDatabase(root / "data" / "eve.db"))
 
+    def test_restore_interrupted_request_in_original_order_without_duplicate(self):
+        from eve_agent.working_memory import WorkingMemoryStore
+        with tempfile.TemporaryDirectory() as tmp:
+            store = self.make_store(Path(tmp))
+            cid = store.create()['id']
+            working = WorkingMemoryStore(store.database)
+            workspace = working.open(cid)
+            turn, _ = working.begin_turn(workspace, cid,
+                {'text': 'Die fehlende Aufforderung', 'images': [], 'trace_id': 'aborted-trace'}, 'aborted-trace')
+            working.finish_turn(workspace, turn, 'cancelled', {'message': 'aborted'})
+            store.append_turn(cid, 'Spätere Nachricht', 'Spätere Antwort', turn_id='later-trace')
+            updated_at = store.get(cid)['updated_at']
+            self.assertTrue(store.preserve_interrupted_turn(turn))
+            page = store.messages(cid)['messages']
+            self.assertEqual(['Die fehlende Aufforderung', 'Vorgang abgebrochen.',
+                              'Spätere Nachricht', 'Spätere Antwort'], [m['content'] for m in page])
+            self.assertEqual(list(range(4)), [m['ordinal'] for m in page])
+            self.assertEqual(updated_at, store.get(cid)['updated_at'])
+            self.assertFalse(store.preserve_interrupted_turn(turn))
+            self.assertEqual(4, len(store.messages(cid)['messages']))
+
+    def test_late_failure_does_not_duplicate_an_already_saved_answer(self):
+        from eve_agent.working_memory import WorkingMemoryStore
+        with tempfile.TemporaryDirectory() as tmp:
+            store = self.make_store(Path(tmp)); cid = store.create()['id']
+            working = WorkingMemoryStore(store.database); workspace = working.open(cid)
+            turn, _ = working.begin_turn(workspace, cid,
+                {'text': 'Frage', 'images': [], 'trace_id': 'saved'}, 'saved')
+            store.append_turn(cid, 'Frage', 'Vollständige Antwort', turn_id='saved')
+            working.finish_turn(workspace, turn, 'failed', {'message': 'Audio fehlgeschlagen'})
+            self.assertFalse(store.preserve_interrupted_turn(turn))
+            self.assertEqual(['Frage', 'Vollständige Antwort'],
+                             [m['content'] for m in store.messages(cid)['messages']])
+
     def test_conversation_crud_and_turn_persist_across_restart(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

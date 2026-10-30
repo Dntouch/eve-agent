@@ -51,6 +51,44 @@ class LocalFileReaderTest(unittest.TestCase):
         self.assertTrue(resource["content"].startswith("data:image/png;base64,"))
         self.assertEqual(original, path.read_bytes())
 
+    def test_open_pdf_is_an_outgoing_file_resource_with_original_bytes_and_name(self):
+        import base64
+        path = self.first / "Anleitung.pdf"
+        original = b"%PDF-1.7\nexample"
+        path.write_bytes(original)
+        resource = self.reader.open_resource("Anleitung.pdf")
+        self.assertEqual("file", resource["type"])
+        self.assertEqual("Anleitung.pdf", resource["filename"])
+        self.assertEqual("application/pdf", resource["media_type"])
+        self.assertEqual(original, base64.b64decode(resource["content"].split(",", 1)[1]))
+        self.assertEqual(original, path.read_bytes())
+
+    def test_binary_files_can_be_attached_without_being_interpreted_as_text(self):
+        import base64
+        for filename in ('project.step', 'archive.zip', 'unknown.evebinary', 'scan.tiff'):
+            with self.subTest(filename=filename):
+                original = b'\x00\xffbinary\x01'
+                (self.first / filename).write_bytes(original)
+                resource = self.reader.open_resource(filename)
+                self.assertEqual('file', resource['type'])
+                self.assertEqual(filename, resource['filename'])
+                self.assertEqual(original, base64.b64decode(resource['content'].split(',', 1)[1]))
+                with self.assertRaisesRegex(LocalFileAccessError, 'nicht als Text'):
+                    self.reader.read_text(filename)
+        self.assertEqual('application/octet-stream', self.reader.open_resource('unknown.evebinary')['media_type'])
+
+    def test_resource_size_and_root_boundary_still_apply_to_binary_files(self):
+        (self.first / 'large.zip').write_bytes(b'x' * 101)
+        reader = LocalFileReader(lambda: self.roots, max_resource_bytes=100)
+        with self.assertRaisesRegex(LocalFileAccessError, 'zu groß'):
+            reader.open_resource('large.zip')
+        outside = self.base / 'private.zip'
+        outside.write_bytes(b'private')
+        (self.first / 'escape.zip').symlink_to(outside)
+        for path in (str(outside), 'escape.zip'):
+            with self.assertRaises(LocalFileAccessError):
+                reader.open_resource(path)
+
     def test_unique_bare_filename_resolves_in_nested_directory(self):
         nested = self.first / "EVE-Glubsch"; nested.mkdir()
         image = nested / "EVE-Glubsch Odysee.png"; image.write_bytes(b"\x89PNG\r\n\x1a\n")

@@ -67,11 +67,15 @@ class HandoffTest(unittest.TestCase):
         answer = self.runtime.respond('Nur analysieren, nichts verändern.')
         self.assertEqual('Bericht und Plan.', answer)
         self.assertEqual(1, provider.call_count)
-        self.assertEqual(2, self.llm.request_working_checkpoint.call_count)
+        self.assertEqual(1, self.llm.request_working_checkpoint.call_count)
         session = self.runtime.working_session
         entry = session.entry()
-        self.assertEqual(2, entry['revision'])
-        self.assertEqual(answer, session.store.value(session.workspace_id, entry['checkpoint_reference'])['completed_answer'])
+        self.assertEqual(1, entry['revision'])
+        with self.db.connect() as c:
+            outcome = c.execute('SELECT answer_id FROM memory_work_turns WHERE id=?', (session.turn_id,)).fetchone()[0]
+        self.assertEqual(answer, session.store.value(session.workspace_id, outcome))
+        resumed = WorkingMemorySession(self.agent, 'Fortsetzen', [], 'after-completion').entry()
+        self.assertEqual(outcome, resumed['latest_turn_outcome']['model_answer_reference'])
         self.assertFalse(entry['checkpoint_is_verified_fact'])
         fresh = self.llm.request_tool_turn.call_args.args[0]
         data = json.loads(fresh[2]['content'].split(': ', 1)[1])
@@ -98,11 +102,11 @@ class HandoffTest(unittest.TestCase):
         session.tool_frame(messages[-1], descriptor)
         session.prepare(messages, [], {}, {'loaded_capabilities': []}, CORE_PROMPT, self.runtime._published_tools)
         self.assertEqual(original, session.store.value(session.workspace_id, descriptor['reference']))
-        self.assertEqual(1, self.llm.request_working_checkpoint.call_count)
-        sent, tools = self.llm.request_working_checkpoint.call_args.args
-        self.assertTrue(measure(sent, tools)['fits'])
-        self.assertNotIn('unchanged' * 100, json.dumps(sent))
-        self.assertIn(descriptor['reference'], json.dumps(sent))
+        self.assertEqual(0, self.llm.request_working_checkpoint.call_count)
+        self.assertTrue(measure(messages, [])['fits'])
+        self.assertNotIn('unchanged' * 100, json.dumps(messages))
+        self.assertIn(descriptor['reference'], json.dumps(messages))
+        # A real handoff still captures a model checkpoint.
         session.capture_checkpoint(messages, CORE_PROMPT, 'capacity')
         self.assertEqual(1, self.llm.request_working_checkpoint.call_count)
 
@@ -136,6 +140,43 @@ class HandoffTest(unittest.TestCase):
             session.capture_checkpoint([{'role': 'system', 'content': CORE_PROMPT}], CORE_PROMPT, 'capacity')
         self.assertIsNone(session.entry()['checkpoint_reference'])
 
+    def test_checkpoint_accepts_existing_historical_source_outside_current_frames(self):
+        session = self.session()
+        source = session.store.put(session.workspace_id, {'original': 'past observation'})
+        def checkpoint(frames, tools):
+            response = self.checkpoint(frames, tools)
+            response['tool_calls'][0]['arguments']['references'].append(source['observation_id'])
+            return response
+        self.llm.request_working_checkpoint = Mock(side_effect=checkpoint)
+        session.capture_checkpoint([{'role': 'system', 'content': CORE_PROMPT}], CORE_PROMPT, 'capacity')
+        self.assertEqual('saved', session.checkpoint_capture['status'])
+        reference = session.entry()['checkpoint_reference']
+        with self.db.connect() as c:
+            links = [r[0] for r in c.execute('SELECT to_id FROM memory_work_links WHERE from_id=?', (reference,))]
+        self.assertIn(source['reference'], links)
+
+    def test_rereading_receipts_does_not_retrigger_checkpoint_or_context_recovery(self):
+        session = self.session()
+        source = session.store.put(session.workspace_id, {'stdout': 'original failure text'})
+        def read(reference, pointer, call_id):
+            parameters = {'reference': reference, 'pointer': pointer}
+            result = session.store.read(session.workspace_id, **parameters)
+            identifier = session.store.start_call(session.workspace_id, session.turn_id, call_id,
+                                                 'working_memory', 'read', 'read', parameters)
+            session.store.dispatch_call(session.workspace_id, identifier)
+            return session.store.finish_call(session.workspace_id, session.turn_id, identifier, result)
+        receipt = read(source['reference'], '/stdout', 'first-read')
+        signature = session._material_signature()
+        self.llm.request_working_checkpoint = Mock(side_effect=self.checkpoint)
+        session.capture_checkpoint([{'role': 'system', 'content': CORE_PROMPT}], CORE_PROMPT, 'capacity')
+        read(receipt['reference'], '/content', 'second-read')
+        self.assertEqual(signature, session._material_signature())
+        session.capture_checkpoint([{'role': 'system', 'content': CORE_PROMPT}], CORE_PROMPT, 'capacity')
+        self.assertEqual(1, self.llm.request_working_checkpoint.call_count)
+        data = json.loads(session._seed(CORE_PROMPT, [])[-1]['content'].split(': ', 1)[1])
+        self.assertEqual(1, data['execution_activity']['repeated_content_reads'])
+        self.assertEqual(1, data['execution_activity']['repeated_returned_results'])
+
     def test_empty_response_continues_from_checkpoint_after_write_exactly_once(self):
         self.llm.request_working_checkpoint = Mock(side_effect=self.checkpoint)
         empty = EmptyModelResponseError(finish_reason='stop', stream_done=True, reasoning_chars=17083)
@@ -150,7 +191,7 @@ class HandoffTest(unittest.TestCase):
         self.assertEqual('Bericht aus gesicherten Ergebnissen.', self.runtime.respond('Analysiere.'))
         self.assertEqual(1, execute.call_count)
         self.assertEqual(4, self.llm.request_tool_turn.call_count)
-        self.assertEqual(2, self.llm.request_working_checkpoint.call_count)
+        self.assertEqual(1, self.llm.request_working_checkpoint.call_count)
         session = self.runtime.working_session
         observations = session.store.list_objects(session.workspace_id, kind='model_response_error')['items']
         self.assertEqual(empty.response_evidence, session.store.value(session.workspace_id, observations[0]['reference']))
@@ -171,7 +212,9 @@ class HandoffTest(unittest.TestCase):
         self.assertEqual(2, self.llm.request_tool_turn.call_count)
         self.assertEqual(1, self.llm.request_working_checkpoint.call_count)
         with self.db.connect() as connection:
-            self.assertEqual(0, connection.execute("SELECT count(*) FROM messages WHERE role='assistant'").fetchone()[0])
+            messages = connection.execute("SELECT content,metadata_json FROM messages WHERE role='assistant'").fetchall()
+        self.assertEqual(['Vorgang fehlgeschlagen.'], [m['content'] for m in messages])
+        self.assertEqual('failed', json.loads(messages[0]['metadata_json'])['runtime_status'])
 
     def test_base_prompt_is_byte_identical_to_pre_change_contract(self):
         self.assertEqual('ff172335332be70a7df1385d657face9b18cce783acc9099432da744615de72d',
@@ -229,8 +272,9 @@ class OutputBudgetTest(unittest.TestCase):
         self.assertEqual('unknown', unknown['output_budget_basis'])
         llm._observe_generation({'completion_tokens': 2048})
         observed = self.measure(llm, 31767)
-        self.assertFalse(observed['fits'])
-        self.assertEqual('observed_completion_high_water', observed['output_budget_basis'])
+        self.assertTrue(observed['fits'])
+        self.assertEqual('unknown', observed['output_budget_basis'])
+        self.assertEqual(2048, observed['observed_completion_tokens'])
         llm.runtime_model_info.return_value['server_output_tokens'] = 4096
         known = self.measure(llm, 30000)
         self.assertFalse(known['fits'])
@@ -254,7 +298,7 @@ class OutputBudgetTest(unittest.TestCase):
             with self.assertRaises(LocalLLMOutputLimitError):
                 llm.request_tool_turn([], [], None)
         self.assertEqual(3500, llm._observed_completion_tokens)
-        self.assertFalse(self.measure(llm, 30000)['fits'])
+        self.assertTrue(self.measure(llm, 30000)['fits'])
 
     def test_checkpoint_transport_forces_only_persistence_and_does_not_publish_answer(self):
         llm = self.llm()

@@ -70,3 +70,40 @@ test('file paths and URLs never become uploaded attachments', async () => {
     await assert.rejects(postAnswer({}, {}, { roomId: 'room' }, 'Datei', [{ type: 'file', content }]));
   }
 });
+
+test('local PDFs including legacy attachment resources upload with filename and exact bytes', async () => {
+  for (const type of ['file', 'attachment']) {
+    const bytes = Buffer.concat([Buffer.from('%PDF-1.7\n'), Buffer.alloc(6 * 1024 * 1024, 32)]);
+    const chunks = [];
+    let created, posted;
+    await postAnswer({
+      createUpload: async payload => { created = payload; return { upload: { uploadId: 'pdf', maxChunkSize: 512 * 1024 } }; },
+      uploadChunk: async payload => { chunks.push(payload.content); },
+      completeUpload: async () => ({ asset: { id: 'pdf-asset' } }),
+    }, { createMessage: async payload => { posted = payload; return { message: { id: 'answer' } }; } },
+    { roomId: 'owner-dm', threadRootId: 'root' }, 'Hier ist das PDF.',
+    [{ type, filename: 'Anleitung.pdf', content: `data:application/pdf;base64,${bytes.toString('base64')}` }]);
+    assert.equal(created.filename, 'Anleitung.pdf');
+    assert.equal(created.contentType, 'application/pdf');
+    assert.equal(created.size, BigInt(bytes.length));
+    assert.deepEqual(Buffer.concat(chunks), bytes);
+    assert.equal(posted.roomId, 'owner-dm');
+    assert.equal(posted.threadRootEventId, 'root');
+    assert.deepEqual(posted.attachmentAssetIds, ['pdf-asset']);
+  }
+});
+
+test('generated text downloads are attached once to the first message of a split answer', async () => {
+  const posted = [];
+  const content = Buffer.from('print("ok")\n');
+  let uploads = 0;
+  await postAnswer({
+    createUpload: async payload => { uploads++; assert.equal(payload.filename, 'hello.py'); return { upload: { uploadId: 'script' } }; },
+    uploadChunk: async payload => { assert.deepEqual(payload.content, content); },
+    completeUpload: async () => ({ asset: { id: 'script-asset' } }),
+  }, { createMessage: async payload => { posted.push(payload); return { message: { id: String(posted.length) } }; } },
+  { roomId: 'r' }, 'x'.repeat(8001),
+  [{ type: 'file', filename: 'hello.py', content: `data:text/plain;base64,${content.toString('base64')}` }]);
+  assert.equal(uploads, 1);
+  assert.deepEqual(posted.map(p => p.attachmentAssetIds), [['script-asset'], []]);
+});

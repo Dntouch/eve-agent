@@ -147,6 +147,7 @@ class VisualServer:
         chatto_handler=None,
         chatto_token: str = "",
         chatto_status_handler=None,
+        service_handler=None,
     ):
         self.web_dir, self.bus, self.host = web_dir, bus, host
         self._thread: threading.Thread | None = None
@@ -162,6 +163,7 @@ class VisualServer:
         handle_work_lists = work_list_handler
         handle_work_items = work_item_handler
         handle_config = config_handler
+        handle_services = service_handler
         handle_home_assistant_inventory = home_assistant_inventory_handler
         handle_home_assistant_policy = home_assistant_policy_handler
         handle_training_packages = training_package_handler
@@ -316,6 +318,8 @@ class VisualServer:
                         if not self._authorized():
                             return
                         self._config_request("GET")
+                    elif path in {"/api/services", "/api/services/runtime"} and handle_services is not None:
+                        self._services_request("GET")
                     elif path == "/api/home-assistant/policy" and handle_home_assistant_policy is not None:
                         if not self._authorized():
                             return
@@ -417,6 +421,9 @@ class VisualServer:
                     self._assist_request()
                     return
                 path = self.path.split("?", 1)[0]
+                if path in {"/api/services", "/api/services/runtime"} and handle_services is not None:
+                    self._services_request("POST")
+                    return
                 if path == "/api/home-assistant/inventory" and handle_home_assistant_inventory is not None:
                     if not self._authorized():
                         return
@@ -1193,6 +1200,34 @@ class VisualServer:
                     return
                 self._json(status, result)
 
+            def _services_request(self, method: str) -> None:
+                if not self._authorized():
+                    return
+                payload = {}
+                if method == "POST":
+                    if self.headers.get_content_type() != "application/json":
+                        self._json(415, {"error": "Dienststeuerung benötigt application/json"})
+                        return
+                    try:
+                        length = int(self.headers.get("Content-Length", "0"))
+                        if not 0 < length <= 4096:
+                            raise ValueError("Ungültige Anfragelänge")
+                        payload = json.loads(self._read_body(length))
+                        if not isinstance(payload, dict):
+                            raise ValueError("JSON-Objekt erwartet")
+                    except (ValueError, TypeError) as exc:
+                        self._json(400, {"error": str(exc)})
+                        return
+                try:
+                    status, result = handle_services(method, self.path.split("?", 1)[0], payload)
+                except (ValueError, TypeError) as exc:
+                    self._json(400, {"error": str(exc)})
+                    return
+                except Exception:
+                    self._json(503, {"error": "Dienststeuerung fehlgeschlagen; Konsolenprotokoll prüfen"})
+                    return
+                self._json(status, result)
+
             def _config_request(self, method: str) -> None:
                 payload = {}
                 if method == "PATCH":
@@ -1374,6 +1409,8 @@ class VisualServer:
                         self._json(200, handle_chatto.conversation(payload))
                     elif path == "/api/chatto/activity":
                         self._json(200, handle_chatto.activity(payload))
+                    elif path == "/api/chatto/presence-activity":
+                        self._json(200, handle_chatto.presence_activity(payload))
                     elif path == "/api/chatto/observe":
                         self._json(200, handle_chatto.observe(payload))
                     else:

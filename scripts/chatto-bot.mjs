@@ -73,6 +73,8 @@ try {
   if (config.presence_enabled !== false) {
     presence = createBotPresence(server.service(MyAccountService), {
       onError: () => console.error('Chatto presence update failed; automatic expiry remains active.'),
+      readActivity: () => eve('/api/chatto/presence-activity', {},
+        AbortSignal.any([controller.signal, AbortSignal.timeout(5000)])),
     });
     await presence.setConnected(true);
   }
@@ -175,7 +177,10 @@ try {
         await handleMessage({
           message, conversationKey: scope, transport: context, signal, observeOnly: Boolean(route.observeOnly),
           loadImages: () => loadImages(server, message, signal),
-          withTyping: work => server.withTyping(destination, work, { signal }),
+          withTyping: work => {
+            const typing = () => server.withTyping(destination, work, { signal });
+            return presence ? presence.withWork(typing) : typing();
+          },
           progress: config.thread_status_enabled === false ? undefined : threadProgress(server.service(MessageService), destination, { signal, timeoutMs: 5000 }),
           bindThread: (root, id) => {
             const key = scopeForRoute(serverUrl, viewerId, { ...message, threadRootId: root }, route);

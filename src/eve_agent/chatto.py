@@ -13,12 +13,14 @@ import threading
 
 from .transport_access import transport_access, PUBLIC_CAPABILITIES, update_transport_metadata, transport_metadata
 from .memory import redact_sensitive
+from .artifacts import output_resources
 
 
 class ChattoAPI:
-    def __init__(self, config, conversations, message_handler, learning_activity=None):
+    def __init__(self, config, conversations, message_handler, learning_activity=None, work_activity=None):
         self.config, self.conversations, self.message_handler = config, conversations, message_handler
         self.learning_activity = learning_activity
+        self.work_activity = work_activity
         self.scheduler = None
         self.output_rooms = []
         self.activities = {}
@@ -161,6 +163,12 @@ class ChattoAPI:
         return {"conversation_id": conversation["id"],
                 **({"project_reference": context["project_reference"]} if context.get("project_reference") else {})}
 
+    def presence_activity(self, payload):
+        """Bridge-only aggregate activity. Never expose conversations or task data."""
+        if not self.config["enabled"]:
+            raise PermissionError("Chatto is disabled")
+        return {"working": bool(self.work_activity and self.work_activity())}
+
     def activity(self, payload):
         context = self._context(payload)
         self._require_bound_conversation(payload.get("conversation_id"), context)
@@ -235,7 +243,7 @@ class ChattoAPI:
                 user_attachments=[{"type":"image", "content": image} for image in images],
                 assistant_attachments=[r for r in result.get("resources", []) if r.get("type") == "image"])
             artifacts = list(result.get("artifacts", []))
-            for resource in result.get("resources", []):
+            for resource in output_resources(result.get("resources", [])):
                 if resource.get("type") == "file" and isinstance(resource.get("content"), str):
                     header, separator, encoded = resource["content"].partition(";base64,")
                     if separator and header.startswith("data:"):
@@ -251,12 +259,7 @@ class ChattoAPI:
         return {**{key: result[key] for key in ("conversation_id", "turn_id")}, "conversation_id": response_identifier, "answer": answer,
                 "thread_root_id": context.get("thread_root_id", ""),
                 **({"project_reference": context["project_reference"]} if context.get("project_reference") else {}),
-                "resources": [
-                    {key: resource[key] for key in ("type", "content", "filename", "media_type") if key in resource}
-                    for resource in result.get("resources", [])
-                    if resource.get("type") in {"image", "file"} and isinstance(resource.get("content"), str)
-                    and (resource["content"].startswith("data:image/") if resource.get("type") == "image" else resource["content"].startswith("data:"))
-                ]}
+                "resources": output_resources(result.get("resources", []), result.get("artifacts", []))}
 
     def _require_bound_conversation(self, identifier, context):
         if not isinstance(identifier, str) or not identifier:

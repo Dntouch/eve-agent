@@ -594,11 +594,15 @@ class EveAgent:
             assistant_message_id = assistant_message["id"]
             if getattr(self.memory, "revisions", None):
                 self.memory.revisions.attach_turn(turn_id, user_message["id"])
-        self.history.extend([
-            {"role": "user", "content": user,
-             **turn_input_metadata},
-            {"role": "assistant", "content": answer},
-        ])
+        if self.conversations and self.conversation_id:
+            # Live follow-ups use the same attachment references and provenance
+            # as a reopened conversation, rather than a text-only shadow copy.
+            self.history = self.conversations.recent_history(self.conversation_id)
+        else:
+            self.history.extend([
+                {"role": "user", "content": user, **turn_input_metadata},
+                {"role": "assistant", "content": answer},
+            ])
         if self.conversations and self.conversation_id:
             if route == Route.WORK_TASKS and hasattr(self.work_tasks, "attach_mutation_provenance"):
                 try:

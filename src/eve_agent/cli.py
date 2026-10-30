@@ -19,7 +19,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from .agent import EveAgent
-from .artifacts import extract_artifacts
+from .artifacts import extract_artifacts, output_resources
 from .audio import Recorder, Speaker, Transcriber, temporary_wav
 from .config import ConfigError, config_status, default_config_path, editable_config, load_config, update_editable_config
 from .telemetry import TurnTelemetry
@@ -46,6 +46,7 @@ from .action_provenance_telemetry import ActionProvenanceTelemetry
 from .memory_maintenance import MemoryMaintenance
 from .network_tools import LocalNetworkTools
 from .state import StateBus
+from .work_activity import WorkActivity
 from .storage import ConversationStore, EveDatabase
 from .search import LocalSearchCapability, PersistentSearch
 from .visual import VisualServer
@@ -353,6 +354,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     agent.conversation_learning = conversation_learning
     turn_results = TurnCompletionStore(limit=20)
+    work_activity = WorkActivity()
     tts_cfg = cfg["text_to_speech"]
     base_hotwords = str(cfg["speech_to_text"].get("hotwords", ""))
 
@@ -502,7 +504,7 @@ def main(argv: list[str] | None = None) -> int:
         response_start_ms = telemetry.elapsed_ms()
         spoken_answer, artifacts = extract_artifacts(answer, utterance)
         for resource in result.resources:
-            if resource.get("type") == "file" and isinstance(resource.get("content"), str):
+            if resource.get("type") in {"file", "attachment"} and isinstance(resource.get("content"), str):
                 header, separator, encoded = resource["content"].partition(";base64,")
                 if separator and header.startswith("data:"):
                     artifacts.append({"filename": resource.get("filename") or "eve-download.bin",
@@ -776,15 +778,11 @@ def main(argv: list[str] | None = None) -> int:
             "postprocess_url": f"/api/turn-results/{result.turn_id}",
             "conversation_id": result.conversation_id,
             "assistant_message_id": result.assistant_message_id,
-            "resources": [
-                {key: resource[key] for key in ("type", "content", "filename", "media_type") if key in resource}
-                for resource in result.resources
-                if resource.get("type") in {"image", "file"} and isinstance(resource.get("content"), str)
-                and (resource["content"].startswith("data:image/") if resource.get("type") == "image" else resource["content"].startswith("data:"))
-            ],
+            "resources": output_resources(result.resources, artifacts),
             "presentation_pending": result.presentation is not None,
         }
 
+    @work_activity.track()
     def execute_scheduled_eve_turn(action: dict) -> dict:
         request = str(action.get("request") or "").strip()
         if not request:
@@ -846,6 +844,7 @@ def main(argv: list[str] | None = None) -> int:
         register_scheduled_executor("eve_turn", execute_scheduled_eve_turn)
     start_scheduler = getattr(reminders, "start", None)
 
+    @work_activity.track()
     def browser_turn(audio_path: Path, conversation_id: str | None = None) -> dict:
         if not turn_lock.acquire(blocking=False):
             raise RuntimeError("EVE verarbeitet bereits eine Eingabe")
@@ -885,6 +884,7 @@ def main(argv: list[str] | None = None) -> int:
         finally:
             turn_lock.release()
 
+    @work_activity.track()
     def browser_message(
         text: str, images: list[str], conversation_id: str | None = None, on_chunk=None,
         backend_turn_id: str | None = None, cancellation=None,
@@ -1105,6 +1105,7 @@ def main(argv: list[str] | None = None) -> int:
             conversation_id, explicit_resume=explicit_resume, reserve_resume=explicit_resume,
         )
         conversation_id = lifecycle["conversation_id"]
+        @work_activity.track()
         def run_voice(turn_id: str, store: BackendTurnStore) -> None:
             early_tts = None
             if not turn_lock.acquire(blocking=False):
@@ -1780,8 +1781,51 @@ def main(argv: list[str] | None = None) -> int:
         cfg["chatto"], conversations,
         lambda text, images, identifier: browser_message(text, images, identifier, synthesize_audio=False),
         learning_activity=conversation_learning.note_activity if conversation_learning else None,
+        work_activity=lambda: work_activity.is_working() or backend_turns.has_active(),
     )
     chatto_bridge.scheduler = reminders
+
+    service_action_lock = threading.Lock()
+
+    def browser_services(method, path, payload):
+        from urllib.error import HTTPError
+        from .services import console_port, local_url, request_json, runtime_status
+        if path == "/api/services/runtime":
+            if method == "GET":
+                _, effective = load_config(config_path)
+                return 200, runtime_status(agent, chatto_process, effective)
+            if set(payload) != {"service", "action"} or payload.get("service") != "chatto" or payload.get("action") not in {"start", "stop", "restart"}:
+                return 400, {"error": "Unbekannte Laufzeit-Dienstaktion"}
+            if not service_action_lock.acquire(blocking=False):
+                return 409, {"error": "Eine Bot-Aktion läuft bereits"}
+            try:
+                if not chatto_process.config["chatto"]["enabled"]:
+                    return 409, {"error": "Chatto ist in der Konfiguration deaktiviert"}
+                action = payload["action"]
+                if action in {"stop", "restart"}:
+                    chatto_process.close()
+                if action in {"start", "restart"} and chatto_process.status().get("state") == "stopped":
+                    chatto_process.start()
+                return 200, {"chatto": chatto_process.status()}
+            except OSError:
+                return 503, {"error": "Bot konnte nicht gestartet werden; Node-Programm und Botprotokoll prüfen"}
+            finally:
+                service_action_lock.release()
+        if method not in {"GET", "POST"}:
+            return 405, {"error": "Methode ist nicht erlaubt"}
+        try:
+            result = request_json(local_url(cfg, console=True) + "/api/services", local_tls=True, timeout=2,
+                payload=payload if method == "POST" else None)
+            return (202 if method == "POST" else 200), result
+        except HTTPError as exc:
+            try:
+                return exc.code, json.loads(exc.read(4096))
+            except (ValueError, OSError):
+                return 503, {"error": "Dienstkonsole hat die Anfrage zurückgewiesen"}
+            finally:
+                exc.close()
+        except (OSError, ValueError):
+            return 503, {"error": "Dienstkonsole nicht erreichbar", "console_port": console_port(cfg)}
     reminders.output_targets_provider = chatto_bridge.output_targets
     if callable(start_scheduler):
         start_scheduler()
@@ -1815,6 +1859,7 @@ def main(argv: list[str] | None = None) -> int:
         chatto_handler=chatto_bridge,
         chatto_token=chatto_process.token,
         chatto_status_handler=chatto_process.status,
+        service_handler=browser_services,
         conversation_handler=browser_conversations,
         task_handler=browser_tasks,
         work_list_handler=browser_work_lists,
@@ -1872,7 +1917,8 @@ def main(argv: list[str] | None = None) -> int:
                 try:
                     recorder.record_until_enter(audio_path)
                     bus.set("thinking", "Transkription")
-                    utterance = transcriber.transcribe(audio_path)
+                    with work_activity.track():
+                        utterance = transcriber.transcribe(audio_path)
                 finally:
                     audio_path.unlink(missing_ok=True)
                 print(f"Du> {utterance}")
@@ -1889,7 +1935,8 @@ def main(argv: list[str] | None = None) -> int:
                 memory_compiler = getattr(agent, "memory_compiler", None)
                 if memory_compiler is not None:
                     memory_compiler.prioritize_interactive_turn()
-                answer = agent.respond(utterance)
+                with work_activity.track():
+                    answer = agent.respond(utterance)
                 print(f"EVE> {answer}")
                 completed_turn = getattr(agent, "_last_turn_result", None)
                 if shadow_learning is not None and completed_turn is not None:
@@ -1909,7 +1956,7 @@ def main(argv: list[str] | None = None) -> int:
                 if not args.no_tts:
                     spoken_answer, _ = extract_artifacts(answer, utterance)
                     bus.set("speaking")
-                    with tts_lock:
+                    with work_activity.track(), tts_lock:
                         speaker.speak(speech_text(spoken_answer))
             except LocalLLMError as exc:
                 bus.set("error", str(exc)); print(f"EVE Fehler> {exc}", file=sys.stderr)

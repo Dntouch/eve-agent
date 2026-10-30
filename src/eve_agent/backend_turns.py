@@ -213,6 +213,11 @@ class BackendTurnStore:
             turn["version"] += 1
             self._lock.notify_all()
 
+    def has_active(self) -> bool:
+        """Include queued turns and response postprocessing until terminal status."""
+        with self._lock:
+            return any(turn["status"] not in self.TERMINAL for turn in self._turns.values())
+
     def active_for_conversation(self, conversation_id: str) -> str | None:
         with self._lock:
             return next((turn["turn_id"] for turn in reversed(self._turns.values())

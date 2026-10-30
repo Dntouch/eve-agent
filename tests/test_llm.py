@@ -145,6 +145,36 @@ class NoisyWorkTaskLLM(CapturingLLM):
 
 
 class SpeechPerspectiveTest(unittest.TestCase):
+    def test_configured_temperature_reaches_text_and_tool_transports(self):
+        messages = [{"role": "user", "content": "Hallo"}]
+        for configured in (None, 0.0, 1.0):
+            for streaming in (False, True):
+                for tools in (False, True):
+                    with self.subTest(temperature=configured, streaming=streaming, tools=tools):
+                        llm = OpenAICompatibleLLM({
+                            "base_url": "http://127.0.0.1:1/v1", "model": "test",
+                            "temperature": configured,
+                        })
+                        if streaming:
+                            response = StreamingResponse([
+                                'data: {"choices":[{"delta":{"content":"Hallo"},"finish_reason":"stop"}]}\n',
+                                'data: [DONE]\n',
+                            ])
+                        else:
+                            response = io.BytesIO(json.dumps({"choices": [{
+                                "message": {"role": "assistant", "content": "Hallo"},
+                                "finish_reason": "stop",
+                            }]}).encode())
+                        with unittest.mock.patch("urllib.request.urlopen", return_value=response) as opened:
+                            with llm.stream_answers((lambda _: None) if streaming else None):
+                                if tools:
+                                    llm.request_tool_turn(messages, [], None, 0.3)
+                                else:
+                                    llm._request(messages, None, 0.3, role="answer")
+                        payload = json.loads(opened.call_args.args[0].data)
+                        self.assertEqual(configured if configured is not None else 0.3, payload["temperature"])
+                        self.assertEqual(streaming, payload["stream"])
+
     def test_learning_stream_preserves_context_error_for_work_memory_fallback(self):
         from eve_agent.llm import LocalLLMStreamError
         llm = OpenAICompatibleLLM({'base_url': 'http://localhost:1/v1', 'model': 'test'})

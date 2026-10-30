@@ -82,6 +82,11 @@ Zugangsdaten werden über Umgebungsvariablen oder eine lokale `.env` gesetzt;
 [`.env.example`](.env.example) nennt die Variablen.
 Home Assistant, Shellzugriff und Desktopsteuerung sind zunächst ausgeschaltet.
 
+Der Web-Leser verarbeitet öffentliche PDFs mit Seitenzahlen bis standardmäßig
+50 MiB. `web.max_pdf_bytes` ist in der Konfiguration einstellbar. Lokale und
+erzeugte Dateien können in Chatto als echte Anhänge im selben Raum und Thread
+versendet werden; dabei gelten 20 MiB pro Datei und die jeweiligen Dateifreigaben.
+
 Für eine eigene EVE einschließlich Sprache, Gedächtnissuche und Websuche:
 
 ```bash
@@ -106,6 +111,7 @@ Serveradressen und Berechtigungen muss jede Installation selbst konfigurieren.
 | Chatto-Bot-Anbindung | EVE als Bot mit einem bestehenden Chatto-Server verbinden: Node 22.13+ und npm, `python3 scripts/setup_chatto.py`, anschließend Serveradresse und eigenen Bot konfigurieren. Siehe [Chatto-Anleitung](docs/CHATTO.md). |
 | Externe MCP-Werkzeuge, etwa SolidCraft | Konfigurierbare Server, getrennte Sitzungen, Chatto-Auftrags-Threads und Dateianhänge: [MCP-Anleitung](docs/MCP.md). |
 | Lokale Dateien und Shell | Eigene Verzeichnisse beziehungsweise Shell in der Konfiguration freigeben. |
+| Dienstübersicht | Status von EVE und angebundenen Diensten direkt im Webfrontend; Einrichtung und verfügbare Steuerung: [Dienst-Anleitung](docs/SERVICES.md). |
 | Desktopsteuerung | Linux/Wayland mit Desktop-Portal; separates Paket `wayland-mcp-kurojs==0.6.1` in `.venv-wayland-mcp` installieren und dort `scripts/patch_wayland_mcp_keyboard.py` ausführen. Benötigt die Systemabhängigkeiten von PyGObject, PyWayland und das Portal des Desktops. Die Desktop-Freigabe erfolgt lokal über das Portal. |
 | Nova-Wartung | Eigenen Coding-Agenten samt Anmeldung konfigurieren; für isolierten Linux-Betrieb wird Bubblewrap benötigt. |
 | Netzwerkscan | Docker oder Podman und die Netzwerkkonfiguration in EVE einrichten. |

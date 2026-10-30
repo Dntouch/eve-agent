@@ -6,6 +6,25 @@ from eve_agent.backend_turns import BackendTurnStore, TurnCancelled
 
 
 class BackendTurnStoreTest(unittest.TestCase):
+    def test_response_postprocessing_remains_active_until_success_failure_or_cancellation(self):
+        ready = threading.Event()
+
+        def runner(turn_id, _text, _images, _conversation_id, store):
+            store.set_response(turn_id, {'answer': 'Antwort'})
+            ready.set()
+            # The separate completion worker owns the remaining lifetime.
+
+        store = BackendTurnStore(runner)
+        self.addCleanup(store.close)
+        for status in ('completed', 'failed', 'cancelled'):
+            with self.subTest(status=status):
+                ready.clear()
+                turn_id = store.start('Lokal', [], 'local')['turn_id']
+                self.assertTrue(ready.wait(2))
+                self.assertTrue(store.has_active())
+                store.update(turn_id, status=status)
+                self.assertFalse(store.has_active())
+
     def test_discover_running_turn_by_conversation_without_client_marker(self):
         release = threading.Event()
         def runner(turn_id, _text, _images, _conversation_id, store):
@@ -14,11 +33,14 @@ class BackendTurnStoreTest(unittest.TestCase):
         store = BackendTurnStore(runner)
         self.addCleanup(store.close)
         self.addCleanup(release.set)
+        self.assertFalse(store.has_active())
         turn_id = store.start("Toolcall", [], "chat-a")["turn_id"]
+        self.assertTrue(store.has_active())
         self.assertEqual(turn_id, store.active_for_conversation("chat-a"))
         self.assertIsNone(store.active_for_conversation("chat-b"))
         release.set()
         self.wait_terminal(store, turn_id)
+        self.assertFalse(store.has_active())
         self.assertIsNone(store.active_for_conversation("chat-a"))
 
     def test_reasoning_is_streamed_separately_and_never_becomes_answer(self):

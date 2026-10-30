@@ -531,6 +531,25 @@ class NativeRuntimeTest(unittest.TestCase):
         )
         self.assertIn("native validation detail", tool_result["content"])
 
+    def test_unpublished_web_call_explains_recovery_without_claiming_permission_denial(self):
+        from eve_agent.web_tools import WebResearch
+        self.agent.web = WebResearch({})
+        self.agent.web.execute_native_operation = Mock(return_value={"sources": [], "context": "verified result"})
+        self.llm.request_tool_turn.side_effect = [
+            {"content": "", "tool_calls": [{"id": "bad-web", "name": "web", "arguments": {"query": "test"}}]},
+            {"content": "", "tool_calls": [{"id": "load-web", "name": "eve__load_capabilities", "arguments": {"capabilities": ["web"]}}]},
+            {"content": "", "tool_calls": [{"id": "search-web", "name": "web__search", "arguments": {"query": "test"}}]},
+            {"content": "verified result", "tool_calls": []},
+        ]
+        self.assertEqual("verified result", self.runtime.respond("Suche im Web"))
+        receipt = self.agent._tool_events[0]["result"]
+        self.assertEqual("unpublished_tool", receipt["error"])
+        self.assertFalse(receipt["permission_denied"])
+        self.assertFalse(receipt["provider_called"])
+        self.assertIn("web", receipt["available_capabilities"])
+        self.assertIn("eve__load_capabilities", receipt["published_functions"])
+        self.agent.web.execute_native_operation.assert_called_once_with("search", {"query": "test"})
+
     def test_web_url_diagnostics_are_readable_from_working_memory(self):
         from urllib.error import HTTPError
         from eve_agent.storage import ConversationStore
@@ -817,6 +836,18 @@ class NativeRuntimeTest(unittest.TestCase):
         repeated = observe(state,'working_memory','read',{'content':[2]})
         self.assertEqual('repeated_provider_result',repeated['kind'])
         self.assertNotIn('provider_failure_counts',state)
+
+    def test_shell_repeat_identity_ignores_receipt_ids_but_preserves_output_and_exit_status(self):
+        state = {}
+        result = {'status': 'completed', 'session_id': 'a', 'pid': 10,
+                  'stdout': 'same output', 'stderr': '', 'exit_code': 0}
+        observe = self.runtime._provider_result_observation
+        self.assertIsNone(observe(state, 'shell', 'execute', result))
+        repeated = observe(state, 'shell', 'execute', {**result, 'session_id': 'b', 'pid': 20})
+        self.assertEqual(2, repeated['equivalent_results'])
+        self.assertFalse(repeated['task_progress_assessed'])
+        self.assertIsNone(observe(state, 'shell', 'execute', {**result, 'stdout': 'different output'}))
+        self.assertIsNone(observe(state, 'shell', 'execute', {**result, 'status': 'failed', 'exit_code': 1}))
 
     def test_repeated_successful_result_is_exposed_as_no_new_evidence(self):
         state = {}

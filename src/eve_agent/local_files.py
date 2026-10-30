@@ -216,15 +216,14 @@ class LocalFileReader:
         if size > self.max_resource_bytes:
             raise LocalFileAccessError("Die Datei ist zu groß, um sie als Turn-Ressource zu öffnen.")
         media_type = RESOURCE_TYPES.get(actual.suffix.casefold())
-        if media_type is None and actual.suffix.casefold() in TEXT_SUFFIXES:
-            media_type = mimetypes.guess_type(actual.name)[0] or "text/plain"
         if media_type is None:
-            raise LocalFileAccessError("Dieser Dateityp wird nicht als Turn-Ressource unterstützt.")
+            fallback = "text/plain" if actual.suffix.casefold() in TEXT_SUFFIXES else "application/octet-stream"
+            media_type = mimetypes.guess_type(actual.name)[0] or fallback
         try:
             body = actual.read_bytes()
         except OSError as exc:
             raise LocalFileAccessError("Datei kann nicht gelesen werden.") from exc
-        return {"type": "image" if media_type.startswith("image/") else "attachment",
+        return {"type": "image" if media_type in {"image/png", "image/jpeg", "image/gif", "image/webp"} else "file",
                 "content": f"data:{media_type};base64," + base64.b64encode(body).decode(),
                 "media_type": media_type, "filename": actual.name,
                 "source": "local_file", "description": f"Lokale Datei {actual.name}",
@@ -249,7 +248,8 @@ class LocalFileCapability:
             "description": (
                 "Nur lesender Zugriff auf freigegebene lokale Verzeichnisse. Ein Benutzer-Dateiname ist noch kein "
                 "veröffentlichter Pfad: zuerst search_files mit dem exakten Namen, danach read_text mit dem dort "
-                "gelieferten path; erst nach read_text aus dessen Inhalt antworten."
+                "gelieferten path; erst nach read_text aus dessen Inhalt antworten. "
+                "open_resource fügt eine Datei als Antwortanhang hinzu, auch zum Versand in Chatto."
             ),
             "roots": [{"reference": f"root:{index}/", "name": root.name}
                       for index, root in enumerate(self.reader.roots())],

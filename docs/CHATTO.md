@@ -42,12 +42,27 @@ Umbenennungen verändern die Bindung an Konto- und Raum-IDs nicht.
 In Chatto muss der Bot Mitglied sein und Lese-/Antwortrechte im jeweiligen
 Raum besitzen. Direkte Antworten benötigen `message.post`. Menschen eröffnen DMs.
 
-**Online-Status anzeigen** meldet den verbundenen Bot als online und erneuert
-die Präsenz alle 30 Sekunden, auch während eines längeren Modellaufrufs. Beim
+**Online-Status anzeigen** meldet den verbundenen Bot im Leerlauf als online
+(grüner Punkt). Während einer Chatto-Anfrage, eines lokalen Text- oder Sprachgesprächs
+oder einer geplanten EVE-Aufgabe wechselt der Punkt auf Gelb/Orange;
+dafür nutzt EVE Chattos vorhandenen Status „Abwesend“ (`Away`). Die Chatto-Oberfläche
+kann diesen Status entsprechend als „Abwesend“ beschriften. Der Farbwechsel umfasst
+das Laden von Bildern, Modell- und Werkzeugaufrufe sowie das Versenden der Antwort.
+Nach Abschluss, Fehler oder Abbruch wechselt EVE wieder auf Grün, sobald alle
+gleichzeitig laufenden Anfragen beendet sind. Lokale Spracheingaben zählen ab der
+Transkription; lokale Browser-Turns einschließlich ausstehender Antwortaufbereitung
+und Audioerzeugung bleiben bis zum Abschluss beschäftigt. Der Bot fragt den
+zusammengefassten Arbeitsstatus ungefähr jede Sekunde über die geschützte lokale
+Bridge ab. Dabei werden keine Gesprächsinhalte, Personen, Räume oder Aufgabendetails
+übermittelt. Schlägt die Abfrage fehl, bleibt der zuletzt bekannte Arbeitsstatus
+bis zur nächsten erfolgreichen Abfrage erhalten. Stilles Mitlernen und interne
+Gedächtniswartung verändern die Farbe nicht. Browser-Audiowiedergabe nach dem
+Abschluss der serverseitigen Verarbeitung zählt nicht als laufende Arbeit.
+Die Präsenz wird alle 30 Sekunden erneuert, auch während eines längeren Modellaufrufs. Beim
 normalen Stoppen wird offline gemeldet. Bei Verbindungsverlust stoppt der
 Heartbeat; Chatto lässt die Präsenz nach etwa 60 Sekunden verfallen. Der Status
 beschreibt die Bot-Verbindung und ist keine Garantie für die Modellverfügbarkeit.
-Chatto zeigt bei Bots den grünen Online-Punkt und blendet den Punkt offline aus;
+Chatto zeigt bei Bots den farbigen Statuspunkt und blendet den Punkt offline aus;
 der Bot bleibt in der eigenen Mitgliedergruppe Bots.
 
 ## Gesprächskontext und Werkzeuge
@@ -136,10 +151,18 @@ Chatto liefert eine Variante mit maximal 2048 Pixeln Kantenlänge. MIME-Typ,
 Base64 und Bildsignatur werden vor dem Modellaufruf geprüft. Diese Übertragung
 erteilt keine lokalen Dateirechte. Audio und sonstige Dateiinhalte werden
 weiterhin nicht verarbeitet.
-Bildressourcen der Antwort werden umgekehrt als echte Chatto-Anhänge in genau
-denselben Raum hochgeladen und zusammen mit dem Antworttext versendet. Nur
-inline bereitgestellte Bildbytes werden übertragen; lokale Pfade und beliebige
-Bild-URLs werden dafür nicht gelesen. Provider-interne Pfade bleiben lokal.
+Bild- und Dateiressourcen der Antwort werden umgekehrt als echte Chatto-Anhänge
+in genau denselben Raum und Thread hochgeladen und mit dem Antworttext versendet.
+Das umfasst lokale Dateien (auch PDFs, ZIPs und CAD-Dateien) über `local_files.open_resource`,
+MCP-Exporte über `eve_attach_file` und erzeugte Downloads, etwa Python- oder
+YAML-Dateien. Dateien behalten ihren Dateinamen; doppelt als Ressource und Download
+bereitgestellte Dateien werden nur einmal angehängt. Es gelten höchstens acht
+Anhänge, davon maximal vier Bilder. Dateien sind auf je 20 MiB, Bilder auf je
+5 MiB begrenzt; zusätzlich gelten die Upload-Rechte und Grenzen des Chatto-Servers.
+Die PDF-Abrufgrenze von 50 MiB für die Webrecherche ist davon unabhängig.
+Nur inline bereitgestellte Bytes werden übertragen. Lokale Dateien müssen zuerst
+über das freigegebene Dateiwerkzeug geöffnet werden; lokale Pfade und beliebige
+URLs werden vom Bot nicht gelesen. Provider-interne Pfade bleiben lokal.
 In einer persönlichen DM dürfen weiterhin die persönlichen EVE-Werkzeuge
 genutzt werden, einschließlich Home Assistant. Die Channel-Sperren gelten nur
 für die freigegebenen Channels.

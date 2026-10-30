@@ -6,6 +6,7 @@ requires-python = ">=3.11"
 license = {text = "MIT"}
 dependencies = [
   "jsonschema>=4.23,<5",
+  "pypdf>=6,<7",
   "faster-whisper>=1.1,<2",
   # PyAV 19 removed metadata_errors used by faster-whisper 1.x.
   "av>=11,<19",

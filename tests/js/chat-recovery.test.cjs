@@ -74,6 +74,7 @@ test('backend failure and cancellation clear the pending marker', async () => {
     await c.context.resumeBackendTurn();
     assert.equal(c.storage.size, 0);
     assert.equal(c.timers.length, 0);
+    if (event.type === 'cancelled') assert.ok(c.calls.includes('completed-history'));
   }
 });
 

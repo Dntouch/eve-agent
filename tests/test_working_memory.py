@@ -195,6 +195,31 @@ class WorkingMemoryTest(unittest.TestCase):
             self.assertEqual(0,c.execute('SELECT count(*) FROM memory_claims').fetchone()[0])
             self.assertEqual(2,c.execute('SELECT count(*) FROM memory_observations').fetchone()[0])
 
+    def test_same_content_through_new_read_receipts_has_one_original_identity(self):
+        original = self.store.put(self.workspace, {'stdout': 'identical failure output'})
+        turn, _ = self.store.begin_turn(self.workspace, self.conversation, {}, 'read-chain')
+        reference, pointer = original['reference'], '/stdout'
+        identities = []
+        for number in range(3):
+            parameters = {'reference': reference, 'pointer': pointer}
+            observed = self.store.retrieval_observation(self.workspace, 'read', parameters)
+            self.assertEqual(number, observed['previous_identical_content_reads'])
+            self.assertEqual(0, observed['previous_identical_selections'])
+            self.assertEqual(original['reference'], observed['origin_reference'])
+            result = self.store.read(self.workspace, **parameters)
+            identities.append(self.store.read_identity(self.workspace, parameters, result))
+            call_id = self.store.start_call(self.workspace, turn, str(number), 'working_memory', 'read', 'read', parameters)
+            self.store.dispatch_call(self.workspace, call_id)
+            receipt = self.store.finish_call(self.workspace, turn, call_id, result)
+            reference, pointer = receipt['reference'], '/content'
+        self.assertEqual(1, len(set(identities)))
+        restarted = WorkingMemoryStore(EveDatabase(self.root / 'eve.db'))
+        self.assertEqual(2, restarted.activity(self.workspace, turn_id=turn)['repeated_content_reads'])
+        different = self.store.put(self.workspace, {'stdout': 'identical failure output'})
+        result = self.store.read(self.workspace, different['reference'], pointer='/stdout')
+        self.assertNotEqual(identities[0], self.store.read_identity(self.workspace,
+            {'reference': different['reference'], 'pointer': '/stdout'}, result))
+
     def test_no_default_material_limit_and_exact_filter_projection_paging(self):
         obj = self.store.put(self.workspace, {'rows': [{'type':'x' if i%2 else 'y','nested':{'id':i}} for i in range(1164)]})
         all_rows = self.store.read(self.workspace,obj['reference'],pointer='/rows')
@@ -383,6 +408,64 @@ class WorkingRuntimeTest(unittest.TestCase):
         self.agent=EveAgent('EVE',memory,self.llm,StateBus(self.root/'runtime'),conversations=self.conversations)
         self.runtime=NativeToolRuntime(self.agent)
 
+    def test_cancelled_request_images_and_tool_results_survive_reload(self):
+        from eve_agent.backend_turns import TurnCancelled
+        image = 'data:image/png;base64,' + base64.b64encode(b'original-image').decode()
+        self.llm.request_tool_turn.side_effect = [
+            call('eve__load_capabilities', {'capabilities': ['local_files']}),
+            call('local_files__fetch'), TurnCancelled('Abbruch')]
+        self.agent.local_files = SimpleNamespace(minimal_contract=lambda: {'description': 'fixture',
+            'operations': {'fetch': {'effect': 'read', 'parameters_schema': {'type': 'object', 'properties': {}}}}},
+            execute_operation=Mock(return_value={'original': 'kept'}))
+        with self.assertRaises(TurnCancelled):
+            self.runtime.respond('Kannst Du Dir mittels Shell helfen?', images=[image])
+        session = self.runtime.working_session
+        restarted = ConversationStore(EveDatabase(self.root / 'eve.db'))
+        page = restarted.messages(self.agent.conversation_id)['messages']
+        self.assertEqual(['user', 'assistant'], [m['role'] for m in page])
+        self.assertEqual('Kannst Du Dir mittels Shell helfen?', page[0]['content'])
+        self.assertEqual('Vorgang abgebrochen.', page[1]['content'])
+        self.assertEqual('cancelled', page[1]['metadata']['runtime_status'])
+        self.assertEqual(session.turn_id, page[1]['metadata']['working_memory']['work_turn_id'])
+        self.assertEqual(('image/png', b'original-image'), restarted.read_asset(page[0]['attachments'][0]['id']))
+        self.assertTrue(any(e['result'] == {'original': 'kept'} for e in page[1]['tool_events']))
+        self.assertFalse(restarted.preserve_interrupted_turn(session.turn_id))
+        self.assertEqual(2, len(restarted.messages(self.agent.conversation_id)['messages']))
+        self.assertEqual(1, self.agent.local_files.execute_operation.call_count)
+
+    def test_failed_request_remains_in_conversation_context(self):
+        self.llm.request_tool_turn.side_effect = RuntimeError('Modell nicht erreichbar')
+        with self.assertRaisesRegex(RuntimeError, 'Modell nicht erreichbar'):
+            self.runtime.respond('Bitte prüfe mein Bild.')
+        history = self.conversations.recent_history(self.agent.conversation_id)
+        self.assertEqual(['Bitte prüfe mein Bild.', 'Vorgang fehlgeschlagen.'],
+                         [m['content'].split('\n[')[0] for m in history])
+
+    def test_isolated_learning_failure_does_not_create_chat_messages(self):
+        from eve_agent.working_context import WorkingMemorySession
+        self.agent.conversation_id = self.conversations.create()['id']
+        session = WorkingMemorySession(self.agent, 'Internes Lernmaterial', [], 'isolated', isolated=True)
+        session.finish('cancelled', {'message': 'Abbruch'})
+        self.assertEqual([], self.conversations.messages(self.agent.conversation_id)['messages'])
+
+    def test_live_followup_keeps_exact_attachment_reference_and_can_materialize_it(self):
+        body = b'exact image bytes'
+        image = 'data:image/png;base64,' + base64.b64encode(body).decode()
+        self.llm.request_tool_turn.return_value = {'content': 'Bild erhalten.', 'tool_calls': []}
+        self.runtime.respond('Hier das Bild.', images=[image])
+        cid = self.agent.conversation_id
+        asset = self.conversations.messages(cid)['messages'][0]['attachments'][0]['id']
+        self.assertIn('asset:' + asset, self.agent.history[0]['content'])
+        self.llm.request_tool_turn.side_effect = [
+            call('eve__load_capabilities', {'capabilities': ['conversation_assets']}),
+            call('conversation_assets__materialize', {'asset_id': asset}),
+            {'content': 'Original als Datei verfügbar.', 'tool_calls': []}]
+        self.runtime.respond('Nutze für dieses Bild die Shell.')
+        messages = self.llm.request_tool_turn.call_args_list[-1].args[0]
+        result = json.loads(next(m['content'] for m in reversed(messages) if m['role'] == 'tool'))
+        self.assertEqual(body, Path(result['path']).read_bytes())
+        self.assertEqual(asset, result['asset_id'])
+
     def budget(self,capacity):
         # Deterministic byte tokenizer for boundary tests, not production counting.
         def measure(messages,tools):
@@ -522,7 +605,7 @@ class WorkingRuntimeTest(unittest.TestCase):
 
     def test_huge_tool_result_is_durable_before_next_request_and_retrieved_selectively(self):
         # Fit the published tool schemas while keeping the original far above context capacity.
-        self.budget(15000)
+        self.budget(20000)
         original={'rows':[{'id':i,'label':'unmodified original '*30} for i in range(1164)]}
         provider=SimpleNamespace(minimal_contract=lambda:{'description':'fixture','operations':{
             'fetch':{'effect':'read','parameters_schema':{'type':'object','properties':{}}}}},

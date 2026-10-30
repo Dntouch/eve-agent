@@ -20,13 +20,15 @@ class WorkingMemorySession:
     def __init__(self, agent, text, images, trace_id, *, isolated=False,
                  retention_class='standard'):
         self.agent = agent
+        self.isolated = isolated
         self.store = WorkingMemoryStore(agent.memory.database)
         self.workspace_id = (
             self.store.create(title='Temporäres Lernmaterial', retention_class=retention_class)
             if isolated else self.store.open(agent.conversation_id)
         )
         self.input = {'text': text, 'images': images, 'trace_id': trace_id}
-        from .scheduled_execution import scheduled_metadata
+        from .scheduled_execution import input_metadata, scheduled_metadata
+        self.input['input_metadata'] = input_metadata()
         execution = scheduled_metadata()
         if execution is not None:
             self.input['scheduled_execution'] = execution
@@ -60,7 +62,13 @@ class WorkingMemorySession:
     def entry(self):
         manifest = self.store.manifest(self.workspace_id, current_turn_id=self.turn_id)
         self._update_delta(manifest['checkpoint_reference'])
+        with self.store.database.connect(lifecycle_audit=False) as c:
+            latest = c.execute("SELECT id,status,request_id AS request_reference,answer_id AS model_answer_reference,"
+                "error_id AS error_reference FROM memory_work_turns WHERE workspace_id=? AND id!=? "
+                "AND status!='running' ORDER BY updated_at DESC,id DESC LIMIT 1",
+                (self.workspace_id, self.turn_id)).fetchone()
         return {**self.identity(), 'revision': manifest['revision'],
+                'latest_turn_outcome': dict(latest) if latest else None,
                 'checkpoint_reference': manifest['checkpoint_reference'],
                 **({'execution_delta_reference': self.delta_reference} if self.delta_reference else {}),
                 'uncertain_call_count': len(manifest['uncertain_calls']),
@@ -190,8 +198,13 @@ class WorkingMemorySession:
             if capability == 'eve_runtime' or (capability == 'working_memory' and operation not in {'read', 'inspect'}):
                 continue
             parameters = self.store.value(self.workspace_id, call['request_reference'])
-            outcome = (self.store.describe(self.workspace_id, call['result_reference'])['sha256']
-                       if capability != 'working_memory' else None)
+            result = self.store.value(self.workspace_id, call['result_reference'])
+            if capability == 'working_memory' and operation == 'read' and 'content' in result:
+                inputs.add(encoded([capability, operation,
+                    self.store.read_identity(self.workspace_id, parameters, result)]))
+                continue
+            from .result_identity import provider_evidence, value_digest
+            outcome = value_digest(provider_evidence(capability, operation, result)) if capability != 'working_memory' else None
             inputs.add(encoded([capability, operation, parameters, outcome]))
         return encoded([self.request['reference'], sorted(inputs)])
 
@@ -225,8 +238,10 @@ class WorkingMemorySession:
         if previous:
             evidence.add(previous)
         evidence.update(self.tool_refs[id(frame)]['reference'] for frame in messages if id(frame) in self.tool_refs)
+        # Historical sources are valid too. checkpoint() resolves exact IDs and
+        # observation aliases against the workspace inside the write transaction.
         schema['properties']['references'] = {'type': 'array', 'minItems': 1,
-            'items': {'type': 'string', 'enum': sorted(evidence)}}
+            'items': {'type': 'string', 'minLength': 1}}
         schema['required'] = ['state', 'expected_revision', 'references']
         tools = [{'type': 'function', 'function': {'name': 'working_memory__checkpoint',
                   'description': operation['description'] + ' Persistence only; do not continue the task in this call.',
@@ -235,6 +250,7 @@ class WorkingMemorySession:
             'reason': reason, 'expected_revision': revision,
             'request_reference': self.request['reference'],
             'previous_checkpoint_reference': self.entry()['checkpoint_reference'],
+            'available_source_references': sorted(evidence),
             **({'completion_reference': completion_reference} if completion_reference else {})}})}
         frames = [dict(message) for message in messages]
         clones = []
@@ -363,6 +379,12 @@ class WorkingMemorySession:
                 'transition': {'reason': self.reset_reason, 'prepared': True,
                                'requested_reset_completed': self.reset_reason == 'model_requested'},
                 'execution_journal_reference': self.journal_reference}
+        if getattr(self.agent, 'conversations', None) and self.agent.conversation_id:
+            data['conversation_assets'] = {'conversation_id': self.agent.conversation_id,
+                'access': 'conversation_assets.list',
+                'current_input_ids': [f'input:{index}' for index in range(len(self.input['images']))]}
+        if self.input.get('input_metadata'):
+            data.update(self.input['input_metadata'])
         if self.input.get('scheduled_execution') is not None:
             data['scheduled_execution'] = self.input['scheduled_execution']
         if self.checkpoint_capture is not None:
@@ -421,14 +443,14 @@ class WorkingMemorySession:
             return messages, tools, None
         if self.original_context is None:
             self.original_context = self.archive_frame(messages, kind='archived_context')
-        if not switched:
-            self.capture_checkpoint(messages, core_prompt, self.reset_reason if self.reset_requested else 'capacity')
         self._externalize_tools(messages, tools=tools)
         if not self._fits(messages, tools):
             self._defer_structures(messages)
         if not force and not self.reset_requested and self._fits(messages, tools):
             self._record_context(messages, 'original_results_referenced')
             return messages, tools, None
+        if not switched:
+            self.capture_checkpoint(messages, core_prompt, self.reset_reason if self.reset_requested else 'capacity')
         self.journal = self.store.calls(self.workspace_id)
         self.journal_reference = self.archive_frame(self.journal, kind='execution_journal')['reference']
         # A complete assistant/tool group is retained, never half an OpenAI call.
@@ -505,4 +527,6 @@ class WorkingMemorySession:
             self.store.finish_turn(self.workspace_id, self.turn_id, status, value)
             self.agent._working_memory_context = {**(self.agent._working_memory_context or self.identity()),
                 'activity': self.store.activity(self.workspace_id, turn_id=self.turn_id)}
+            if status in {'cancelled', 'failed'} and not self.isolated:
+                self.agent.conversations.preserve_interrupted_turn(self.turn_id)
             self.finished = True

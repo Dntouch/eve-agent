@@ -321,6 +321,8 @@ class OpenAICompatibleLLM:
         self.max_tokens = int(config.get("max_tokens", 180))
         self.use_server_limits = bool(config.get("use_server_limits", True))
         self.generation_max_tokens = None if self.use_server_limits else self.max_tokens
+        # An explicit setting overrides the individual call's legacy temperature.
+        self.temperature = config.get("temperature")
         configured_reasoning = config.get("reasoning_effort")
         self.reasoning_effort = (
             None if configured_reasoning in {None, "", "auto", "server"}
@@ -521,8 +523,6 @@ class OpenAICompatibleLLM:
             output, output_basis = self.generation_max_tokens, "configured"
         elif type(server_output) is int and server_output > 0:
             output, output_basis = server_output, "server_default"
-        elif self._observed_completion_tokens:
-            output, output_basis = self._observed_completion_tokens, "observed_completion_high_water"
         else:
             output, output_basis = None, "unknown"
         remaining = capacity - count - margin
@@ -1003,7 +1003,7 @@ class OpenAICompatibleLLM:
         payload = {
             "model": self.model,
             "messages": messages,
-            "temperature": temperature,
+            "temperature": self.temperature if self.temperature is not None else temperature,
             "stream": False,
         }
         if max_tokens is not None:
@@ -1135,7 +1135,7 @@ class OpenAICompatibleLLM:
             "messages": messages,
             "tools": tools,
             "tool_choice": tool_choice,
-            "temperature": temperature,
+            "temperature": self.temperature if self.temperature is not None else temperature,
             "stream": False,
         }
         if max_tokens is not None:
@@ -1274,7 +1274,7 @@ class OpenAICompatibleLLM:
             "messages": messages,
             "tools": tools,
             "tool_choice": tool_choice,
-            "temperature": temperature,
+            "temperature": self.temperature if self.temperature is not None else temperature,
             "stream": True,
             "stream_options": {"include_usage": True},
         }
@@ -1516,7 +1516,8 @@ class OpenAICompatibleLLM:
         effective_thinking = self.enable_thinking if enable_thinking is None else enable_thinking
         effective_reasoning = self.reasoning_effort if reasoning_effort is None else reasoning_effort
         request_payload = {
-            "model": self.model, "messages": messages, "temperature": temperature,
+            "model": self.model, "messages": messages,
+            "temperature": self.temperature if self.temperature is not None else temperature,
             "stream": True, "stream_options": {"include_usage": True},
         }
         if max_tokens is not None:

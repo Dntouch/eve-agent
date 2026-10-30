@@ -2,6 +2,7 @@ from __future__ import annotations
 import base64
 import html
 import ipaddress
+import io
 import json
 import re
 import socket
@@ -88,14 +89,15 @@ class WebResearch:
         self.image_results = min(max(int(config.get("image_results", 4)), 1), 8)
         self.max_image_bytes = 5 * 1024 * 1024
         self.max_page_bytes = int(config.get("max_page_bytes", 5_000_000))
+        self.max_pdf_bytes = int(config.get("max_pdf_bytes", 50 * 1024 * 1024))
 
     @staticmethod
     def self_descriptions():
         from .runtime_self_knowledge import RuntimeSelfDescription
         return [RuntimeSelfDescription(
             "web.research", "web.research",
-            "Ich kann das Web durchsuchen, öffentliche Seiten lesen und öffentliche Bilder beschaffen.",
-            "WebResearch", "search,read_urls,search_images",
+            "Ich kann das Web durchsuchen, öffentliche Webseiten und PDF-Texte lesen und öffentliche Bilder beschaffen.",
+            "WebResearch", "search,read_urls,read_pdf,search_images",
         )]
 
     @staticmethod
@@ -103,7 +105,7 @@ class WebResearch:
         """Publish the operations implemented by this provider itself."""
         return {
             "description": (
-                "Search public web sources, read supplied public URLs, or fetch public image results."
+                "Search public web sources, read supplied public URLs including PDF documents, or fetch public image results."
             ),
             "operations": {
                 "search": {
@@ -132,6 +134,7 @@ class WebResearch:
                 },
                 "read_urls": {
                     "effect": "read",
+                    "description": "Read public HTML, text or PDF URLs. PDF text includes page numbers; image-only scans have no extractable text.",
                     "parameters_schema": {
                         "type": "object", "additionalProperties": False,
                         "properties": {
@@ -141,6 +144,19 @@ class WebResearch:
                             },
                         },
                         "required": ["urls"],
+                    },
+                },
+                "read_pdf": {
+                    "effect": "read",
+                    "description": "Read text from a public PDF URL, optionally selecting exact one-based page numbers. Returns page count, page texts, empty-page information and source URL. Does not perform OCR.",
+                    "parameters_schema": {
+                        "type": "object", "additionalProperties": False,
+                        "properties": {
+                            "url": {"type": "string", "format": "uri"},
+                            "pages": {"type": "array", "minItems": 1,
+                                      "items": {"type": "integer", "minimum": 1}},
+                        },
+                        "required": ["url"],
                     },
                 },
                 "search_images": {
@@ -200,6 +216,18 @@ class WebResearch:
             context, sources, failures = self._read_urls(urls)
             return {"operation": kind, "context": context, "sources": sources,
                     "resources": [], "url_errors": failures}
+        if kind == 'read_pdf':
+            url = operation.get('url')
+            if not isinstance(url, str) or not url.strip():
+                raise ValueError('PDF-Abruf benötigt eine URL')
+            content_type, raw, _ = self._read_document(url)
+            if content_type != 'application/pdf' and not raw.lstrip().startswith(b'%PDF-'):
+                raise ValueError('Die URL liefert kein PDF-Dokument')
+            result = self._pdf_text(raw, pages=operation.get('pages'))
+            context = self._pdf_context(result)
+            return {**result, 'operation': kind, 'url': url, 'context': context,
+                    'sources': [{'title': result['title'] or urllib.parse.urlparse(url).hostname or url,
+                                 'url': url, 'snippet': context}], 'resources': []}
         if kind == "search_images":
             query = operation.get("query")
             if not isinstance(query, str) or not query.strip():
@@ -262,19 +290,68 @@ class WebResearch:
             raise WebNoResults("Die Websuche hat keine Ergebnisse geliefert")
         return "\n\n".join(sections), sources
 
-    def read_page(self, url: str) -> str:
+    def _read_document(self, url: str) -> tuple[str, bytes, str]:
         _assert_public_url(url)
         request = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (EVE Local Agent)"})
         with urllib.request.build_opener(_SafeRedirect()).open(request, timeout=self.timeout) as response:
             content_type = response.headers.get_content_type()
-            if content_type not in {"text/html", "text/plain", "application/xhtml+xml"}:
-                raise ValueError("Kein lesbares Textdokument")
-            raw = response.read(self.max_page_bytes + 1)
-            if len(raw) > self.max_page_bytes:
+            # Sniff the body too: download endpoints often label PDFs as binary.
+            prefix = response.read(min(1024, self.max_page_bytes + 1, self.max_pdf_bytes + 1))
+            is_pdf = content_type == "application/pdf" or prefix.lstrip().startswith(b"%PDF-")
+            limit = self.max_pdf_bytes if is_pdf else self.max_page_bytes
+            raw = prefix + response.read(max(0, limit + 1 - len(prefix)))
+            if len(raw) > limit:
+                kind = "Das PDF" if is_pdf else "Die Webseite"
                 raise RuntimeError(
-                    f"Die Webseite überschreitet die technische Abrufgröße von {self.max_page_bytes} Bytes"
+                    f"{kind} überschreitet die technische Abrufgröße von {limit} Bytes"
                 )
             charset = response.headers.get_content_charset() or "utf-8"
+        return content_type, raw, charset
+
+    @staticmethod
+    def _pdf_text(raw: bytes, *, pages=None) -> dict:
+        from pypdf import PdfReader
+        from pypdf.errors import PyPdfError
+        if pages is not None and (not isinstance(pages, list) or not pages
+                or any(type(page) is not int or page < 1 for page in pages)):
+            raise ValueError('pages muss positive, bei 1 beginnende Seitenzahlen enthalten')
+        try:
+            reader = PdfReader(io.BytesIO(raw))
+            if reader.is_encrypted and not reader.decrypt(''):
+                raise ValueError('Das PDF ist passwortgeschützt und kann ohne Passwort nicht gelesen werden')
+            count = len(reader.pages)
+            selected = list(dict.fromkeys(pages)) if pages is not None else list(range(1, count + 1))
+            if any(page > count for page in selected):
+                raise ValueError(f'Das PDF hat {count} Seiten; eine angeforderte Seite liegt außerhalb des Dokuments')
+            extracted = [{'page': number, 'text': (reader.pages[number - 1].extract_text() or '').strip()}
+                         for number in selected]
+            metadata = reader.metadata
+            title = str(metadata.title or '') if metadata else ''
+        except PyPdfError as exc:
+            raise ValueError(f'Das PDF konnte nicht gelesen werden: {exc}') from exc
+        return {'title': title, 'page_count': count, 'pages': extracted,
+                'empty_text_pages': [page['page'] for page in extracted if not page['text']],
+                'all_pages_selected': len(selected) == count,
+                'has_extractable_text': any(page['text'] for page in extracted),
+                'ocr_performed': False}
+
+    @staticmethod
+    def _pdf_context(result: dict) -> str:
+        sections = [f"PDF · {result['page_count']} Seiten"]
+        for page in result['pages']:
+            sections.append(f"[Seite {page['page']}]\n" + (page['text'] or
+                '[Kein auslesbarer Text auf dieser Seite; Bild-/Scaninhalt wird nicht per OCR gelesen.]'))
+        return '\n\n'.join(sections)
+
+    def read_page(self, url: str) -> str:
+        content_type, raw, charset = self._read_document(url)
+        if content_type == 'application/pdf' or raw.lstrip().startswith(b'%PDF-'):
+            result = self._pdf_text(raw)
+            if not any(page['text'] for page in result['pages']):
+                raise ValueError('Das PDF enthält keinen auslesbaren Text; Bild-/Scanseiten benötigen OCR')
+            return self._pdf_context(result)
+        if content_type not in {"text/html", "text/plain", "application/xhtml+xml"}:
+            raise ValueError("Kein lesbares Textdokument")
         text = raw.decode(charset, errors="replace")
         if content_type == "text/plain":
             text = text.strip()

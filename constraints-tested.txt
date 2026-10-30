@@ -23,6 +23,7 @@ onnxruntime==1.31.0 ; python_version == "3.14" and sys_platform == "linux" and p
 packaging==26.3 ; python_version == "3.14" and sys_platform == "linux" and platform_machine == "x86_64"
 pathvalidate==3.3.1 ; python_version == "3.14" and sys_platform == "linux" and platform_machine == "x86_64"
 piper-tts==1.8.0 ; python_version == "3.14" and sys_platform == "linux" and platform_machine == "x86_64"
+pypdf==6.21.4 ; python_version == "3.14" and sys_platform == "linux" and platform_machine == "x86_64"
 protobuf==7.36.2 ; python_version == "3.14" and sys_platform == "linux" and platform_machine == "x86_64"
 pycparser==3.12 ; python_version == "3.14" and sys_platform == "linux" and platform_machine == "x86_64"
 pyyaml==6.0.3 ; python_version == "3.14" and sys_platform == "linux" and platform_machine == "x86_64"

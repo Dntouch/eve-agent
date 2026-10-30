@@ -11,6 +11,19 @@ from eve_agent.llm import OpenAICompatibleLLM
 
 
 class ConfigurationTest(unittest.TestCase):
+    def test_optional_llm_temperature_is_loaded_and_validated(self):
+        with tempfile.TemporaryDirectory() as directory:
+            for value in (None, 0, 1.0, 2):
+                with self.subTest(value=value):
+                    path = self.write_config(Path(directory), {"llm": {"temperature": value}})
+                    config = load_config(path, environ={})[1]
+                    self.assertEqual(value, OpenAICompatibleLLM(config["llm"]).temperature)
+            for value in (True, "1", -0.1, 2.1, float("nan"), float("inf")):
+                with self.subTest(value=value):
+                    path = self.write_config(Path(directory), {"llm": {"temperature": value}})
+                    with self.assertRaises(ConfigError):
+                        load_config(path, environ={})
+
     def test_page_fetch_limit_is_defaulted_editable_and_bounded(self):
         with tempfile.TemporaryDirectory() as directory:
             path = self.write_config(Path(directory), {})
@@ -20,6 +33,19 @@ class ConfigurationTest(unittest.TestCase):
             for value in (0, 20_000_001):
                 with self.subTest(value=value), self.assertRaises(ConfigError):
                     update_editable_config(path, {"values": {"web.max_page_bytes": value}}, environ={})
+
+    def test_pdf_fetch_limit_is_separate_defaulted_editable_and_bounded(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = self.write_config(Path(directory), {"web": {"max_page_bytes": 5_000_000}})
+            self.assertEqual(50 * 1024 * 1024, load_config(path, environ={})[1]["web"]["max_pdf_bytes"])
+            for value in (750_000, 100 * 1024 * 1024, 200 * 1024 * 1024):
+                update_editable_config(path, {"values": {"web.max_pdf_bytes": value}}, environ={})
+                config = load_config(path, environ={})[1]["web"]
+                self.assertEqual(value, config["max_pdf_bytes"])
+                self.assertEqual(5_000_000, config["max_page_bytes"])
+            for value in (True, "50000000", 0, 200 * 1024 * 1024 + 1):
+                with self.subTest(value=value), self.assertRaises(ConfigError):
+                    update_editable_config(path, {"values": {"web.max_pdf_bytes": value}}, environ={})
 
     def test_external_mcp_is_portable_editable_and_channel_access_is_explicit(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -297,12 +297,34 @@ class WorkingMemoryStore:
                 {'reference': reference, 'requested_pointer': pointer, 'items': self.structure(original),
                  'array_elements_expanded': False, **self.pointer_diagnostic(original, pointer)}) from exc
 
+    def read_identity(self, workspace_id, parameters, result):
+        """Follow recorded read receipts to their immutable source, then hash the selection."""
+        from .result_identity import selected_evidence, value_digest
+        reference = self.describe(workspace_id, parameters['reference'])['reference']
+        visited = set()
+        with self.database.connect(lifecycle_audit=False) as c:
+            while reference not in visited:
+                visited.add(reference)
+                row = c.execute("SELECT v.structured_value_json FROM memory_work_calls t "
+                    "JOIN memory_work_objects o ON o.id=t.request_id "
+                    "JOIN memory_observations v ON v.id=o.observation_id "
+                    "WHERE t.workspace_id=? AND t.result_id=? AND t.capability='working_memory' AND t.operation='read'",
+                    (workspace_id, reference)).fetchone()
+                if row is None:
+                    break
+                parent = json.loads(row[0]).get('reference')
+                if not parent:
+                    break
+                reference = self.describe(workspace_id, parent)['reference']
+        return reference, value_digest(selected_evidence(result))
+
     def retrieval_observation(self, workspace_id, operation, parameters):
         """Exact repeats on immutable material, independent of names or task meaning."""
         canonical = lambda value: json.dumps(value, sort_keys=True, separators=(',', ':'))
         with self.database.connect(lifecycle_audit=False) as c:
-            rows = c.execute("SELECT v.structured_value_json FROM memory_work_calls t "
+            rows = c.execute("SELECT v.structured_value_json,rv.structured_value_json AS result_json FROM memory_work_calls t "
                 "JOIN memory_work_objects o ON o.id=t.request_id JOIN memory_observations v ON v.id=o.observation_id "
+                "LEFT JOIN memory_work_objects ro ON ro.id=t.result_id LEFT JOIN memory_observations rv ON rv.id=ro.observation_id "
                 "WHERE t.workspace_id=? AND t.capability='working_memory' AND t.operation=? AND t.status='returned'",
                 (workspace_id, operation)).fetchall()
         # Normalize only documented structural defaults, never field meanings.
@@ -310,15 +332,31 @@ class WorkingMemoryStore:
             return {**{'pointer': '', 'offset': 0, 'limit': None, 'fields': None, 'where': None, 'filters': [], 'as_image': False}, **p}
         repeated = sum(canonical(selection(json.loads(r[0]))) == canonical(selection(parameters)) for r in rows)
         description = self.describe(workspace_id, parameters['reference'])
+        content = {}
+        if operation == 'read':
+            selected = self.read(workspace_id, **{k: v for k, v in parameters.items() if k != 'as_image'})
+            identity = self.read_identity(workspace_id, parameters, selected)
+            same_content = 0
+            for row in rows:
+                prior = json.loads(row['result_json'] or '{}')
+                if 'content' not in prior:
+                    continue
+                try:
+                    same_content += self.read_identity(workspace_id, json.loads(row[0]), prior) == identity
+                except KeyError:
+                    continue
+            content = {'origin_reference': identity[0], 'selected_content_sha256': identity[1],
+                       'previous_identical_content_reads': same_content, 'task_progress_assessed': False}
         return {'previous_identical_selections': repeated, 'original_is_immutable': True,
                 'source_kind': description['kind'], 'source_reference': parameters['reference'],
-                'source_sha256': description['sha256']}
+                'source_sha256': description['sha256'], **content}
 
     def activity(self, workspace_id, *, turn_id=None):
         """Technical counters and last call; not a judgement of task progress."""
         with self.database.connect(lifecycle_audit=False) as c:
-            rows = c.execute('SELECT t.*,v.structured_value_json AS parameters FROM memory_work_calls t '
+            rows = c.execute('SELECT t.*,v.structured_value_json AS parameters,rv.structured_value_json AS result_json FROM memory_work_calls t '
                 'JOIN memory_work_objects o ON o.id=t.request_id JOIN memory_observations v ON v.id=o.observation_id '
+                'LEFT JOIN memory_work_objects ro ON ro.id=t.result_id LEFT JOIN memory_observations rv ON rv.id=ro.observation_id '
                 'WHERE t.workspace_id=?' + (' AND t.turn_id=?' if turn_id else '') + ' ORDER BY t.created_at,t.id',
                 (workspace_id, turn_id) if turn_id else (workspace_id,)).fetchall()
             resets = c.execute("SELECT count(*) FROM memory_work_contexts WHERE workspace_id=? AND reason='fresh_context'"
@@ -336,18 +374,36 @@ class WorkingMemoryStore:
                     checkpoint = historical[0] if historical else None
         counts, selections = {}, set()
         repeated = 0
+        contents, repeated_contents = set(), 0
+        returned_results, repeated_results = set(), 0
         last = None
         for row in rows:
             key = row['capability'] + '.' + row['operation']
             counts[key] = counts.get(key, 0) + 1
             parameters = json.loads(row['parameters'])
+            result = json.loads(row['result_json'] or '{}')
+            if row['status'] == 'returned' and isinstance(result, dict) and row['capability'] != 'eve_runtime':
+                from .result_identity import provider_evidence, value_digest
+                identity = (row['capability'], row['operation'],
+                            value_digest(provider_evidence(row['capability'], row['operation'], result)))
+                repeated_results += identity in returned_results
+                returned_results.add(identity)
             last = {'capability': row['capability'], 'operation': row['operation'], 'status': row['status'],
                     'request_reference': row['request_id'], 'result_reference': row['result_id']}
             if row['capability'] == 'working_memory' and row['operation'] in {'read', 'inspect'} and row['status'] == 'returned':
                 selection = (row['operation'], json.dumps(parameters, sort_keys=True, separators=(',', ':')))
                 repeated += selection in selections
                 selections.add(selection)
+                if row['operation'] == 'read' and 'content' in result:
+                    try:
+                        identity = self.read_identity(workspace_id, parameters, result)
+                    except KeyError:
+                        continue
+                    repeated_contents += identity in contents
+                    contents.add(identity)
         return {'tool_calls': len(rows), 'operations': counts, 'repeated_material_selections': repeated,
+                'repeated_content_reads': repeated_contents,
+                'repeated_returned_results': repeated_results,
                 'distinct_material_selections': len(selections), 'fresh_contexts': resets,
                 'checkpoint_reference': checkpoint, 'checkpoint_missing': checkpoint is None,
                 'task_progress_assessed': False, 'last_call': last}

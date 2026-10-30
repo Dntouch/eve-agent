@@ -24,7 +24,7 @@ function outputFile(resource, index) {
 }
 
 export async function postAnswer(uploadApi, messageApi, destination, text, resources = [], signal) {
-  const outputs = resources.filter(r => r.type === 'image' || r.type === 'file');
+  const outputs = resources.filter(r => ['image', 'file', 'attachment'].includes(r.type));
   if (outputs.filter(r => r.type === 'image').length > 4 || outputs.length > 8) throw new Error('Too many EVE output attachments');
   const files = outputs.map(outputFile);
   const options = { signal, timeoutMs: 30000 };
@@ -44,7 +44,7 @@ export async function postAnswer(uploadApi, messageApi, destination, text, resou
         await uploadApi.uploadChunk({ uploadId, offset: BigInt(offset), content: chunk, chunkSha256: hash(chunk) }, options);
       }
       const completed = await uploadApi.completeUpload({ uploadId }, options);
-      if (!completed.asset?.id) throw new Error('Chatto image asset missing');
+      if (!completed.asset?.id) throw new Error('Chatto attachment asset missing');
       assets.push(completed.asset.id);
     } catch (error) {
       if (uploadId) await uploadApi.cancelUpload({ uploadId }, { timeoutMs: 3000 }).catch(() => {});

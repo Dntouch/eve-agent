@@ -205,7 +205,8 @@ class NativeToolRuntime:
                 "name": "eve__load_capabilities",
                 "description": (
                     "Load the full native function contracts for the capabilities "
-                    "you choose. Call this before using a provider."
+                    "you choose. Call this before using a provider. Capability names "
+                    "are not function names; use the exact published function names after loading."
                 ),
                 "parameters": schema,
             },
@@ -246,6 +247,9 @@ class NativeToolRuntime:
         a = self.agent
         state = state or {}
         capabilities = {}
+        if a.conversations and a.conversation_id:
+            from .conversation_assets import ConversationAssets
+            capabilities['conversation_assets'] = ConversationAssets.contract(materialize=capability_allowed('shell'))
         inbox = getattr(a, "assist_events", None)
         if inbox is not None:
             capabilities["assist_events"] = inbox.minimal_contract()
@@ -509,11 +513,10 @@ class NativeToolRuntime:
             return None
         response = result.get("response") if isinstance(result.get("response"), dict) else {}
         status = result.get("status")
+        from .result_identity import provider_evidence, value_digest
         if status in {None, "completed", "success", "returned", "accepted"}:
-            response_fingerprint = hashlib.sha256(json.dumps(
-                NativeToolRuntime._safe_prompt_result(response if isinstance(result.get("response"), dict) else result),
-                sort_keys=True, separators=(",", ":"), default=str,
-            ).encode("utf-8")).hexdigest()
+            response_fingerprint = value_digest(NativeToolRuntime._safe_prompt_result(
+                provider_evidence(capability, operation, result)))
             fingerprint = json.dumps({
                 "capability": capability, "operation": operation,
                 "status": result.get("status"),
@@ -527,9 +530,10 @@ class NativeToolRuntime:
                 "kind": "repeated_provider_result",
                 "equivalent_results": responses[fingerprint],
                 "new_provider_evidence": False,
+                "task_progress_assessed": False,
                 "message": (
-                    "The native provider returned the same result again. This attempt added no "
-                    "technical evidence; reconsider or research the interface before another variant."
+                    "The returned content is identical to an earlier result. "
+                    "Receipt IDs are excluded where the provider contract defines them as transport metadata."
                 ),
             }
         if status not in {"error", "failed", "rejected"}:
@@ -539,6 +543,8 @@ class NativeToolRuntime:
             "status": result.get("status"), "error_class": result.get("error_class"),
             "provider_status": response.get("status"),
             "provider_error_type": response.get("type"),
+            **({'result_digest': value_digest(provider_evidence(capability, operation, result))}
+               if capability == 'shell' else {}),
         }, sort_keys=True, separators=(",", ":"), default=str)
         failures = state.setdefault("provider_failure_counts", {})
         failures[fingerprint] = failures.get(fingerprint, 0) + 1
@@ -548,9 +554,9 @@ class NativeToolRuntime:
             "kind": "repeated_provider_failure",
             "equivalent_failures": failures[fingerprint],
             "new_provider_evidence": False,
+            "task_progress_assessed": False,
             "message": (
-                "Equivalent native provider attempts keep failing. Reconsider the interface "
-                "or research its official documentation before another variant."
+                "The provider has returned an equivalent failure before."
             ),
         }
 
@@ -737,6 +743,9 @@ class NativeToolRuntime:
             return a.assist_events.execute_operation(operation, parameters), Route.CHAT
         if capability == "working_memory":
             return self.working_session.execute(operation, parameters), Route.MEMORY
+        if capability == 'conversation_assets':
+            from .conversation_assets import ConversationAssets
+            return ConversationAssets(a.conversations, a.conversation_id, images).execute(operation, parameters), Route.CHAT
         if capability == "home_assistant":
             from .transient_credentials import contains_credentials, resolve_credentials
             result = a.home_assistant.execute_native_operation(operation, resolve_credentials(parameters))
@@ -1047,6 +1056,10 @@ class NativeToolRuntime:
                 "complete_inventory": False,
             },
         }
+        if a.conversations and a.conversation_id:
+            context['conversation_assets'] = {'conversation_id': a.conversation_id,
+                'access': 'conversation_assets.list',
+                'current_input_ids': [f'input:{index}' for index in range(len(images))]}
         if execution is not None:
             context["scheduled_execution"] = execution
         elif transport_metadata() is not None:
@@ -1145,8 +1158,6 @@ class NativeToolRuntime:
                 answer = str(message.get("content") or "").strip()
                 if not answer:
                     raise RuntimeError("The model returned neither an answer nor a tool call")
-                if self.working_session and self.working_session.last_checkpoint_signature is not None:
-                    self.working_session.capture_checkpoint(messages, turn_prompt, 'turn_complete', completion=answer)
                 result = {
                     "status": "success", "summary": answer,
                     "provider_results": deepcopy(completed_results),
@@ -1191,7 +1202,21 @@ class NativeToolRuntime:
                         binding["effect"] if binding else "unknown", parameters,
                     )
                 if binding is None:
-                    result = {"status": "rejected", "error": "unpublished_tool"}
+                    result = {
+                        "status": "rejected", "error": "unpublished_tool",
+                        "requested_function": name,
+                        "provider_called": False,
+                        "permission_denied": False,
+                        "message": (
+                            "This function name is not published in the current tool list. "
+                            "No provider was called; this is not a service failure or a permission denial. "
+                            "Load the needed capability with eve__load_capabilities, then call "
+                            "its exact published function name to continue the user's request."
+                        ),
+                        "available_capabilities": list(capabilities),
+                        "published_functions": list(bindings),
+                        "capability_loader": "eve__load_capabilities",
+                    }
                     capability = "unknown"
                     operation = name
                 else:

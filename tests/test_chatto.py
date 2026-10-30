@@ -107,6 +107,33 @@ class ChattoTest(unittest.TestCase):
         response = self.api.conversation({**created, 'context': self.context, 'text': 'Datei'})
         self.assertEqual(response['resources'], [file])
 
+    def test_local_pdf_and_generated_downloads_reach_chatto_output(self):
+        from eve_agent.local_files import LocalFileReader
+        from eve_agent.artifacts import extract_artifacts
+        pdf = self.root / 'Anleitung.pdf'
+        pdf.write_bytes(b'%PDF-1.7\nexample')
+        resource = LocalFileReader(lambda: [str(self.root)]).open_resource(str(pdf))
+        _, artifacts = extract_artifacts('```python filename=hello.py\nprint("ok")\n```')
+        created = self.api.create_conversation({'context': self.context})
+        self.handler.return_value.update(resources=[resource], artifacts=artifacts)
+        response = self.api.conversation({**created, 'context': self.context, 'text': 'Dateien'})
+        self.assertEqual(['Anleitung.pdf', 'hello.py'], [r['filename'] for r in response['resources']])
+        self.assertTrue(all(r['type'] == 'file' and 'path' not in r for r in response['resources']))
+
+    def test_legacy_attachment_survives_new_thread_copy_and_is_returned_as_file(self):
+        from eve_agent.transport_access import report_transport_activity
+        created = self.api.create_conversation({'context': self.context})
+        resource = {'type': 'attachment', 'filename': 'manual.pdf',
+                    'content': 'data:application/pdf;base64,cGRm', 'media_type': 'application/pdf'}
+        def answer(*args):
+            report_transport_activity({'integration': 'Files', 'reply_mode': 'thread'})
+            return {'answer': 'Datei', 'conversation_id': args[2], 'turn_id': 'file-turn', 'resources': [resource]}
+        self.handler.side_effect = answer
+        result = self.api.conversation({**created, 'context': self.context, 'text': 'Datei'})
+        self.assertEqual([{**resource, 'type': 'file'}], result['resources'])
+        history = self.store.messages(result['conversation_id'])['messages']
+        self.assertEqual('application/pdf', history[1]['attachments'][0]['media_type'])
+
     def test_web_list_filters_only_member_dms_before_pagination(self):
         self.api.configure({**self.config, "member_dm_enabled": True})
         channel = self.api.create_conversation({"context": self.context})["conversation_id"]
@@ -242,6 +269,16 @@ class ChattoTest(unittest.TestCase):
             request({'context': self.context}, 'assist-token')
         self.assertEqual(error.exception.code, 401)
         error.exception.close()
+        with self.assertRaises(urllib.error.HTTPError) as error:
+            request({}, 'assist-token', 'presence-activity')
+        self.assertEqual(error.exception.code, 401)
+        error.exception.close()
+        self.api.work_activity = Mock(return_value=True)
+        with request({}, 'bridge-only', 'presence-activity') as response:
+            self.assertEqual(json.load(response), {'working': True})
+        self.api.work_activity.return_value = False
+        with request({}, 'bridge-only', 'presence-activity') as response:
+            self.assertEqual(json.load(response), {'working': False})
         with request({'context': self.context}, 'bridge-only') as response:
             self.assertEqual(response.status, 201)
             identifier = json.load(response)['conversation_id']

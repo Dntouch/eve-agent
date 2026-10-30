@@ -10,6 +10,7 @@
   <link rel="apple-touch-icon" sizes="180x180" href="assets/apple-touch-icon.png">
   <link rel="manifest" href="manifest.webmanifest">
   <link rel="stylesheet" href="styles.css?v=20261028-scheduled-origin1">
+  <link rel="stylesheet" href="service-link.css?v=2">
   <title>EVE // Living Signal</title>
 </head>
 <body data-state="idle">
@@ -30,6 +31,7 @@
     </div>
     <div class="system-meta">
       <span id="connection">LOCAL // CONNECTING</span>
+      <a id="openServices" class="service-link" href="services/index.html" target="_blank" rel="noopener" data-status="unknown" aria-label="Dienststatus und Steuerung öffnen">Dienste · prüfen …</a>
       <time id="clock" aria-label="Lokale Uhrzeit">--:--</time>
       <div class="system-menu-wrap">
         <button class="system-menu-toggle eve-icon-button" id="systemMenuToggle" type="button" aria-controls="systemMenu" aria-expanded="false" aria-label="EVE-Menü öffnen">
@@ -556,5 +558,6 @@
   <script src="vendor/html2canvas.min.js" defer></script>
   <script src="chat-export.js" defer></script>
   <script src="app.js?v=20261028-scheduled-origin1" defer></script>
+  <script src="service-link.js?v=2" defer></script>
 </body>
 </html>

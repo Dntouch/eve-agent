@@ -16,6 +16,34 @@ EXTENSIONS = {
 }
 
 
+def output_resources(resources, artifacts=()) -> list[dict]:
+    """Normalize inline response attachments without resolving paths or URLs."""
+    outputs, seen = [], set()
+    candidates = list(resources)
+    for artifact in artifacts:
+        if isinstance(artifact, dict) and isinstance(artifact.get("base64"), str):
+            candidates.append({
+                "type": "file", "filename": artifact.get("filename") or "eve-download.bin",
+                "media_type": artifact.get("mime") or "application/octet-stream",
+                "content": f"data:{artifact.get('mime') or 'application/octet-stream'};base64,{artifact['base64']}",
+            })
+    for resource in candidates:
+        if not isinstance(resource, dict):
+            continue
+        kind, content = resource.get("type"), resource.get("content")
+        if kind not in {"image", "file", "attachment"} or not isinstance(content, str):
+            continue
+        if not content.startswith("data:image/" if kind == "image" else "data:"):
+            continue
+        clean = {key: resource[key] for key in ("content", "filename", "media_type") if key in resource}
+        clean["type"] = "image" if kind == "image" else "file"
+        identity = (clean["type"], content, clean.get("filename") or "eve-download.bin")
+        if identity not in seen:
+            outputs.append(clean)
+            seen.add(identity)
+    return outputs
+
+
 def extract_artifacts(answer: str, request: str = "") -> tuple[str, list[dict[str, str]]]:
     matches = list(FENCE.finditer(answer))
     if not matches:
