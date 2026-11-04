@@ -8,6 +8,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock
 
 from eve_agent.shadow_learning import ProductiveLearningPipeline
+from eve_agent.conversation_learning import ConversationLearningCoordinator
 from eve_agent.storage import EveDatabase, ConversationStore
 
 
@@ -82,6 +83,36 @@ class LearningReviewTest(unittest.TestCase):
         finally:
             self.pipeline._evaluation_lock.release()
             worker.join(2)
+
+    def test_targeted_retry_reopens_review_atomically_and_preserves_its_history(self):
+        self.failed('selected'); self.failed('untouched')
+        self.pipeline.review_turn('selected', 'Originale Prüfnotiz')
+        coordinator = ConversationLearningCoordinator(self.database, self.pipeline,
+            {'enabled': True}, autostart=False)
+        self.addCleanup(coordinator.close)
+        result = coordinator.retry_turn('selected')
+        self.assertEqual({'turn_id': 'selected', 'status': 'pending'}, result['retry'])
+        self.assertEqual(1, result['pending'])
+        self.assertEqual(1, result['failed'])
+        self.assertFalse(result['pause_requested'])
+        self.assertEqual(['selected'], self.pipeline.queued_turns(40))
+        with self.database.connect() as c:
+            job = c.execute("SELECT status,reviewed_at,review_note,error_class FROM memory_learning_jobs WHERE turn_id='selected'").fetchone()
+            self.assertEqual(('pending', None, '', None), tuple(job))
+            event = c.execute("SELECT actor,details_json FROM audit_events WHERE event_type='learning_review_reopened'").fetchone()
+            self.assertEqual('user', event['actor'])
+            self.assertEqual('Originale Prüfnotiz', json.loads(event['details_json'])['previous_review_note'])
+            self.assertEqual(0, c.execute('SELECT count(*) FROM memory_claims').fetchone()[0])
+        self.llm.analyze_conversation_learning.assert_not_called()
+
+    def test_targeted_retry_rejects_changed_or_missing_jobs_without_touching_others(self):
+        self.failed('failed'); self.failed('changed')
+        with self.database.connect() as c:
+            c.execute("UPDATE memory_learning_jobs SET status='pending' WHERE turn_id='changed'")
+        for turn in ['changed', 'missing', '', None, 5]:
+            with self.subTest(turn=turn), self.assertRaises(ValueError):
+                self.pipeline.retry_turn(turn, reopen_review=True)
+        self.assertEqual(1, self.pipeline.learning_jobs('failed')['total'])
 
     def test_only_existing_failed_jobs_can_be_reviewed(self):
         self.failed('turn')

@@ -10,6 +10,26 @@ from eve_agent.storage import EveDatabase
 
 
 class ScheduledTasksTest(unittest.TestCase):
+    def test_task_paused_after_due_list_was_read_is_not_executed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            scheduler = self.make_scheduler(Path(tmp))
+            first = self.create(scheduler, 'Erster Check')['result']
+            second = self.create(scheduler, 'Zweiter Check')['result']
+            now = datetime.now(timezone.utc)
+            with scheduler.database.connect() as c:
+                for task, seconds in ((first, 2), (second, 1)):
+                    c.execute('UPDATE scheduled_tasks SET next_run_at=? WHERE id=?',
+                              ((now - timedelta(seconds=seconds)).isoformat(), task['id']))
+            executed = []
+            def execute(action):
+                executed.append(action['task_id'])
+                scheduler.update_task(second['id'], {'status': 'paused'})
+                return {'outcome': 'no_change', 'reason': 'Keine Änderung'}
+            scheduler.register_executor('eve_turn', execute)
+            scheduler.pop_due()
+            self.assertEqual([first['id']], executed)
+            self.assertEqual('paused', scheduler.get_task(second['id'])['status'])
+
     def test_end_date_roundtrip_edit_and_removal(self):
         with tempfile.TemporaryDirectory() as tmp:
             scheduler = self.make_scheduler(Path(tmp))

@@ -34,23 +34,26 @@ test('only owner text DMs are accepted', () => {
 test('conversation survives restart and duplicate deliveries never re-execute actions', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'eve-chatto-'));
   let state = new ChattoState(join(dir, 'state.sqlite'));
-  let turns = 0, creates = 0, replies = 0;
+  let turns = 0, creates = 0;
   const eve = async (path, payload) => {
     if (path === '/api/chatto/conversations') {
       assert.equal(payload.context.room_kind, 'dm');
       creates++; return { conversation_id: 'eve-1' };
     }
-    turns++; assert.equal(payload.conversation_id, 'eve-1'); return { answer: 'Hallo!' };
+    assert.equal(path, '/api/chatto/submit');
+    turns++; assert.equal(payload.conversation_id, 'eve-1'); return { id: 'chatto-job:' + turns, state: 'queued' };
   };
-  const ctx = { message, transport: { room_kind: 'dm' }, conversationKey: 'thread1', withTyping: fn => fn(), reply: async () => { replies++; } };
+  const ctx = { message, transport: { room_kind: 'dm' }, conversationKey: 'thread1', withTyping: fn => fn(),
+    reply: async () => assert.fail('Answers are delivered independently') };
   try {
     await handleMessage(ctx, 'owner', state, eve);
     state.close(); state = new ChattoState(join(dir, 'state.sqlite'));
     await handleMessage(ctx, 'owner', state, eve);
     await handleMessage({ ...ctx, message: { ...message, id: 'm2' } }, 'owner', state, eve);
-    assert.deepEqual([creates, turns, replies], [1, 2, 2]);
-    const broken = { ...ctx, message: { ...message, id: 'm3' }, reply: async () => { throw Error('uncertain send'); } };
-    await assert.rejects(handleMessage(broken, 'owner', state, eve));
+    assert.deepEqual([creates, turns], [1, 2]);
+    assert.equal(state.db.prepare('SELECT status FROM deliveries WHERE id=?').get('m2').status, 'accepted');
+    const broken = { ...ctx, message: { ...message, id: 'm3' } };
+    await assert.rejects(handleMessage(broken, 'owner', state, async () => { turns++; throw Error('acceptance unknown'); }));
     await handleMessage(broken, 'owner', state, eve);
     assert.equal(turns, 3);
     assert.equal(state.db.prepare('SELECT status FROM deliveries WHERE id = ?').get('m3').status, 'uncertain');
@@ -77,15 +80,18 @@ test('silent observations never type, reply, fetch images or request an answer',
     assert.equal(state.db.prepare('SELECT status FROM deliveries').get().status, 'observed');
   } finally { state.close(); }
 });
-test('validated member DMs use the existing reply and image path', async () => {
+test('validated member DMs submit work without waiting for a reply', async () => {
   const state = new ChattoState(':memory:');
-  let replied = 0;
+  let submitted = 0;
   try {
     const ctx = { message: { ...message, authorId: 'member' },
       transport: { room_kind: 'dm', access_profile: 'member_dm' }, conversationKey: 'member-private',
-      withTyping: fn => fn(), reply: async text => { assert.equal(text, 'Hallo'); replied++; } };
-    await handleMessage(ctx, 'owner', state, async path =>
-      path === '/api/chatto/conversations' ? { conversation_id: 'member-c' } : { answer: 'Hallo' });
-    assert.equal(replied, 1);
+      withTyping: fn => fn(), reply: async () => assert.fail('Direct reply') };
+    await handleMessage(ctx, 'owner', state, async path => {
+      if (path === '/api/chatto/conversations') return { conversation_id: 'member-c' };
+      assert.equal(path, '/api/chatto/submit'); submitted++;
+      return { id: 'chatto-job:member', state: 'queued' };
+    });
+    assert.equal(submitted, 1);
   } finally { state.close(); }
 });

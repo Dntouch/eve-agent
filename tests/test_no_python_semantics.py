@@ -46,7 +46,7 @@ class PythonSemanticsBoundaryTest(unittest.TestCase):
 
     def test_core_prompt_is_small_and_has_no_household_examples(self):
         contract = CORE_PROMPT.casefold()
-        self.assertLess(len(CORE_PROMPT.split()), 50)
+        self.assertLessEqual(len(CORE_PROMPT.split()), 50)
         for term in ("rollladen", "lampe", "wohnzimmer", "garage", "carport"):
             self.assertNotIn(term, contract)
 

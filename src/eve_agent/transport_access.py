@@ -34,7 +34,7 @@ def require_capability(name):
         raise PermissionError(f"Capability {name} is not permitted in this conversation")
 
 
-def report_transport_activity(event):
+def report_transport_activity(event: dict[str, object]) -> None:
     current = _access.get()
     if current and callable(current.get("activity")):
         current["activity"](deepcopy(event))

@@ -497,6 +497,14 @@ def main(argv: list[str] | None = None) -> int:
                 text_stream_end_ms=None if stream_end_ms is None else round(stream_end_ms, 2),
             )
         answer = result.answer
+        if getattr(result, "outcome", "answer") == "no_change":
+            bus.set("idle")
+            telemetry.finish(status="success", details={"outcome": "no_change"})
+            return {
+                "outcome": "no_change", "reason": result.outcome_reason,
+                "turn_id": result.turn_id, "conversation_id": result.conversation_id,
+                "answer": "", "resources": [], "assistant_message_id": None,
+            }
         print(f"EVE> {answer}")
         answer_ready_ms = telemetry.elapsed_ms()
         telemetry.summary(answer_ready_ms=None if answer_ready_ms is None else round(answer_ready_ms, 2))
@@ -800,7 +808,9 @@ def main(argv: list[str] | None = None) -> int:
                 from .scheduled_execution import scheduled_execution, ensure_scheduled_deadline
                 ensure_scheduled_deadline(action)
                 context = action.get("execution_context")
-                with scheduled_execution(action), (chatto_bridge.scheduled_access(context) if context else nullcontext()):
+                activity_stream = (llm.stream_answers(lambda _chunk: None)
+                                   if (action.get("output_target") or {}).get("transport") == "chatto" else nullcontext())
+                with scheduled_execution(action), chatto_bridge.scheduled_access(context), activity_stream:
                     response = browser_response(request, conversation_id=conversation_id)
             except Exception as exc:
                 remember_turn_failure(exc, text=request, conversation_id=conversation_id)
@@ -816,6 +826,11 @@ def main(argv: list[str] | None = None) -> int:
                     agent.prepare_conversation_view(previous_conversation_id)
         target = action.get("output_target") or {}
         output_conversation = response.get("conversation_id")
+        if response.get("outcome") == "no_change":
+            return {
+                "outcome": "no_change", "reason": response.get("reason"), "resources": [],
+                "turn": {"turn_id": response.get("turn_id"), "conversation_id": output_conversation},
+            }
         if target.get("transport") == "eve" and target.get("conversation_id") and target["conversation_id"] != output_conversation:
             output_conversation = target["conversation_id"]
             conversations.get(output_conversation)
@@ -890,8 +905,9 @@ def main(argv: list[str] | None = None) -> int:
         backend_turn_id: str | None = None, cancellation=None,
         on_preview=None, on_preview_reset=None,
         early_tts: StreamingTTSPipeline | None = None, synthesize_audio: bool = True,
+        wait_for_slot: bool = False,
     ) -> dict:
-        if not turn_lock.acquire(blocking=False):
+        if not turn_lock.acquire(blocking=wait_for_slot):
             raise RuntimeError("EVE verarbeitet bereits eine Eingabe")
         try:
             telemetry.start(
@@ -1568,6 +1584,8 @@ def main(argv: list[str] | None = None) -> int:
                 return conversation_learning.run_now()
             if action == "retry_failed":
                 return conversation_learning.retry_failed()
+            if action == "retry_turn":
+                return conversation_learning.retry_turn(query.get("turn_id"))
             if action in {"review", "reopen_review"}:
                 result = conversation_learning.pipeline.review_turn(
                     query.get("turn_id"), query.get("note", ""), reopen=action == "reopen_review")
@@ -1777,9 +1795,13 @@ def main(argv: list[str] | None = None) -> int:
     from .assist_api import AssistAPI
     from .chatto import ChattoAPI, ChattoProcess
     chatto_process = ChattoProcess(root, cfg)
+    def chatto_message(text, images, identifier):
+        # Observe real content deltas for WRITING while retaining final delivery.
+        with llm.stream_answers(lambda _chunk: None):
+            return browser_message(text, images, identifier, synthesize_audio=False, wait_for_slot=True)
     chatto_bridge = ChattoAPI(
         cfg["chatto"], conversations,
-        lambda text, images, identifier: browser_message(text, images, identifier, synthesize_audio=False),
+        chatto_message,
         learning_activity=conversation_learning.note_activity if conversation_learning else None,
         work_activity=lambda: work_activity.is_working() or backend_turns.has_active(),
     )
@@ -1886,6 +1908,7 @@ def main(argv: list[str] | None = None) -> int:
         allowed_hosts=visual_cfg.get("allowed_hosts", [visual_cfg.get("public_host")]),
     )
     visual.start()
+    chatto_bridge.jobs.start()
     try:
         chatto_process.start()
     except OSError:
@@ -1967,6 +1990,7 @@ def main(argv: list[str] | None = None) -> int:
     finally:
         service_ready.clear()
         chatto_process.close()
+        chatto_bridge.close()
         bus.set("idle")
         visual.stop()
         backend_turns.close()

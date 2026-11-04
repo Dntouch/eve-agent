@@ -28,7 +28,7 @@ test('image-only DM reaches EVE as images and failed downloads never trigger a t
     loadImages: async () => [image], withTyping: fn => fn(), reply: async () => {} };
   const eve = async (path, payload) => {
     requests.push({ path, payload });
-    return path.endsWith('conversations') ? { conversation_id: 'conversation' } : { answer: 'Bild gesehen' };
+    return path.endsWith('conversations') ? { conversation_id: 'conversation' } : { id: 'chatto-job:image', state: 'queued' };
   };
   try {
     await handleMessage(ctx, 'owner', state, eve);

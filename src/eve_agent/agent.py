@@ -44,6 +44,8 @@ class TurnResult:
     conversation_id: str | None
     presentation: PresentationWork | None
     assistant_message_id: str | None = None
+    outcome: str = "answer"
+    outcome_reason: str | None = None
 
 
 class EveAgent:
@@ -404,6 +406,24 @@ class EveAgent:
         except (OSError, ValueError):
             # Diagnostics must never make the user-facing tool unavailable.
             pass
+
+    def _record_no_change(self, reason: str, route: Route) -> str:
+        """Complete a scheduled check without creating a chat message or media."""
+        from .scheduled_execution import scheduled_metadata
+        if scheduled_metadata() is None:
+            raise RuntimeError("Ein stiller Abschluss benötigt einen geplanten Durchlauf")
+        self._cancel_checkpoint(commit=True)
+        reason = redact_sensitive(reason)
+        self.last_route = route
+        self._last_turn_result = TurnResult(
+            turn_id=self._trace_id, answer="", route=route.value, sources=(), resources=(),
+            conversation_id=self.conversation_id, presentation=None,
+            outcome="no_change", outcome_reason=reason,
+        )
+        if self.telemetry:
+            self.telemetry.summary(request_status="completed", final_turn_state="no_change")
+            self.telemetry.event("scheduled_tasks", "no_change", details={"reason": reason})
+        return ""
 
     def _record(self, user: str, answer: str, route: Route) -> str:
         self._cancel_checkpoint()

@@ -16,6 +16,11 @@ EXECUTION_PROMPT = (
     "Einrichtung oder Formulierung und lege sie nicht erneut an. "
     "scheduled_execution enthält Herkunft, Fälligkeit und Ausgabeziel; das Ergebnis "
     "wird automatisch dorthin zugestellt. Das Ausgabeziel erteilt keine Werkzeugrechte. "
+    "Wenn ein Prüfauftrag keine meldepflichtige Änderung ergibt und ohne Nachricht enden soll, "
+    "beende diesen Durchlauf mit eve__complete_check(outcome='no_change', reason=...). "
+    "Dieser Aufruf ist der endgültige erfolgreiche Abschluss, kein Zwischenstand. "
+    "Danach wird nichts zugestellt; den nächsten Check übernimmt der Scheduler. "
+    "Für Erinnerungen oder verlangte Berichte liefere weiterhin die fällige Antwort. "
 )
 
 

@@ -189,6 +189,22 @@ def runtime_config(root, overrides):
 
 
 class RuntimeTest(unittest.TestCase):
+    def setUp(self):
+        # The durable Chatto bridge owns a database even when the fake local
+        # agent deliberately omits conversation persistence.
+        from eve_agent.chatto import ChattoAPI
+        from eve_agent.storage import ConversationStore, EveDatabase
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        store = ConversationStore(EveDatabase(Path(directory.name) / 'bridge.db'))
+        def bridge(config, conversations, handler, **kwargs):
+            api = ChattoAPI(config, conversations or store, handler, **kwargs)
+            self.addCleanup(api.close)
+            return api
+        patcher = mock.patch('eve_agent.chatto.ChattoAPI', side_effect=bridge)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_local_text_and_voice_publish_aggregate_work_without_chatto_messages(self):
         FakeVisualServer.instances = []
         agent = FakeAgent()

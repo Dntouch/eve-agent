@@ -42,6 +42,9 @@ class WorkingMemorySession:
         self.pending_workspace = None
         self.latest_budget = None
         self.last_recovery_signature = None
+        # These attempts belong to the entire user/scheduled turn. A context
+        # reset or workspace switch must not create a fresh retry allowance.
+        self.recovery_attempts = {}
         self.finished = False
         self.context_number = 0
         self.journal = None
@@ -189,23 +192,27 @@ class WorkingMemorySession:
         self.agent._working_memory_context = self.identity()
 
     def _material_signature(self):
-        """Immutable inputs/outcomes, not a semantic judgement of progress."""
+        """Returned evidence, independent of queries, clocks and receipt IDs."""
         inputs = set()
         for call in self.store.calls(self.workspace_id)['items']:
             if call['turn_id'] != self.turn_id or call['status'] != 'returned':
                 continue
             capability, operation = call['capability'], call['operation']
-            if capability == 'eve_runtime' or (capability == 'working_memory' and operation not in {'read', 'inspect'}):
+            if capability in {'eve_runtime', 'clock'} or (capability == 'working_memory' and operation != 'read'):
                 continue
             parameters = self.store.value(self.workspace_id, call['request_reference'])
             result = self.store.value(self.workspace_id, call['result_reference'])
+            if isinstance(result, dict) and result.get('status') in {'error', 'failed', 'rejected', 'outcome_uncertain'}:
+                continue
             if capability == 'working_memory' and operation == 'read' and 'content' in result:
                 inputs.add(encoded([capability, operation,
-                    self.store.read_identity(self.workspace_id, parameters, result)]))
+                    self.store.read_identity(self.workspace_id, parameters, result)[1]]))
                 continue
             from .result_identity import provider_evidence, value_digest
-            outcome = value_digest(provider_evidence(capability, operation, result)) if capability != 'working_memory' else None
-            inputs.add(encoded([capability, operation, parameters, outcome]))
+            if capability == 'working_memory':
+                continue
+            outcome = value_digest(provider_evidence(capability, operation, result))
+            inputs.add(encoded([capability, operation, outcome]))
         return encoded([self.request['reference'], sorted(inputs)])
 
     def capture_checkpoint(self, messages, core_prompt, reason, *, completion=None):
@@ -503,23 +510,29 @@ class WorkingMemorySession:
         return fresh, tools, new_bindings
 
     def recover(self, messages, error):
-        """Retry only if a context reset can change the rejected model input."""
+        """One repair per model failure category, surviving new tools/contexts."""
+        from .llm import EmptyModelResponseError, LocalLLMOutputLimitError
+        category = ('empty_model_response' if isinstance(error, EmptyModelResponseError) else
+                    'output_limit' if isinstance(error, LocalLLMOutputLimitError) else 'provider_context_rejection')
         signature = self._material_signature()
-        if signature == self.last_recovery_signature:
-            from .llm import EmptyModelResponseError, LocalLLMOutputLimitError
+        attempts = self.recovery_attempts.get(category, 0)
+        repeated = attempts > 0 or signature == self.last_recovery_signature
+        self.archive_frame({'class': type(error).__name__, 'message': str(error),
+                            'partial_response': getattr(error, 'partial_response', ''),
+                            'category': category, 'previous_recovery_attempts': attempts,
+                            'new_material_since_last_recovery': signature != self.last_recovery_signature,
+                            'recovery_allowed': not repeated}, kind='model_context_error')
+        if repeated:
             if isinstance(error, (EmptyModelResponseError, LocalLLMOutputLimitError)):
                 raise error
             raise WorkingContextBudgetError(self.workspace_id, 'Der Modellserver lehnt auch den frischen Kontext ab.') from error
+        self.recovery_attempts[category] = attempts + 1
         self.last_recovery_signature = signature
         refresh = getattr(self.agent.llm, 'runtime_model_info', None)
         if callable(refresh):
             refresh(refresh=True)
-        self.archive_frame({'class': type(error).__name__, 'message': str(error),
-                            'partial_response': getattr(error, 'partial_response', '')}, kind='model_context_error')
         self.reset_requested = True
-        from .llm import EmptyModelResponseError, LocalLLMOutputLimitError
-        self.reset_reason = ('empty_model_response' if isinstance(error, EmptyModelResponseError) else
-                             'output_limit' if isinstance(error, LocalLLMOutputLimitError) else 'provider_context_rejection')
+        self.reset_reason = category
         self.defer_images = True
 
     def finish(self, status, value):

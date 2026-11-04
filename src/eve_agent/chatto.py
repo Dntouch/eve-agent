@@ -7,6 +7,7 @@ from pathlib import Path
 import subprocess
 import secrets
 from copy import deepcopy
+from contextlib import contextmanager
 from datetime import datetime, timezone
 import uuid
 import threading
@@ -14,6 +15,8 @@ import threading
 from .transport_access import transport_access, PUBLIC_CAPABILITIES, update_transport_metadata, transport_metadata
 from .memory import redact_sensitive
 from .artifacts import output_resources
+from .chatto_jobs import ChattoJobs
+from .bot_activity import BotActivity
 
 
 class ChattoAPI:
@@ -24,20 +27,36 @@ class ChattoAPI:
         self.scheduler = None
         self.output_rooms = []
         self.activities = {}
+        self.scheduled_activities = {}
         self.activity_lock = threading.RLock()
+        self.jobs = ChattoJobs(conversations.database, self.conversation)
 
     def output_targets(self):
         context = transport_metadata()
-        # Public callers can address only their verified current room/thread.
+        personal = []
+        if context and self.config.get("enabled"):
+            clean = self._context({"context": context})
+            owner = clean["sender_id"] == self.config["owner_user_id"]
+            if clean["sender_id"] != clean["bot_id"] and self.config.get(
+                    "owner_dm_enabled" if owner else "member_dm_enabled"):
+                # Resolve the actual room with the authenticated Chatto directory
+                # at delivery time; no previous EVE conversation is necessary.
+                personal = [{"id": "chatto:dm:self", "name": "Chatto · DM to you (current sender)",
+                             "description": "Personal reminder by DM. A human must have opened the DM with EVE once; Chatto forbids bots from opening DMs.",
+                             "transport": "chatto", "server_url": clean["server_url"],
+                             "bot_id": clean["bot_id"], "room_kind": "dm",
+                             "recipient_user_id": clean["sender_id"], "sender_id": clean["sender_id"],
+                             "access_profile": "owner_dm" if owner else "member_dm"}]
+        # Public callers may select their own DM, never another user's targets.
         if context and context.get("access_profile") != "owner_dm":
-            return []
+            return personal
         with self.conversations.database.connect() as connection:
             local_rows = connection.execute("SELECT id,title FROM conversations WHERE source!='chatto' AND status!='deleted'").fetchall()
         local_targets = [{"id": "eve:conversation:" + row["id"], "name": "EVE · " + row["title"],
                           "transport": "eve", "conversation_id": row["id"]} for row in local_rows]
         if not self.config.get("enabled"):
             return local_targets
-        targets = local_targets + [{"id": "chatto:room:" + room["id"], "name": "Chatto · " + room["name"],
+        targets = personal + local_targets + [{"id": "chatto:room:" + room["id"], "name": "Chatto · " + room["name"],
                     "transport": "chatto", "server_url": self.config["server_url"],
                     "room_id": room["id"], "room_kind": "channel"}
                    for room in self.output_rooms if room["id"] in self.config["channel_ids"]]
@@ -58,13 +77,43 @@ class ChattoAPI:
         return targets
 
     def deliveries(self, payload):
-        if self.scheduler is None:
-            return {"deliveries": []}
-        return {"deliveries": self.scheduler.claim_deliveries()}
+        deliveries = self.jobs.claim()
+        if not deliveries and self.scheduler is not None:
+            deliveries = self.scheduler.claim_deliveries()
+        return {"deliveries": deliveries}
+
+    def delivery_start(self, payload):
+        if payload['id'].startswith('chatto-job:'):
+            self.jobs.begin_send(payload['id'], payload['claim_token'])
+        else:
+            self.scheduler.begin_delivery(payload['id'], payload['claim_token'])
+        return {"ok": True}
 
     def delivery_ack(self, payload):
-        self.scheduler.acknowledge_delivery(payload["id"], payload["status"], payload.get("error"))
+        if payload['id'].startswith('chatto-job:'):
+            self.jobs.acknowledge(payload['id'], payload['claim_token'], payload['status'], payload.get('error'))
+        else:
+            self.scheduler.acknowledge_delivery(payload["id"], payload["status"], payload.get("error"),
+                                               claim_token=payload.get('claim_token'))
         return {"ok": True}
+
+    def submit(self, payload):
+        context, _, _ = self._conversation_request(payload)
+        return self.jobs.submit(deepcopy(payload), context)
+
+    def job_status(self, payload):
+        with self.activity_lock:
+            scheduled = deepcopy(list(self.scheduled_activities.values()))
+        return {'jobs': self.jobs.statuses() + scheduled}
+
+    def retry_job_delivery(self, payload):
+        self.jobs.retry(payload['id'])
+        return {'ok': True}
+
+    def close(self):
+        with self.activity_lock:
+            self.scheduled_activities.clear()
+        self.jobs.close()
 
     def register_output_rooms(self, payload):
         rooms = payload.get("rooms")
@@ -75,12 +124,36 @@ class ChattoAPI:
         return {"ok": True}
 
     def scheduled_access(self, context):
-        clean = self._context({"context": context})
-        if context.get("mcp_session_id"):
+        clean = self._context({"context": context}) if context else {}
+        if context and context.get("mcp_session_id"):
             clean["mcp_session_id"] = context["mcp_session_id"]
-        allowed = (PUBLIC_CAPABILITIES if clean["access_profile"] == "member_dm"
+        allowed = (PUBLIC_CAPABILITIES if clean.get("access_profile") == "member_dm"
                    else self.config["channel_capabilities"])
-        return transport_access(clean, public=clean["access_profile"] != "owner_dm", allowed_capabilities=allowed)
+        return self._scheduled_work(clean, allowed)
+
+    @contextmanager
+    def _scheduled_work(self, clean, allowed):
+        from .scheduled_execution import scheduled_metadata
+        target = (scheduled_metadata() or {}).get("output_target") or {}
+        identifier = "scheduled-activity:" + uuid.uuid4().hex
+        tracker = BotActivity()
+        active = (self.config["enabled"] and target.get("transport") == "chatto" and
+                  target.get("server_url") == self.config["server_url"] and bool(target.get("room_id")))
+        def activity(event):
+            with self.activity_lock:
+                if identifier in self.scheduled_activities:
+                    self.scheduled_activities[identifier]["progress"]["bot_activity"] = tracker.update(event)
+        if active:
+            with self.activity_lock:
+                self.scheduled_activities[identifier] = {"id": identifier, "state": "running",
+                    "target": deepcopy(target), "progress": {"bot_activity": "THINKING"}}
+        try:
+            with transport_access(clean, public=bool(clean) and clean["access_profile"] != "owner_dm",
+                                  allowed_capabilities=allowed, activity=activity if active else None):
+                yield
+        finally:
+            with self.activity_lock:
+                self.scheduled_activities.pop(identifier, None)
 
     def configure(self, config):
         self.config = deepcopy(config)
@@ -167,7 +240,7 @@ class ChattoAPI:
         """Bridge-only aggregate activity. Never expose conversations or task data."""
         if not self.config["enabled"]:
             raise PermissionError("Chatto is disabled")
-        return {"working": bool(self.work_activity and self.work_activity())}
+        return {"working": self.jobs.working() or bool(self.work_activity and self.work_activity())}
 
     def activity(self, payload):
         context = self._context(payload)
@@ -176,8 +249,8 @@ class ChattoAPI:
         with self.activity_lock:
             return deepcopy(self.activities.get(key, {"state": "unknown"}))
 
-    def conversation(self, payload):
-        config = self.config
+    def _conversation_request(self, payload, config=None):
+        config = self.config if config is None else config
         context = self._context(payload, config)
         text, identifier = payload.get("text"), payload.get("conversation_id")
         images = payload.get("images", [])
@@ -188,19 +261,28 @@ class ChattoAPI:
         if not isinstance(identifier, str) or not identifier:
             raise ValueError("Chatto conversation ID is required")
         self._require_bound_conversation(identifier, context)
+        return context, text, images
+
+    def conversation(self, payload, *, job_id=None):
+        config = self.config
+        context, text, images = self._conversation_request(payload, config)
+        identifier = payload['conversation_id']
         original_thread = context.get("thread_root_id")
         with self.conversations.database.connect() as connection:
             metadata = json.loads(connection.execute("SELECT metadata_json FROM conversations WHERE id=?", (identifier,)).fetchone()[0] or "{}")
         if metadata.get("mcp_session_id"):
             context["mcp_session_id"] = metadata["mcp_session_id"]
         activity_key = (identifier, context["message_id"])
-        progress = {"state": "working", "thread_root_id": original_thread or ""}
+        runtime_activity = BotActivity()
+        progress = {"state": "working", "thread_root_id": original_thread or "", "bot_activity": "THINKING"}
         with self.activity_lock:
             if len(self.activities) >= 256:
                 completed = next((key for key, item in self.activities.items() if item["state"] != "working"), None)
                 if completed is not None:
                     self.activities.pop(completed)
             self.activities[activity_key] = progress
+        if job_id:
+            self.jobs.progress(job_id, context, progress)
         branch_identifier = None
         def activity(event):
             nonlocal branch_identifier
@@ -219,7 +301,10 @@ class ChattoAPI:
                                        (json.dumps(branch_metadata), branch_identifier))
             with self.activity_lock:
                 progress.update({"integration": event.get("integration", ""),
-                                 "thread_root_id": context.get("thread_root_id", "")})
+                                 "thread_root_id": context.get("thread_root_id", ""),
+                                 "bot_activity": runtime_activity.update(event)})
+            if job_id:
+                self.jobs.progress(job_id, context, progress)
         try:
             with transport_access(context, public=context["access_profile"] != "owner_dm", activity=activity,
                                   allowed_capabilities=(PUBLIC_CAPABILITIES if context["access_profile"] == "member_dm"

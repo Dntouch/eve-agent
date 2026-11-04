@@ -5,7 +5,10 @@ bereitstehen; dessen Adresse und ein eigener Bot werden in EVE konfiguriert.
 
 EVE verbindet sich ausgehend per HTTPS/WebSocket mit Chatto 0.5.0-beta.19.
 Der offizielle Client wird am Commit `cda6bf54bb5282752169adb376f03081c09f0d89`
-gebaut. EVE bleibt eine Instanz mit gemeinsamem Gedächtnis. Die Nachrichten
+gebaut. Die optionale Bot-Aktivität benötigt den eigenen Server-Build
+`0.5.0-beta.24+hakkerwerkstatt.3` oder neuer. Normale Verbindungen behalten
+ihre bisherige Mindestversion; ein SDK-Update ist dafür nicht nötig.
+EVE bleibt eine Instanz mit gemeinsamem Gedächtnis. Die Nachrichten
 bekommen technische Herkunftsdaten (Server, Raum, Absender und Zugriffsprofil).
 Es gibt keine Klassifikation des Nachrichtentexts und keine Prompt-Änderung.
 
@@ -40,7 +43,8 @@ erneut öffnen, um die Auswahl zu aktualisieren. Der Bot startet und stoppt
 weiterhin zusammen mit EVE. Anzeigename und Benutzername sind keine Autoritätsmerkmale;
 Umbenennungen verändern die Bindung an Konto- und Raum-IDs nicht.
 In Chatto muss der Bot Mitglied sein und Lese-/Antwortrechte im jeweiligen
-Raum besitzen. Direkte Antworten benötigen `message.post`. Menschen eröffnen DMs.
+Raum besitzen. Direkte Antworten benötigen `message.post`. Menschen eröffnen DMs;
+danach kann EVE dort auch ohne neue eingehende Nachricht Erinnerungen zustellen.
 
 **Online-Status anzeigen** meldet den verbundenen Bot im Leerlauf als online
 (grüner Punkt). Während einer Chatto-Anfrage, eines lokalen Text- oder Sprachgesprächs
@@ -64,6 +68,74 @@ Heartbeat; Chatto lässt die Präsenz nach etwa 60 Sekunden verfallen. Der Statu
 beschreibt die Bot-Verbindung und ist keine Garantie für die Modellverfügbarkeit.
 Chatto zeigt bei Bots den farbigen Statuspunkt und blendet den Punkt offline aus;
 der Bot bleibt in der eigenen Mitgliedergruppe Bots.
+
+## Bot-Aktivität während der Bearbeitung
+
+Nach Aktualisierung EVE einschließlich des Bots einmal neu starten. Es gibt
+keinen zusätzlichen Dienst und keinen neuen Schlüssel. Die Aktivitätsanzeige
+arbeitet unabhängig von Online-Farbpunkt und Profilstatus. Sie erzeugt keine
+Fortschrittsnachrichten. Der frühere Schalter `thread_status_enabled` wird beim
+Einlesen alter Konfigurationen weiterhin akzeptiert, hat aber keine Wirkung mehr
+und wird nicht mehr in der Konfiguration angeboten. Bereits vorhandene alte
+Statusnachrichten werden nicht verändert.
+
+Die vorhandene Bot-Authentifizierung sendet Connect-JSON an
+`/api/connect/chatto.api.v1.RoomService/RefreshTypingIndicator` mit
+`Connect-Protocol-Version: 1`. Nur `roomId`, gegebenenfalls
+`threadRootEventId` und `botActivity` werden übertragen. Für Raumantworten fehlt
+das Thread-Feld vollständig. Eine Thread-Wurzel kommt ausschließlich aus dem
+verifizierten Eingang beziehungsweise dem tatsächlichen Ausgabeziel. Eröffnet
+eine MCP-Integration einen Thread, wird die ursprüngliche Chatto-Nachricht dessen
+Wurzel; die Aktivität im bisherigen Raum wird beendet. EVE-Gesprächs-IDs und
+Antwort-IDs werden dafür nicht verwendet.
+
+Tatsächlich verwendete Laufzeitereignisse:
+
+| Ereignis / Einstiegspunkt | Aktivität |
+| --- | --- |
+| Annahmeverarbeitung, wartender/laufender Auftrag, Beginn eines Modell-Transportversuchs (`_request_lifecycle`) | `THINKING` |
+| Eintritt in `NativeToolRuntime._execute_direct`, einschließlich Capability-Loader und bestätigter Wiederverwendung | `TOOL_USE` |
+| Derselbe Dispatcher mit Capability `web`, einschließlich Suche und Seitenabruf | `WEB_RESEARCH` |
+| Erster nichtleerer Content-Delta im nativen Modellstream oder Antwortstream | `WRITING` |
+| Ende eines Werkzeugaufrufs, auch bei Fehler oder Abbruch | Verbleibende Werkzeuge, sonst aktuelle Modellphase |
+| Abschluss, Modellfehler, Abbruch, abgelaufener Auftragsstand, Shutdown | Letzte Aufgabe im Ziel beendet: `IDLE` |
+
+Chatto-Turns und geplante Aufgaben mit Chatto-Ausgabeziel verwenden den vorhandenen
+Modellstream intern, damit der Beginn der Texterzeugung beobachtbar ist. Die
+fertige Antwort wird weiterhin über die bestehende Zustellwarteschlange versandt.
+Bei einem gepufferten Modellaufruf lässt sich `WRITING` erst bei Empfang der
+Antwort feststellen. Reine Reasoning-Deltas ändern die Kategorie nicht. Weder
+Reasoning noch Content-Deltas werden als Aktivitätsdaten übertragen.
+
+Der Bot liest den aktuellen Auftragsstand alle 500 ms über die geschützte lokale
+Bridge. Sehr kurze Zwischenphasen können zusammengefasst werden. Die jeweils
+aktuelle Kategorie wird alle drei Sekunden erneuert. Pro Server, Bot, Raum und
+optionaler Thread-Wurzel werden parallele Aufgaben aggregiert. Priorität:
+`WEB_RESEARCH`, dann `TOOL_USE`, dann `WRITING`, dann `THINKING`. Werkzeugstarts
+besitzen interne Aufruf-IDs; doppelte oder verspätete Werkzeugenden entfernen
+keinen anderen laufenden Aufruf. Geplante Aufgaben melden im konfigurierten
+Ausgabeziel, ohne aus diesem Ziel zusätzliche Werkzeugrechte abzuleiten.
+
+Requests laufen je Ziel nacheinander. Ausstehende Zwischenstände werden
+zusammengefasst, auch während einer Berechtigungsprüfung. Ein regulärer Refresh
+hat insgesamt 1,5 Sekunden Timeout, `IDLE` eine eigene Sekunde unabhängig vom
+Abbruchsignal. Vor nichtleerer Aktivität werden Bot-Konto, freigegebenes Ziel,
+Mitgliedschaft, Leserechte und gegebenenfalls Lesbarkeit der Thread-Wurzel geprüft.
+Eine Schreibberechtigung wird für Aktivität nicht zusätzlich verlangt. Der
+Server bleibt für die endgültige Zugriffskontrolle zuständig. Es werden keine
+Rechte erweitert und keine Request-Inhalte oder Schlüssel zusätzlich geloggt.
+
+Netzwerkfehler und fehlende Berechtigungen beeinflussen die Antwort nicht. Es gibt
+keine eigene Wiederholungsschleife; nur weiterhin aktive Arbeit wird beim nächsten
+Heartbeat erneut gemeldet. Nach 4,5 Sekunden ohne frischen Bridge-Auftragsstand
+wird dessen Aktivität beendet. Bei Chatto-Verbindungsverlust werden alte
+Auftragssnapshots verworfen. Nach Wiederverbindung zählen nur neue Snapshots;
+Antworten und Werkzeugaktionen werden dafür nicht wiederholt. Timer und
+Abbruchlistener werden am Ende entfernt. Nach einem harten Prozessabbruch gilt
+Chattos serverseitiger Ablauf sechs Sekunden nach dem letzten Refresh. Wenn ein
+Server nach einem Client-Timeout einen Request trotzdem verspätet verarbeitet,
+kann der Client ohne serverseitige Versionsnummer keine absolute Commit-Reihenfolge
+garantieren; Serialisierung und abschließendes `IDLE` begrenzen diesen Fall.
 
 ## Gesprächskontext und Werkzeuge
 
@@ -141,6 +213,49 @@ Der Abschnitt Chatto zeigt den Verbindungsstatus beim Laden der Konfiguration.
 - `runtime/chatto/bot.log`: technische Meldungen ohne Nachrichten und Schlüssel
 - `runtime/chatto/state.sqlite`: Gesprächszuordnung und verarbeitete Nachrichten-IDs
 
+Normale Chatto-Aufträge werden über `POST /api/chatto/submit` dauerhaft angenommen
+und sofort mit HTTP 202 bestätigt. EVE arbeitet die Aufträge der Reihe nach im
+Hintergrund ab. Die ursprüngliche HTTP-Anfrage und eine durchgehende
+Chatto-Verbindung sind für die Bearbeitung nicht erforderlich. Eine wiederholte
+Übergabe derselben Server-/Bot-/Raum-/Nachrichten-ID führt keinen zweiten
+Modell- oder Werkzeugaufruf aus. Stilles Mitlernen behält seinen bisherigen Weg.
+
+Die Tabelle `chatto_jobs` in `data/eve.db` speichert Aufträge, Ziel und Zustellstand.
+Nach Abschluss werden Antwort und Anhänge atomar für den bestehenden
+Bot-Zustellweg bereitgestellt. Gespeichert sind Server, Bot, Channel beziehungsweise
+DM, Absender, Ursprungsnachricht und gegebenenfalls Thread; auch ein erst durch
+ein MCP-Werkzeug eröffneter Thread bleibt erhalten. Vor dem Versand prüft der Bot
+die aktuelle Konfiguration, Eigentümerschaft, Mitgliedschaft, Zielthread und
+Schreibrechte. Nach bestätigter Zustellung wird die zusätzliche Kopie des
+Antwortinhalts aus der Warteschlange entfernt; die Gesprächshistorie bleibt erhalten.
+
+Bei einem Bot-Neustart oder Verbindungsverlust arbeitet EVE weiter. Fertige
+Antworten warten dauerhaft auf die Wiederverbindung. Der Bot fragt alle drei
+Sekunden nach Ergebnissen. Vorübergehende Fehler vor dem Versand werden mit
+15 Sekunden Abstand erneut versucht. Eine noch nicht zum Versand gestartete
+Reservierung läuft nach 60 Sekunden ab und kann sicher neu übernommen werden.
+Fehlende Rechte oder nicht mehr freigegebene Ziele führen zu `blocked`.
+Nach Korrektur lässt sich ausschließlich diese Zustellung über den geschützten
+Bridge-Endpunkt `POST /api/chatto/job-retry` mit `{"id":"chatto-job:…"}` erneut
+freigeben. Das führt den Auftrag nicht erneut aus.
+
+Unmittelbar vor der ersten Antwortnachricht wird `sending` dauerhaft gespeichert.
+Geht danach die Verbindung oder Bestätigung verloren, wird die Antwort nicht
+automatisch wiederholt; ihr Zustand bleibt `sending` oder wird `uncertain`.
+Das gilt auch für teilweise versandte, aufgeteilte Antworten. Chattos
+Nachrichten-API bietet dafür keinen Idempotenzschlüssel. Ein unklarer Versand
+muss deshalb geprüft werden, um doppelte Antworten zu vermeiden.
+
+Bei einem vollständigen EVE-Neustart bleiben fertige Antworten erhalten und noch
+nicht begonnene Aufträge werden wieder aufgenommen. Zuvor laufende Aufträge
+werden nicht erneut ausgeführt; EVE stellt stattdessen einen Hinweis auf die
+Unterbrechung zu. Bereits erfolgte Werkzeugaktionen müssen dann geprüft werden.
+`POST /api/chatto/jobs` zeigt die offenen Auftrags- und Zustellstände ohne
+Nachrichteninhalte; alle genannten Bridge-Endpunkte benötigen den eigenen
+Bridge-Schlüssel. Bot-Aktivität wird unabhängig von der Annahme-Anfrage
+aktualisiert. Die oben beschriebene Präsenzlogik bleibt bestehen. Zur Aktivierung
+dieser Änderung EVE einschließlich Bot einmal neu starten.
+
 Der Bot sendet beim Start keine Begrüßung oder Testnachricht. Nach einem
 unklaren Fehler wird dieselbe Nachricht nicht automatisch erneut ausgeführt,
 da eine Werkzeugaktion oder Antwort bereits erfolgt sein könnte. Eine neue
@@ -166,14 +281,15 @@ URLs werden vom Bot nicht gelesen. Provider-interne Pfade bleiben lokal.
 In einer persönlichen DM dürfen weiterhin die persönlichen EVE-Werkzeuge
 genutzt werden, einschließlich Home Assistant. Die Channel-Sperren gelten nur
 für die freigegebenen Channels.
-Bei Unterbrechungen können Nachrichten fehlen; Echtzeit ist keine dauerhafte
-Warteschlange. Erkannte Lücken werden im Status gemeldet.
+Vor der dauerhaften Annahme durch EVE können bei Unterbrechungen Nachrichten
+fehlen; Chattos Echtzeit-Empfang ist keine dauerhafte Eingangswarteschlange.
+Erkannte Lücken werden im Status gemeldet.
 
 Prüfung ohne Modellaufrufe (HTTP-Tests verwenden einen lokalen Testserver):
 
 ```bash
-PYTHONPATH=src:tests .venv/bin/python -m unittest test_chatto test_native_runtime test_config test_assist_api
-node --test tests/js/chatto-bot.test.mjs tests/js/chatto-routing.test.mjs tests/js/chatto-images.test.mjs tests/js/chatto-output.test.mjs
+PYTHONPATH=src:tests .venv/bin/python -m unittest test_bot_activity test_chatto test_chatto_jobs test_native_runtime test_llm test_config test_assist_api test_scheduler
+node --test tests/js/chatto-*.test.mjs
 ```
 
 ## Konfigurierbare MCP-Werkzeuge und Auftrags-Threads
@@ -182,8 +298,7 @@ Externe MCP-Server, etwa SolidCraft, werden zentral in EVE konfiguriert.
 Die [MCP-Anleitung](MCP.md) beschreibt Einrichtung, getrennte Sitzungen,
 Dateianhänge und Channel-Freigaben. Der allgemeine Antwortmodus kann `chat` bleiben. Mit `thread` unter der
 jeweiligen Integration erhält nur deren Verwendung einen eigenen Thread und
-EVE-Verlauf. Der sichtbare Arbeitsstatus in Threads lässt sich im Chatto-Abschnitt
-aktivieren. Eine stabile `EVE-<UUID>`-Referenz
+EVE-Verlauf. Die Bot-Aktivität folgt dabei dem tatsächlichen Thread-Ziel. Eine stabile `EVE-<UUID>`-Referenz
 verbindet den Thread technisch mit den Herkunftsdaten für das Memory-Lernen.
 Die Bedeutung und fachlichen Beziehungen bestimmt weiterhin das Modell.
 
@@ -218,8 +333,34 @@ nächste Termin vor oder auf dem Endzeitpunkt liegen. Ein Tagesende lässt sich 
 23:59 Uhr am gewünschten letzten Tag setzen.
 
 Der lokale Benutzer und Owner-DMs können andere verfügbare Ziele wählen.
-Öffentliche Channels und Member-DMs bleiben auf ihr aktuelles Gespräch begrenzt
-und können keine Aufgaben anderer Gespräche lesen oder umleiten. Bei geplanten
+Öffentliche Channels und Member-DMs können neben dem aktuellen Gespräch die
+persönliche DM des verifizierten Absenders wählen (`chatto:dm:self`). Andere
+DMs und lokale Gespräche werden dort nicht als Ziele veröffentlicht. Für eine
+DM-Erinnerung wie „EVE, erinnere mich um 16:00 Uhr per DM an den Termin“ wählt
+das Modell dieses Ziel und speichert die gewünschte Uhrzeit im Zeitplan.
+Im Channel muss dafür `scheduled_tasks` unter `chatto.channel_capabilities`
+freigegeben sein. Für den Owner muss `owner_dm_enabled`, für andere Benutzer
+`member_dm_enabled` aktiv sein. Die bestehende Standardfreigabe für Member-DMs
+enthält keine Aufgabenverwaltung; die Channel-Freigabe gilt nur im Channel.
+
+Chatto verbietet Bots das Eröffnen einer DM, auch über `StartDM`. Jeder Empfänger
+muss deshalb einmal selbst eine Zweier-DM mit EVE in Chatto eröffnen. Eine
+vorherige Unterhaltung oder ein gespeicherter EVE-Verlauf dort ist nicht nötig.
+Beim Versand sucht EVE diese DM über das authentifizierte Raumverzeichnis,
+einschließlich weiterer Ergebnisseiten, und prüft die beiden Teilnehmer sowie
+die aktuellen Rechte erneut. Gruppen-DMs werden nicht verwendet. Fehlt die DM
+oder wurde ihre Freigabe widerrufen, wird die Zustellung blockiert; sie wird
+nicht ersatzweise im Channel veröffentlicht. Nach Eröffnen der DM kann die
+blockierte Ausgabe über `retry_delivery` erneut freigegeben werden.
+Channel-Thread und Ursprungsnachricht werden nicht als DM-Ziel übernommen.
+Die automatische Erinnerung wird als neue Nachricht in der persönlichen DM
+zugestellt, auch bei geschlossenem Browser. EVE und der Chatto-Bot müssen laufen;
+fertige Ausgaben überstehen Neustarts in der vorhandenen Warteschlange.
+
+Aufgaben mit persönlichem DM-Ziel können im Ursprungschannel nur vom jeweiligen
+Empfänger gelesen oder geändert werden; die Verwaltung über die lokale EVE
+beziehungsweise die Owner-DM bleibt möglich. Channel-Verläufe bleiben gemeinsam
+sichtbar, einschließlich des ursprünglichen Erinnerungsauftrags. Bei geplanten
 Chatto-Turns werden die aktuellen Capability-Freigaben des Herkunftskontexts
 wiederhergestellt; ein Ausgabeziel verleiht keine zusätzlichen Werkzeugrechte.
 
@@ -232,12 +373,63 @@ Ein offener Browser ist dafür nicht erforderlich. Der Auftrag bestimmt weiterhi
 welche Ergebnisse und Änderungen EVE melden soll; die Zustellung vergleicht keine
 Nachrichtentexte und baut keine eigene inhaltliche Benachrichtigungslogik ein.
 
+Die Ausführung geplanter Aufgaben hält keine Sperre auf der Zustellwarteschlange.
+Abholungen, lokale Benachrichtigungsabfragen und Aufgabenänderungen bleiben während
+eines laufenden Modellaufrufs verfügbar. Im Dienstbetrieb führt ausschließlich
+der Hintergrundmonitor fällige Aufgaben aus; Browser-Polling liest fertige
+Ergebnisse. Startseite und statische Dateien belegen keine API-Anfrageplätze.
+
 `list_deliveries(task_id)` zeigt Zustellstatus und Fehler. Mit
 `retry_delivery(task_id, delivery_id)` lässt sich eine vor dem Versand blockierte
-Zustellung erneut anstoßen, ohne den Task erneut auszuführen. Nach einem
-möglicherweise begonnenen Versand lautet der Status `uncertain`; nach einem
-Abbruch ohne Bestätigung kann `sending` verbleiben. Solche Zustellungen werden
-zur Vermeidung doppelter Nachrichten nicht automatisch wiederholt.
+Zustellung erneut anstoßen, ohne den Task erneut auszuführen. Eine Abholung
+reserviert zunächst nur die Ausgabe (`claimed`). Bricht der Bot vor dem
+gespeicherten Versandbeginn ab, wird die Reservierung nach spätestens fünf
+Minuten oder beim EVE-Neustart freigegeben. Vorübergehende Fehler bei der
+Zielprüfung führen mit Wartezeit zu einem erneuten Zustellversuch.
+Nach einem möglicherweise begonnenen Versand lautet der Status bei Abbruch
+oder ausbleibender Bestätigung `uncertain`. Diese Ausgabe wird zur Vermeidung
+doppelter Nachrichten nicht automatisch wiederholt. Alte, verwaiste
+`sending`-Einträge werden beim Neustart ebenfalls als `uncertain` übernommen.
+Der Bot wiederholt verlorene Zustellbestätigungen getrennt vom Versand.
+`notification.delivered` ist erst nach bestätigter Chatto-Zustellung wahr;
+ein erfolgreicher Aufgabenlauf allein bestätigt noch keinen Empfang.
 Bereits bestehende Aufgaben ohne Ausgabeziel behalten ihre lokale Zustellung;
 ein Ziel lässt sich nachträglich setzen. Ein Neustart von EVE samt Bot lädt die
 Erweiterung. Für die Tests ist kein Versand an einen echten Chatto-Server nötig.
+
+## Änderungen und Abnahme der Bot-Aktivität
+
+- `src/eve_agent/bot_activity.py`: Inhaltsfreie Ereignisse und Aggregation laufender Werkzeuge.
+- `src/eve_agent/llm.py`, `minimal.py`, `transport_access.py`: Modellbeginn, Content-Deltas und garantierte Werkzeugenden.
+- `src/eve_agent/chatto.py`, `chatto_jobs.py`, `cli.py`: Aktuelle Kategorien in der Bridge, vollständige Sicht auf aktive Aufträge, geplante Ausgabeziele und interne Modellstreams.
+- `scripts/chatto-activity.mjs`, `chatto-bot.mjs`, `chatto-state.mjs`, `chatto-output.mjs`: Reporter, Laufzeit-Anbindung und Leserechteprüfung.
+- `scripts/chatto-delivery.mjs`: Entfernen der bisherigen Fortschrittsnachrichten; `chatto-progress.mjs` entfällt.
+- `src/eve_agent/config.py`: Alten Statusnachrichten-Schalter aus der Oberfläche entfernen; gespeicherte Konfiguration bleibt lesbar.
+- `tests/test_bot_activity.py`, `test_chatto_jobs.py`, `tests/js/chatto-activity.test.mjs`, `chatto-scheduled.test.mjs`, `chatto-delivery.test.mjs`: Laufzeit-, Parallelitäts-, Fehler-, Timeout-, Abbruch-, Berechtigungs-, Wiederverbindungs- und lokale HTTP-Vertragstests. Der frühere Test für Statusnachrichten entfällt. `tests/test_runtime.py` und `tests/test_scheduled_delivery.py` ergänzen die Testfixtures um Warteschlangendatenbank und Modellstream.
+- `scripts/prepare_release.py`, `tests/test_prepare_release.py` im Repository-Hauptordner: Neues Modul im Quellcodeexport und gelöschte Altdateien korrekt behandeln.
+- `docs/CHATTO.md`: Einrichtung, Ereigniszuordnung und Grenzen.
+
+Der lokale HTTP-Testserver prüft URL, Header, JSON-Felder, fehlendes Thread-Feld
+bei Raumantworten und Weiterarbeit nach HTTP 403. Die Zustandsprüfungen decken
+zwei parallele Threads, überlappende Web-/andere Werkzeuge, alte Auftragsenden,
+verspätete Requests, dynamische Thread-Ziele, Neustart und unabhängiges `IDLE` ab.
+
+Ausgeführte Prüfungen (31.10.2026):
+
+- Vollständige Python-Suite: `PYTHONPATH=src:tests .venv/bin/python -m unittest discover -s tests` — 1.254 Tests, erfolgreich, drei bestehende bedingte Übersprünge.
+- Vollständige JavaScript-Suite: `node --test tests/js/*.test.*` — 100 Tests erfolgreich; der Reporter-Test wurde nach der letzten Timer-Bereinigung zusätzlich erneut geprüft (neun Tests erfolgreich).
+- Release-Export: im Repository-Hauptordner `python3 -m unittest discover -s tests` — beide Tests erfolgreich.
+- Typprüfung: `mypy --follow-imports=silent --strict src/eve_agent/bot_activity.py` — erfolgreich. Es besteht keine konfigurierte projektweite Typprüfung.
+- Ruff: Neues Aktivitätsmodul und dessen Tests ohne Befund. Die übrigen betroffenen Python-Dateien bestehen die Prüfung mit `--isolated --select E4,E7,E9,F`, mit Ausnahme der unveränderten Altbefunde in `cli.py` (14), `llm.py` (9) und `minimal.py` (1). Ein Vergleich gegen den vorherigen Git-Stand bestätigt: keine neuen Befunde in diesen Dateien.
+- `node --check` für die acht betroffenen JavaScript-Module/Tests und `git diff --check` — erfolgreich.
+
+Ruff und Mypy wurden nur temporär unter `/tmp` installiert; die Abhängigkeiten
+der EVE-Laufzeit wurden nicht verändert. Die Socket-Tests liefen mit lokalen
+Loopback-Servern. Für diese Prüfungen wurde keine produktive EVE neu gestartet.
+
+Noch ausstehend ist die Sichtprüfung gegen einen dafür vorgesehenen echten
+Chatto-Testserver mit dem genannten Build: zweites leseberechtigtes Konto prüft
+Gespräch, Avatar und Profil in zwei Threads; ein Konto ohne Raum-/Thread-Leserecht
+darf die Aktivität nicht sehen. Auch der reale Ablauf nach hartem Prozessabbruch
+ist dort zu prüfen. Ein lokaler HTTP-Vertragstest ersetzt diese Server-/UI-Abnahme
+nicht. Auf dem Produktivserver wurden keine Testkonten oder Testnachrichten angelegt.

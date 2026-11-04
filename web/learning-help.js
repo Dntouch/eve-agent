@@ -30,7 +30,7 @@
     failed: ["Lernversuch ohne Abschluss", "Der letzte Versuch konnte keine erfolgreich abgeschlossene Lernentscheidung übernehmen. Das Material bleibt erhalten. Prüfe den Fehlergrund; ein erneuter Versuch ist über das erneute Einreihen möglich. Die Meldung bedeutet nicht automatisch, dass die damalige Antwort falsch war."],
     no_persist: ["Bewusst nicht gespeichert", "Die Auswertung ist abgeschlossen und hat keinen dauerhaft zu speichernden Inhalt ergeben. Das ist ein reguläres Lernergebnis, kein technischer Fehler."],
     applied: ["Lernentscheidung übernommen", "Die geprüfte Lernentscheidung wurde gespeichert. Ob daraus ein aktiver Fakt oder zunächst ein unbestätigter Kandidat entstanden ist, zeigen die verknüpften Claims und deren Status."],
-    reviewed: ["Als geprüft abgeschlossen", "Der erfolglose Versuch wurde manuell als geprüft markiert. Dadurch wird sein Lernvorschlag nicht als richtig bestätigt und kein Wissen daraus übernommen. Für eine erneute Bearbeitung zuerst wieder öffnen und anschließend erneut einreihen."],
+    reviewed: ["Als geprüft abgeschlossen", "Der erfolglose Versuch wurde manuell als geprüft markiert. Dadurch wird sein Lernvorschlag nicht als richtig bestätigt und kein Wissen daraus übernommen. Mit ERNEUT LERNEN oder über die Auswahl kann er direkt wieder eingereiht werden; dabei wird die Prüfung wieder geöffnet."],
   };
   function help(table, code, fallback) {
     const value = Object.hasOwn(table, code) ? table[code] : fallback;

@@ -273,6 +273,10 @@ class VisualServerTest(unittest.TestCase):
         first.start()
         self.assertTrue(entered.wait(1))
         try:
+            Path(self.temp_dir.name, 'index.html').write_text('<html>EVE UI</html>')
+            with urllib.request.urlopen(f'http://127.0.0.1:{server.port}/', timeout=1) as response:
+                self.assertEqual(200, response.status)
+                self.assertIn(b'EVE UI', response.read())
             with self.assertRaises(urllib.error.HTTPError) as caught:
                 self.request_json(server, "/api/message", data=body)
             self.assertEqual(caught.exception.code, 429)
@@ -283,6 +287,51 @@ class VisualServerTest(unittest.TestCase):
             first.join(2)
         self.assertFalse(first.is_alive())
         self.assertEqual(first_result[0][0], 200)
+
+    def test_background_check_does_not_block_delivery_or_notification_http_requests(self):
+        from datetime import datetime, timedelta, timezone
+        from eve_agent.scheduler import ScheduledTasks
+        from eve_agent.storage import EveDatabase
+        scheduler = ScheduledTasks(EveDatabase(Path(self.temp_dir.name) / 'tasks.db'), start_monitor=False)
+        entered, release = threading.Event(), threading.Event()
+        calls = []
+        def slow_check(action):
+            calls.append(action)
+            entered.set()
+            if not release.wait(5):
+                raise RuntimeError('test executor timed out')
+            return {'outcome': 'no_change', 'reason': 'Keine Änderung'}
+        scheduler.register_executor('eve_turn', slow_check)
+        task = scheduler.execute_operation('create', {'request': 'Prüfe', 'schedule_type': 'delay',
+            'schedule': {'seconds': 1}})['result']
+        with scheduler.database.connect() as c:
+            c.execute('UPDATE scheduled_tasks SET next_run_at=?',
+                      ((datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat(),))
+        bridge = mock.Mock()
+        bridge.deliveries.side_effect = lambda payload: {'deliveries': scheduler.claim_deliveries()}
+        server = self.make_server(chatto_handler=bridge, chatto_token='test-token',
+                                  notification_handler=scheduler.pop_due, max_concurrent_requests=1)
+        server.start()
+        scheduler.start()
+        try:
+            self.assertTrue(entered.wait(2))
+            for _ in range(12):
+                status, _, payload = self.request_json(
+                    server, '/api/chatto/deliveries', data=b'{}', timeout=.5,
+                    headers={'Authorization': 'Bearer test-token'})
+                self.assertEqual(200, status)
+                self.assertEqual({'deliveries': []}, payload)
+                self.assertEqual(200, self.request_json(server, '/api/notifications', data=b'{}', timeout=.5)[0])
+            scheduler.update_task(task['id'], {'status': 'paused'})
+            self.assertEqual('paused', scheduler.get_task(task['id'])['status'])
+            self.assertEqual(1, len(calls))
+            self.assertFalse(release.is_set())
+        finally:
+            release.set()
+            scheduler.stop()
+            scheduler._monitor_thread.join(2)
+        self.assertFalse(scheduler._monitor_thread.is_alive())
+        self.assertEqual('paused', scheduler.get_task(task['id'])['status'])
 
     def test_invalid_message_is_400_and_releases_request_slot(self):
         server = self.make_server(
@@ -555,6 +604,22 @@ class VisualServerTest(unittest.TestCase):
                 self.request_json(server, '/api/brainwatch/conversation-learning', data=json.dumps(value).encode(), method='POST')
             self.assertEqual(400, error.exception.code)
             error.exception.close()
+
+    def test_targeted_learning_retry_validates_the_turn_before_dispatch(self):
+        calls = []
+        server = self.make_server(brainwatch_handler=lambda *args: calls.append(args) or {'status': 'waiting'})
+        server.start()
+        status, _, _ = self.request_json(server, '/api/brainwatch/conversation-learning',
+            data=json.dumps({'action': 'retry_turn', 'turn_id': 'chosen-turn'}).encode(), method='POST')
+        self.assertEqual(200, status)
+        self.assertEqual(('conversation_learning_control', None, {'action': 'retry_turn', 'turn_id': 'chosen-turn'}), calls[-1])
+        for value in [{'action': 'retry_turn'}, {'action': 'retry_turn', 'turn_id': ''},
+                      {'action': 'retry_turn', 'turn_id': 5}, {'action': 'retry_turn', 'turn_id': 'x', 'note': 'extra'}]:
+            with self.subTest(value=value), self.assertRaises(urllib.error.HTTPError) as error:
+                self.request_json(server, '/api/brainwatch/conversation-learning', data=json.dumps(value).encode(), method='POST')
+            self.assertEqual(400, error.exception.code)
+            error.exception.close()
+        self.assertEqual(1, len(calls))
 
     def test_working_memory_graph_route_dispatches_read_only_projection(self):
         calls = []

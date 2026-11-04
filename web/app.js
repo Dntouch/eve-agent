@@ -6911,6 +6911,7 @@
   function conversationLearningJobCard(item) {
     const statusHelp = window.EveLearningHelp.status(item.status);
     const card = document.createElement("article"); card.className = `conversation-learning-job is-${item.status}`;
+    card.dataset.turnId = item.turn_id;
     const head = document.createElement("header");
     const heading = document.createElement("div");
     const title = document.createElement("strong"); title.textContent = item.conversation_title || `Turn ${String(item.turn_id).slice(0, 12)}`;
@@ -6922,6 +6923,13 @@
     badge.textContent = ({reviewed: "GEPRÜFT", applied: "ÜBERNOMMEN", failed: "OHNE ABSCHLUSS",
       pending: "WARTEND", running: "IN VERARBEITUNG", no_persist: "BEWUSST NICHT GESPEICHERT"})[item.status] || item.status;
     badge.title = statusHelp.text.join(" ");
+    if (item.status === "failed" || item.status === "reviewed") {
+      const selection = document.createElement("input"); selection.type = "checkbox";
+      selection.className = "conversation-learning-select";
+      selection.setAttribute("aria-label", `Zum erneuten Lernen auswählen: ${title.textContent}`);
+      selection.addEventListener("change", () => updateConversationLearningSelection(card.closest(".conversation-learning-results")));
+      head.append(selection);
+    }
     head.append(heading, badge, learningHelpButton(statusHelp)); card.append(head);
 
     const source = document.createElement("blockquote"); source.textContent = item.user_content || "Der Quelltext ist nicht mehr vorhanden."; card.append(source);
@@ -6955,27 +6963,18 @@
       review.textContent = item.status === "reviewed" ? "WIEDER ÖFFNEN" : "ALS GEPRÜFT ABSCHLIESSEN";
       const reviewHelp = window.EveLearningHelp.review(item.status === "reviewed");
       review.title = reviewHelp.text.join(" ");
-      review.addEventListener("click", async () => {
-        review.disabled = true;
-        try {
-          const response = await fetchWithTimeout("/api/brainwatch/conversation-learning", {
-            method: "POST", headers: { ...auth, "Content-Type": "application/json" },
-            body: JSON.stringify({ action: item.status === "reviewed" ? "reopen_review" : "review", turn_id: item.turn_id, note: note.value }),
-          });
-          const result = await readJsonResponse(response, "Lernfehler prüfen");
-          if (!response.ok) throw new Error(result.error || "Prüfstatus konnte nicht gespeichert werden.");
-          await loadBrainwatchStatistics();
-          elements.brainwatchStatisticsStatus.textContent = item.status === "reviewed"
-            ? "Lernfehler wieder geöffnet. Er kann erneut eingereiht werden."
-            : "Lernfehler geprüft und abgeschlossen. Er wird nicht erneut eingereiht.";
-        } catch (error) { review.disabled = false; review.textContent = error.message; }
-      });
+      review.addEventListener("click", () => changeConversationLearningJobs(
+        card.closest(".conversation-learning-results"), [card], item.status === "reviewed" ? "reopen_review" : "review"));
+      const retry = document.createElement("button"); retry.type = "button"; retry.className = "eve-button eve-button--secondary";
+      retry.textContent = "ERNEUT LERNEN";
+      retry.title = "Reiht nur diesen Eintrag erneut zum Lernen ein. Eine abgeschlossene Prüfung wird dabei wieder geöffnet.";
+      retry.addEventListener("click", () => changeConversationLearningJobs(card.closest(".conversation-learning-results"), [card], "retry_turn"));
       if (item.reviewed_at) {
         const reviewed = document.createElement("small");
         reviewed.textContent = `Geprüft am ${new Date(item.reviewed_at).toLocaleString("de-DE")}`;
         actions.append(reviewed);
       }
-      actions.append(note, review, learningHelpButton(reviewHelp)); card.append(actions);
+      actions.append(note, review, learningHelpButton(reviewHelp), retry); card.append(actions);
     }
 
     const claims = item.claims || [];
@@ -7033,25 +7032,115 @@
     return card;
   }
 
+  function updateConversationLearningSelection(host) {
+    const inputs = [...host.querySelectorAll(".conversation-learning-select")];
+    const selected = inputs.filter((input) => input.checked).length;
+    const retry = host.querySelector(".conversation-learning-retry-selected");
+    if (retry) {
+      retry.textContent = `AUSWAHL ERNEUT LERNEN (${selected})`;
+      retry.disabled = !selected || host.dataset.busy === "true";
+    }
+    const all = host.querySelector(".conversation-learning-select-all");
+    if (all) {
+      all.checked = inputs.length > 0 && selected === inputs.length;
+      all.indeterminate = selected > 0 && selected < inputs.length;
+      all.disabled = !inputs.length || host.dataset.busy === "true";
+    }
+  }
+
+  async function changeConversationLearningJobs(host, cards, action) {
+    if (!host || host.dataset.busy === "true" || !cards.length) return;
+    host.dataset.busy = "true";
+    const controls = [...host.querySelectorAll("button, input, textarea")].map((node) => [node, node.disabled]);
+    controls.forEach(([node]) => { node.disabled = true; });
+    let completed = 0;
+    let failure = "";
+    let focusTarget = null;
+    try {
+      for (const card of cards) {
+        const payload = { action, turn_id: card.dataset.turnId };
+        if (action !== "retry_turn") payload.note = card.querySelector("textarea")?.value || "";
+        elements.brainwatchStatisticsStatus.textContent = `${completed + 1} von ${cards.length} wird bearbeitet …`;
+        const response = await fetchWithTimeout("/api/brainwatch/conversation-learning", {
+          method: "POST", headers: { ...auth, "Content-Type": "application/json" }, body: JSON.stringify(payload),
+        });
+        const result = await readJsonResponse(response, "Lernvorgang bearbeiten");
+        if (!response.ok) throw new Error(result.error || "Lernvorgang konnte nicht bearbeitet werden.");
+        const scrollTop = elements.brainwatchStatisticsWorkspace.scrollTop;
+        const next = card.nextElementSibling || card.previousElementSibling;
+        card.remove();
+        completed += 1;
+        host.dataset.total = String(Math.max(0, Number(host.dataset.total) - 1));
+        // Removing a row from this status also shifts all following pages.
+        host.dataset.nextOffset = String(Math.max(0, Number(host.dataset.nextOffset) - 1));
+        const total = Number(host.dataset.total);
+        host.querySelector(".conversation-learning-result-count").textContent = `${brainwatchCountFormat.format(total)} Ergebnis${total === 1 ? "" : "se"}`;
+        if (!host.querySelector(".conversation-learning-job")) {
+          const empty = document.createElement("p");
+          empty.textContent = Number(host.dataset.total) ? "Weitere Einträge können unten geladen werden." : "Alle Einträge dieser Liste sind bearbeitet.";
+          host.querySelector(".conversation-learning-job-list").append(empty);
+        }
+        focusTarget = next?.querySelector("button") || host.querySelector(".conversation-learning-more") || host.querySelector("header button");
+        elements.brainwatchStatisticsWorkspace.scrollTop = scrollTop;
+      }
+    } catch (error) {
+      failure = error.message;
+    } finally {
+      controls.forEach(([node, disabled]) => { node.disabled = disabled; });
+      host.dataset.busy = "false";
+      updateConversationLearningSelection(host);
+      focusTarget?.focus({ preventScroll: true });
+    }
+    if (completed) {
+      try { await loadBrainwatchStatistics(); }
+      catch (error) { failure = `${failure ? `${failure} · ` : ""}Zähler konnten nicht aktualisiert werden: ${error.message}`; }
+    }
+    const message = action === "retry_turn" ? `${completed} Einträge erneut zum Lernen eingereiht.`
+      : action === "review" ? "Lernfehler geprüft und abgeschlossen." : "Lernfehler wieder geöffnet.";
+    elements.brainwatchStatisticsStatus.textContent = failure ? `${completed} von ${cards.length} bearbeitet. ${failure}` : message;
+  }
+
   async function loadConversationLearningResults(status, label, host, trigger, offset = 0) {
+    if (host.dataset.busy === "true") return;
     if (!offset) {
       host.replaceChildren(); host.hidden = false;
+      host.dataset.status = status;
       const loading = document.createElement("p"); loading.textContent = `${label} werden gelesen …`; host.append(loading);
       host.closest(".brainwatch-statistics-section")?.querySelectorAll(".brainwatch-statistic-card.is-interactive").forEach((card) => card.classList.toggle("is-active", card === trigger));
     }
     const params = new URLSearchParams({ view: "jobs", status, limit: "40", offset: String(offset) });
     const response = await fetchWithTimeout(`/api/brainwatch/conversation-learning?${params}`, { cache: "no-store", headers: auth });
     const page = await readJsonResponse(response, "Lernergebnisse");
+    if (host.dataset.status !== status || host.hidden) return;
     if (!response.ok) throw new Error(page.error || "Lernergebnisse konnten nicht gelesen werden.");
+    host.dataset.total = String(page.total || 0);
+    host.dataset.nextOffset = String(page.page?.next_offset || 0);
     let list = host.querySelector(".conversation-learning-job-list");
     if (!offset) {
       host.replaceChildren();
       const head = document.createElement("header");
       const title = document.createElement("h4"); title.textContent = label;
-      const count = document.createElement("span"); count.textContent = `${brainwatchCountFormat.format(page.total || 0)} Ergebnis${page.total === 1 ? "" : "se"}`;
+      const count = document.createElement("span"); count.className = "conversation-learning-result-count"; count.textContent = `${brainwatchCountFormat.format(page.total || 0)} Ergebnis${page.total === 1 ? "" : "se"}`;
       const close = document.createElement("button"); close.type = "button"; close.className = "eve-button eve-button--ghost"; close.textContent = "SCHLIESSEN";
-      close.addEventListener("click", () => { host.hidden = true; host.replaceChildren(); trigger?.classList.remove("is-active"); });
+      close.addEventListener("click", () => {
+        host.hidden = true; host.replaceChildren(); delete host.dataset.status;
+        host.closest(".brainwatch-statistics-section")?.querySelectorAll(".is-active").forEach((card) => card.classList.remove("is-active"));
+      });
       head.append(title, count, close); host.append(head);
+      if (status === "failed" || status === "reviewed") {
+        const toolbar = document.createElement("div"); toolbar.className = "conversation-learning-selection";
+        const selectLabel = document.createElement("label");
+        const selectAll = document.createElement("input"); selectAll.type = "checkbox"; selectAll.className = "conversation-learning-select-all";
+        selectAll.addEventListener("change", () => {
+          host.querySelectorAll(".conversation-learning-select").forEach((input) => { input.checked = selectAll.checked; });
+          updateConversationLearningSelection(host);
+        });
+        selectLabel.append(selectAll, document.createTextNode("Geladene Einträge auswählen"));
+        const retry = document.createElement("button"); retry.type = "button"; retry.className = "conversation-learning-retry-selected eve-button eve-button--secondary";
+        retry.addEventListener("click", () => changeConversationLearningJobs(host,
+          [...host.querySelectorAll(".conversation-learning-select")].filter((input) => input.checked).map((input) => input.closest(".conversation-learning-job")), "retry_turn"));
+        toolbar.append(selectLabel, retry); host.append(toolbar);
+      }
       list = document.createElement("div"); list.className = "conversation-learning-job-list"; host.append(list);
     }
     for (const item of page.items || []) list.append(conversationLearningJobCard(item));
@@ -7061,14 +7150,20 @@
     }
     if (page.page?.has_more) {
       const more = document.createElement("button"); more.type = "button"; more.className = "conversation-learning-more eve-button"; more.textContent = "WEITERE ERGEBNISSE";
-      more.addEventListener("click", () => { more.disabled = true; loadConversationLearningResults(status, label, host, trigger, page.page.next_offset).catch((error) => { more.disabled = false; more.textContent = error.message; }); });
+      more.addEventListener("click", () => { more.disabled = true; loadConversationLearningResults(status, label, host, trigger, Number(host.dataset.nextOffset)).catch((error) => { more.disabled = false; more.textContent = error.message; }); });
       host.append(more);
     }
+    updateConversationLearningSelection(host);
   }
 
   function renderBrainwatchStatistics(data) {
     const memory = data.memory || {}, home = data.home_assistant || {}, tools = data.tools || {}, activity = data.activity || {};
-    const content = elements.brainwatchStatisticsContent; content.replaceChildren();
+    const content = elements.brainwatchStatisticsContent;
+    // Retain the actual result nodes, including pagination, notes and disclosures.
+    const previousResults = content.querySelector(".conversation-learning-results");
+    const scrollTop = elements.brainwatchStatisticsWorkspace.scrollTop;
+    const focused = document.activeElement;
+    content.replaceChildren();
     const learning = data.conversation_learning;
     if (learning) {
       const labels = {
@@ -7079,7 +7174,8 @@
         "Lernen aus Gesprächen",
         "EVE wertet offene Turns gebündelt im Leerlauf aus. Neue Benutzeraktivität pausiert laufende Inferenz; unvollständige Ergebnisse gelangen nicht ins Memory.",
       );
-      const results = document.createElement("section"); results.className = "conversation-learning-results"; results.hidden = true;
+      const results = previousResults || document.createElement("section"); results.className = "conversation-learning-results";
+      if (!previousResults) results.hidden = true;
       const inspect = (status, label) => (trigger) => {
         loadConversationLearningResults(status, label, results, trigger).catch((error) => {
           results.hidden = false; results.replaceChildren(); const message = document.createElement("p"); message.textContent = error.message; results.append(message);
@@ -7108,6 +7204,10 @@
         ]);
       }
       appendBrainwatchStatisticGrid(section, learningCards);
+      const statuses = [null, "pending", "running", "evidenced", "no_persist", "failed", "reviewed", "inconsistent"];
+      section.querySelectorAll(".brainwatch-statistic-card").forEach((card, index) => {
+        card.classList.toggle("is-active", !results.hidden && statuses[index] === results.dataset.status);
+      });
       const detail = document.createElement("p");
       detail.className = "conversation-learning-detail";
       detail.textContent = `${learning.batch_size} Turns pro Paket · Start nach ${learning.idle_delay_seconds} Sekunden Leerlauf`;
@@ -7130,6 +7230,9 @@
             });
             const result = await readJsonResponse(response, "Gesprächslernen");
             if (!response.ok) throw new Error(result.error || "Gesprächslernen konnte nicht gesteuert werden.");
+            if (action === "retry_failed" && !results.hidden && results.dataset.status === "failed") {
+              await loadConversationLearningResults("failed", "Lernversuche ohne Abschluss", results);
+            }
             await loadBrainwatchStatistics();
           } catch (error) {
             elements.brainwatchStatisticsStatus.textContent = error.message;
@@ -7228,6 +7331,8 @@
     ];
     for (const text of factTexts) { const item = document.createElement("article"); item.textContent = text; list.append(item); }
     facts.append(list); content.append(facts);
+    if (focused && previousResults?.contains(focused)) focused.focus({ preventScroll: true });
+    elements.brainwatchStatisticsWorkspace.scrollTop = scrollTop;
   }
 
   function renderBrainwatchStatisticsInspector() {

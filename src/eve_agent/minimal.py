@@ -20,6 +20,7 @@ from datetime import datetime
 from jsonschema import Draft202012Validator
 
 from .backend_turns import TurnCancelled
+from .bot_activity import tool_activity
 from .memory import MemoryHit
 from .provenance import PlanningProvenance
 from .transport_access import capability_allowed, require_capability, transport_metadata
@@ -32,7 +33,7 @@ CORE_PROMPT = (
     "Unbekannte Schnittstellen: recherchiere offizielle Quellen; rate keine Befehle oder Pfade. "
     "Eine erfolgreiche Antwort ohne verlangte Information erfüllt den Auftrag nicht. "
     "Memory-Kontext: unvollständige Trefferauswahl. Aussagensuche: memory.find; Ressourceninventar: memory.inventory. "
-    "Antworte in der Sprache des Benutzers."
+    "Antworte durchgehend in der Sprache des Benutzers."
 )
 
 def operation_capability(operation):
@@ -231,6 +232,27 @@ class NativeToolRuntime:
             selected["memory"] = deepcopy(selected["memory"])
             selected["memory"]["operations"].pop("revise", None)
         tools, bindings = self._native_tools(selected)
+        if scheduled_metadata() is not None:
+            schema = {
+                "type": "object", "additionalProperties": False,
+                "properties": {
+                    "outcome": {"type": "string", "const": "no_change"},
+                    "reason": {"type": "string", "minLength": 1, "pattern": r"\S"},
+                },
+                "required": ["outcome", "reason"],
+            }
+            name = "eve__complete_check"
+            tools.append({"type": "function", "function": {
+                "name": name,
+                "description": (
+                    "Finish this scheduled check successfully with no notification when nothing "
+                    "needs reporting. Terminal: call alone, then stop. The scheduler handles future checks. "
+                    "Do not use for a reminder or a report that must be delivered."
+                ),
+                "parameters": schema,
+            }})
+            bindings[name] = {"capability": "eve_runtime", "operation": "complete_check",
+                              "effect": "read", "schema": schema}
         return [loader, *tools], {loader["function"]["name"]: loader_binding, **bindings}
 
     @staticmethod
@@ -698,10 +720,18 @@ class NativeToolRuntime:
         raise ValueError("Arithmetic result is outside the supported numeric range")
 
     def _execute_direct(self, capability, operation, parameters, state, images):
+        with tool_activity(capability):
+            return self._execute_direct_tracked(capability, operation, parameters, state, images)
+
+    def _execute_direct_tracked(self, capability, operation, parameters, state, images):
         from .dialog import Route
         a = self.agent
         if capability != "eve_runtime":
             require_capability(capability)
+        if capability == "eve_runtime" and operation == "complete_check":
+            if scheduled_metadata() is None:
+                raise ValueError("Ein stiller Abschluss benötigt einen geplanten Durchlauf")
+            return {"status": "completed", "outcome": "no_change", "reason": parameters["reason"]}, Route.CHAT
         if capability == "eve_runtime" and operation == "load_capabilities":
             requested = parameters.get("capabilities") or []
             if not isinstance(requested, list) or not requested:
@@ -942,6 +972,8 @@ class NativeToolRuntime:
                         records[-1]['experience'].get('action_link_status'), 'semantic_candidate'))
                 if records else {'kind': 'pending', 'reason': 'deferred_model_assessment'})
         self.last_result = deepcopy(result or {"status": "success", "summary": answer})
+        if self.last_result.get("outcome") == "no_change":
+            return self.agent._record_no_change(self.last_result["reason"], route)
         return self.agent._record(text, answer, route)
 
     def respond(self, text, images=None, conversation_id=None):
@@ -957,7 +989,8 @@ class NativeToolRuntime:
         try:
             answer = self._respond(text, images, conversation_id)
             if self.working_session:
-                self.working_session.finish("completed", answer)
+                self.working_session.finish("completed", self.last_result
+                    if (self.last_result or {}).get("outcome") == "no_change" else answer)
             return answer
         except BaseException as exc:
             if self.working_session:
@@ -1224,6 +1257,8 @@ class NativeToolRuntime:
                     operation = binding["operation"]
                     try:
                         Draft202012Validator(binding["schema"]).validate(parameters)
+                        if capability == "eve_runtime" and operation == "complete_check" and len(calls) != 1:
+                            raise ValueError("Der endgültige Abschluss muss allein aufgerufen werden")
                         # The presence renderer already understands generic
                         # ``tool:*`` states. Publish the exact dispatched
                         # capability here, at the native tool boundary, so the
@@ -1288,6 +1323,11 @@ class NativeToolRuntime:
                     "content": json.dumps(prompt_result, ensure_ascii=False, separators=(",", ":"), default=str),
                 }
                 messages.append(tool_message)
+                if (capability == "eve_runtime" and operation == "complete_check"
+                        and result.get("status") == "completed"):
+                    return self._finish(text, "", last_route, result={
+                        "status": "success", "outcome": "no_change", "reason": result["reason"],
+                    })
                 if stored_result:
                     self.working_session.tool_frame(tool_message, stored_result,
                         readable=capability == "working_memory" and operation in {"read", "inspect", "list", "events", "status", "workspaces"},

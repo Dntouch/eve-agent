@@ -215,6 +215,12 @@ class VisualServer:
                 if path.startswith("/api/") and not self._trusted_browser_request():
                     self._json(403, {"error": "Cross-Origin-Anfragen sind nicht erlaubt"})
                     return
+                if not path.startswith("/api/"):
+                    # Loading the UI and its assets must not compete with API
+                    # calls waiting for model work or observing long turns.
+                    # The separate connection limit still bounds these requests.
+                    super().do_GET()
+                    return
                 if not self._acquire_request_slot():
                     return
                 try:
@@ -496,7 +502,11 @@ class VisualServer:
                         payload = json.loads(self._read_body(length))
                         if not isinstance(payload, dict):
                             raise ValueError("Learning-Steuerung erwartet ein Objekt")
-                        if payload.get("action") in {"review", "reopen_review"}:
+                        if payload.get("action") == "retry_turn":
+                            if (set(payload) != {"action", "turn_id"} or not isinstance(payload.get("turn_id"), str)
+                                    or not payload["turn_id"].strip()):
+                                raise ValueError("Erneutes Lernen erwartet eine Turn-ID")
+                        elif payload.get("action") in {"review", "reopen_review"}:
                             if (set(payload) - {"action", "turn_id", "note"} or not isinstance(payload.get("turn_id"), str)
                                     or not payload["turn_id"].strip() or not isinstance(payload.get("note", ""), str)):
                                 raise ValueError("Lernprüfung erwartet eine Turn-ID und optional eine Prüfnotiz")
@@ -1402,6 +1412,15 @@ class VisualServer:
                         self._json(200, handle_chatto.deliveries(payload))
                     elif path == "/api/chatto/delivery-ack":
                         self._json(200, handle_chatto.delivery_ack(payload))
+                    elif path == "/api/chatto/delivery-start":
+                        self._json(200, handle_chatto.delivery_start(payload))
+                    elif path == "/api/chatto/jobs":
+                        self._json(200, handle_chatto.job_status(payload))
+                    elif path == "/api/chatto/job-retry":
+                        self._json(200, handle_chatto.retry_job_delivery(payload))
+                    elif path == "/api/chatto/submit":
+                        self._validate_images(payload.get("images", []))
+                        self._json(202, handle_chatto.submit(payload))
                     elif path == "/api/chatto/conversations":
                         self._json(201, handle_chatto.create_conversation(payload))
                     elif path == "/api/chatto/conversation":

@@ -6,6 +6,7 @@ import sqlite3
 import threading
 import time
 import uuid
+from contextlib import nullcontext
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable
@@ -56,6 +57,9 @@ class ScheduledTasks:
         self.database = database
         self.home_assistant = home_assistant
         self._lock = threading.RLock()
+        # Model execution can take minutes. Never hold the data/delivery lock
+        # while running an executor, and never queue another scheduler tick.
+        self._run_lock = threading.Lock()
         self._executors: dict[str, Callable[[dict], dict]] = {"notify": self._notify}
         self.conversation_id: str | None = None
         self._monitor_thread: threading.Thread | None = None
@@ -67,6 +71,20 @@ class ScheduledTasks:
             connection.execute("""CREATE TABLE IF NOT EXISTS scheduled_deliveries (
                 id TEXT PRIMARY KEY, target_json TEXT NOT NULL, payload_json TEXT NOT NULL,
                 status TEXT NOT NULL DEFAULT 'pending', error TEXT, updated_at TEXT NOT NULL)""")
+            columns = {row['name'] for row in connection.execute('PRAGMA table_info(scheduled_deliveries)')}
+            for name, definition in (('claim_token', 'TEXT'), ('claim_until', 'REAL'),
+                                     ('retry_at', 'REAL NOT NULL DEFAULT 0')):
+                if name not in columns:
+                    connection.execute(f'ALTER TABLE scheduled_deliveries ADD COLUMN {name} {definition}')
+            # Old sending rows have no dispatch marker. Their outcome cannot be
+            # inferred safely, so preserve the output without publishing it again.
+            connection.execute("""UPDATE scheduled_deliveries SET status='uncertain',
+                error='Send interrupted; delivery outcome unknown',updated_at=?
+                WHERE status='sending'""", (_utc_iso(datetime.now(timezone.utc)),))
+            connection.execute("""UPDATE scheduled_deliveries SET status='pending',
+                claim_token=NULL,claim_until=NULL WHERE status='claimed'""")
+            for row in connection.execute('SELECT id,status FROM scheduled_deliveries').fetchall():
+                self._delivery_result(connection, row['id'], row['status'])
         if start_monitor:
             self.start()
 
@@ -116,7 +134,8 @@ class ScheduledTasks:
         target_schema = {"type": "string", "minLength": 1,
                          "description": (
                              "Omit or use current for this conversation. For another destination, "
-                             "use an ID returned by list_output_targets."
+                             "use an ID returned by list_output_targets. For a Chatto reminder to be delivered "
+                             "by DM, select chatto:dm:self from that list, even when requested in a channel."
                          )}
         task_id_schema = {"type": "string", "minLength": 1,
                           "description": "Task ID returned by create or list."}
@@ -244,7 +263,10 @@ class ScheduledTasks:
                     return {"status": "completed", "result": [dict(row) for row in rows]}
                 if not any(row["id"] == arguments["delivery_id"] and row["status"] == "blocked" for row in rows):
                     raise ValueError("Nur blockierte Zustellungen können erneut versucht werden")
-                connection.execute("UPDATE scheduled_deliveries SET status='pending',error=NULL WHERE id=? AND status='blocked'", (arguments["delivery_id"],))
+                connection.execute("""UPDATE scheduled_deliveries SET status='pending',error=NULL,
+                    claim_token=NULL,claim_until=NULL,retry_at=0,updated_at=? WHERE id=? AND status='blocked'""",
+                    (_utc_iso(datetime.now(timezone.utc)), arguments["delivery_id"]))
+                self._delivery_result(connection, arguments['delivery_id'], 'pending')
             return {"status": "updated", "result": {"delivery_id": arguments["delivery_id"], "status": "pending"}}
         if operation == "list_runs":
             return {"status": "completed", "result": self.list_runs(
@@ -273,19 +295,72 @@ class ScheduledTasks:
         raise ValueError("Unbekanntes oder nicht erlaubtes Ausgabeziel")
 
     def claim_deliveries(self):
+        """Lease one output; only claims that never started dispatch may replay."""
+        now = time.time()
+        token = uuid.uuid4().hex
         with self._lock, self.database.connect() as connection:
-            rows = connection.execute("""UPDATE scheduled_deliveries SET status='sending', updated_at=?
-                WHERE id IN (SELECT id FROM scheduled_deliveries WHERE status='pending' ORDER BY updated_at LIMIT 10)
-                RETURNING *""", (_utc_iso(datetime.now(timezone.utc)),)).fetchall()
+            connection.execute('BEGIN IMMEDIATE')
+            self._expire_deliveries(connection)
+            rows = connection.execute("""UPDATE scheduled_deliveries SET status='claimed',
+                claim_token=?,claim_until=?,updated_at=? WHERE id=(SELECT id FROM scheduled_deliveries
+                WHERE status='pending' AND retry_at<=? ORDER BY updated_at,id LIMIT 1) RETURNING *""",
+                (token, now + 300, _utc_iso(datetime.now(timezone.utc)), now)).fetchall()
+            for row in rows:
+                self._delivery_result(connection, row['id'], 'claimed')
         return [{"id": row["id"], "target": json.loads(row["target_json"]),
-                 "payload": json.loads(row["payload_json"])} for row in rows]
+                 "payload": json.loads(row["payload_json"]), 'claim_token': token} for row in rows]
 
-    def acknowledge_delivery(self, identifier, status, error=None):
-        if status not in {"delivered", "blocked", "uncertain"}:
+    def _expire_deliveries(self, connection):
+        # Also called by the scheduler monitor: a disconnected bot must not
+        # leave a started send stuck forever awaiting another delivery poll.
+        expired = connection.execute("""UPDATE scheduled_deliveries SET
+            status=CASE WHEN status='claimed' THEN 'pending' ELSE 'uncertain' END,
+            error=CASE WHEN status='sending' THEN 'Send timed out; delivery outcome unknown' ELSE error END,
+            updated_at=? WHERE status IN ('claimed','sending') AND claim_until<=? RETURNING id,status""",
+            (_utc_iso(datetime.now(timezone.utc)), time.time())).fetchall()
+        for row in expired:
+            self._delivery_result(connection, row['id'], row['status'])
+
+    def begin_delivery(self, identifier, token):
+        """Persist the irreversible boundary immediately before visible output."""
+        with self.database.connect() as connection:
+            changed = connection.execute("""UPDATE scheduled_deliveries SET status='sending',
+                claim_until=?,updated_at=? WHERE id=? AND claim_token=?
+                AND status='claimed' AND claim_until>?""",
+                (time.time() + 300, _utc_iso(datetime.now(timezone.utc)), identifier, token, time.time())).rowcount
+            if not changed:
+                raise ValueError('Scheduled delivery claim is no longer valid')
+            self._delivery_result(connection, identifier, 'sending')
+
+    def acknowledge_delivery(self, identifier, status, error=None, *, claim_token=None):
+        """Accept idempotent ACKs for the current claim, including late success."""
+        if status not in {"delivered", "blocked", "uncertain", "retry"}:
             raise ValueError("Invalid delivery status")
         with self.database.connect() as connection:
-            connection.execute("UPDATE scheduled_deliveries SET status=?, error=?, updated_at=? WHERE id=? AND status='sending'",
-                               (status, redact_sensitive(str(error or ""))[:500], _utc_iso(datetime.now(timezone.utc)), identifier))
+            connection.execute('BEGIN IMMEDIATE')
+            row = connection.execute('SELECT status,claim_token FROM scheduled_deliveries WHERE id=?', (identifier,)).fetchone()
+            if row is None or not claim_token or row['claim_token'] != claim_token:
+                raise ValueError('Scheduled delivery claim is no longer valid')
+            stored = 'pending' if status == 'retry' else status
+            if row['status'] == stored:
+                return
+            allowed = {'claimed'} if status in {'retry', 'blocked'} else {'sending'}
+            if status == 'delivered':
+                allowed.add('uncertain')
+            if row['status'] not in allowed:
+                raise ValueError('Invalid scheduled delivery transition')
+            connection.execute("""UPDATE scheduled_deliveries SET status=?,error=?,retry_at=?,updated_at=?
+                WHERE id=?""", (stored, redact_sensitive(str(error or ''))[:500],
+                    time.time() + 15 if status == 'retry' else 0, _utc_iso(datetime.now(timezone.utc)), identifier))
+            self._delivery_result(connection, identifier, stored)
+
+    @staticmethod
+    def _delivery_result(connection, identifier, status):
+        # Execution success and confirmed transport delivery are independent.
+        for table, column in (('task_runs', 'result_json'), ('scheduled_deliveries', 'payload_json')):
+            connection.execute(f"""UPDATE {table} SET {column}=json_set({column},
+                '$.notification.delivered',json(?),'$.notification.delivery_status',?)
+                WHERE id=?""", ('true' if status == 'delivered' else 'false', status, identifier))
 
     def register_executor(self, tool: str, executor: Callable[[dict], dict]) -> None:
         if not re.fullmatch(r"[a-z][a-z0-9_]{0,63}", tool):
@@ -312,6 +387,9 @@ class ScheduledTasks:
         if not context or context.get("access_profile") == "owner_dm":
             return True
         origin = task["action"].get("execution_context") or {}
+        target = task["action"].get("output_target") or {}
+        if target.get("recipient_user_id") and target["recipient_user_id"] != context.get("sender_id"):
+            return False
         keys = ["server_url", "bot_id", "room_id", "thread_root_id", "access_profile"]
         if context.get("access_profile") == "member_dm":
             keys.append("sender_id")
@@ -515,15 +593,20 @@ class ScheduledTasks:
         if limit is not None and int(limit) <= 0:
             return []
         requested = None if limit is None else int(limit)
-        with self._lock:
+        # In service mode only the background monitor executes tasks. HTTP
+        # notification polling must only read already completed outputs.
+        if not self._monitor_thread or not self._monitor_thread.is_alive():
             self._run_due(requested)
+        with self._lock:
             with self.database.connect() as connection:
+                connection.execute('BEGIN IMMEDIATE')
                 suffix = "" if requested is None else " LIMIT ?"
                 parameters = () if requested is None else (requested,)
                 rows = connection.execute(
                     """SELECT id, result_json FROM task_runs
                        WHERE status='succeeded' AND json_extract(result_json, '$.notification.message') IS NOT NULL
                          AND COALESCE(json_extract(result_json, '$.notification.delivered'), 0) = 0
+                         AND NOT EXISTS (SELECT 1 FROM scheduled_deliveries WHERE id=task_runs.id)
                        ORDER BY created_at, id""" + suffix, parameters,
                 ).fetchall()
                 result = []
@@ -539,8 +622,7 @@ class ScheduledTasks:
     def _monitor(self) -> None:
         while not self._stop.is_set():
             try:
-                with self._lock:
-                    self._run_due(20)
+                self._run_due(20)
             except (OSError, sqlite3.Error, ValueError, RuntimeError):
                 # A transient backend or database failure is recorded on an
                 # individual run where possible. The daemon must stay alive.
@@ -548,10 +630,19 @@ class ScheduledTasks:
             self._stop.wait(1)
 
     def _run_due(self, limit: int | None) -> None:
+        if not self._run_lock.acquire(blocking=False):
+            return
+        try:
+            self._run_due_unlocked(limit)
+        finally:
+            self._run_lock.release()
+
+    def _run_due_unlocked(self, limit: int | None) -> None:
         now = datetime.now(timezone.utc)
         # Expire before claiming work, including overdue tasks after downtime.
         # Paused tasks also finish when their deadline passes.
         with self.database.connect() as connection:
+            self._expire_deliveries(connection)
             for task in connection.execute("SELECT * FROM scheduled_tasks WHERE status IN ('active','paused') AND json_extract(schedule_json,'$.ends_at') IS NOT NULL").fetchall():
                 end = _from_iso(json.loads(task["schedule_json"]).get("ends_at"))
                 if end is not None and now > end:
@@ -574,7 +665,17 @@ class ScheduledTasks:
             run_id = str(uuid.uuid4())
             started = _utc_iso(datetime.now(timezone.utc))
             try:
-                with self.database.connect() as connection:
+                with self._lock, self.database.connect() as connection:
+                    connection.execute('BEGIN IMMEDIATE')
+                    # A task may have been paused, deleted or rescheduled since
+                    # the due list was read. Claim only its current occurrence.
+                    current = connection.execute(
+                        "SELECT * FROM scheduled_tasks WHERE id=? AND status='active' AND next_run_at=?",
+                        (row['id'], scheduled_for),
+                    ).fetchone()
+                    if current is None:
+                        continue
+                    row = current
                     connection.execute(
                         """INSERT INTO task_runs(id, task_id, status, scheduled_for, started_at,
                            attempt, idempotency_key, created_at) VALUES (?, ?, 'running', ?, ?, 1, ?, ?)""",
@@ -592,11 +693,15 @@ class ScheduledTasks:
                 result = self._executors[tool](action)
                 target = action.get("output_target")
                 if target and target.get("transport") == "chatto" and result.get("notification"):
+                    result["notification"]["delivered"] = False
+                    result["notification"]["delivery_status"] = 'pending'
                     with self.database.connect() as connection:
-                        connection.execute("INSERT INTO scheduled_deliveries VALUES (?, ?, ?, 'pending', NULL, ?)",
+                        connection.execute("""INSERT INTO scheduled_deliveries
+                            (id,target_json,payload_json,status,error,updated_at) VALUES (?, ?, ?, 'pending', NULL, ?)""",
                             (run_id, json.dumps(target), json.dumps(result, ensure_ascii=False), _utc_iso(datetime.now(timezone.utc))))
-                    result["notification"]["delivered"] = True
-                self._finish(row, run_id, result=result)
+                        self._finish(row, run_id, result=result, connection=connection)
+                else:
+                    self._finish(row, run_id, result=result)
             except sqlite3.IntegrityError:
                 # The unique idempotency key means another scheduler tick has
                 # already claimed this exact occurrence.
@@ -604,10 +709,11 @@ class ScheduledTasks:
             except Exception as exc:
                 self._finish(row, run_id, error=str(exc))
 
-    def _finish(self, task, run_id: str, *, result: dict | None = None, error: str | None = None) -> None:
+    def _finish(self, task, run_id: str, *, result: dict | None = None, error: str | None = None,
+                connection=None) -> None:
         finished = datetime.now(timezone.utc)
         run_status = "failed" if error else "succeeded"
-        with self.database.connect() as connection:
+        with self.database.connect() if connection is None else nullcontext(connection) as connection:
             # Respect end dates, pauses and deletions edited during a model turn.
             current = connection.execute("SELECT * FROM scheduled_tasks WHERE id=?", (task["id"],)).fetchone()
             schedule = json.loads(current["schedule_json"])

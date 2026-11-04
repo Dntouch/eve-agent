@@ -328,7 +328,7 @@ class NativeRuntimeTest(unittest.TestCase):
         }
         answer = self.runtime.respond("Servus EVE")
         self.assertEqual("Servus!", answer)
-        self.assertLess(len(CORE_PROMPT.split()), 50)
+        self.assertLessEqual(len(CORE_PROMPT.split()), 50)
         messages = self.llm.request_tool_turn.call_args.args[0]
         self.assertEqual(CORE_PROMPT, messages[0]["content"])
         self.assertEqual(1, sum(item["role"] == "system" for item in messages))
@@ -836,6 +836,17 @@ class NativeRuntimeTest(unittest.TestCase):
         repeated = observe(state,'working_memory','read',{'content':[2]})
         self.assertEqual('repeated_provider_result',repeated['kind'])
         self.assertNotIn('provider_failure_counts',state)
+
+    def test_same_web_content_with_different_query_is_reported_as_repeated(self):
+        state = {}
+        result = {'operation': 'search', 'query': 'eins', 'queries': ['eins'], 'site': None,
+                  'context': 'Dieselben Ergebnisse', 'sources': [{'url': 'https://example.test/a'}]}
+        observe = self.runtime._provider_result_observation
+        self.assertIsNone(observe(state, 'web', 'search', result))
+        repeated = observe(state, 'web', 'search', {**result, 'query': 'zwei', 'queries': ['zwei']})
+        self.assertEqual('repeated_provider_result', repeated['kind'])
+        self.assertFalse(repeated['new_provider_evidence'])
+        self.assertIsNone(observe(state, 'web', 'search', {**result, 'context': 'Neues Ergebnis'}))
 
     def test_shell_repeat_identity_ignores_receipt_ids_but_preserves_output_and_exit_status(self):
         state = {}

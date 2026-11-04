@@ -1614,33 +1614,44 @@ class ProductiveLearningPipeline(ShadowLearningPipeline):
                                   'previous_review_note': row['review_note']}, ensure_ascii=False), now))
         return {'turn_id': turn_id, 'status': 'failed' if reopen else 'reviewed'}
 
-    def retry_turn(self, turn_id: str) -> dict:
+    def retry_turn(self, turn_id: str, *, reopen_review: bool = False) -> dict:
         """Requeue a failed attempt, including an old rejection mislabeled no_persist.
 
         Genuine completed decisions are retained. No claim, proposal or source
         meaning is reconstructed from words here.
+        An explicit reopen_review combines reopening and requeueing in one
+        transaction, retaining the previous review in the audit history.
         """
+        if not isinstance(turn_id, str) or not turn_id.strip():
+            raise ValueError('Eine Turn-ID ist erforderlich')
         with self.database.connect(lifecycle_audit=False) as c:
             c.execute('BEGIN IMMEDIATE')
             row = c.execute('SELECT j.*,t.conversation_id,d.metadata_json FROM memory_learning_jobs j '
                 'JOIN turns t ON t.id=j.turn_id LEFT JOIN memory_learning_decisions d ON d.id=j.decision_id '
                 'WHERE j.turn_id=?', (turn_id,)).fetchone()
             if row is None:
-                raise KeyError('Lernauftrag wurde nicht gefunden')
-            if row['reviewed_at']:
+                raise ValueError('Lernauftrag wurde nicht gefunden')
+            if row['reviewed_at'] and not reopen_review:
                 raise ValueError('Geprüften Lernauftrag zuerst wieder öffnen')
             metadata = json.loads(row['metadata_json'] or '{}')
             legacy_rejection = (row['status'] == 'no_persist' and
                                 metadata.get('proposal_decision_type') in {'undetermined', 'shadow_error'})
             if row['status'] != 'failed' and not legacy_rejection:
                 raise ValueError('Nur fehlgeschlagene oder früher als no_persist verbuchte Ablehnungen erneut ausführen')
+            if row['reviewed_at']:
+                c.execute('INSERT INTO audit_events(conversation_id,event_type,actor,summary,details_json,created_at) '
+                    "VALUES (?,'learning_review_reopened','user',?,?,?)", (row['conversation_id'],
+                    'Lernfehler für erneutes Lernen wieder geöffnet', json.dumps({
+                        'turn_id': turn_id, 'error_class': row['error_class'],
+                        'previous_reviewed_at': row['reviewed_at'],
+                        'previous_review_note': row['review_note']}, ensure_ascii=False), _now()))
             c.execute('INSERT INTO audit_events(conversation_id,event_type,actor,summary,details_json,created_at) '
                 "VALUES (?,'learning_retry','system',?,?,?)", (row['conversation_id'],
                 'Fehlgeschlagenen Lernauftrag erneut eingereiht', json.dumps({
                     'turn_id': turn_id, 'previous_status': row['status'], 'previous_decision_id': row['decision_id'],
                     'previous_error': row['error_class'] or metadata.get('reason_code')}, ensure_ascii=False), _now()))
             c.execute("UPDATE memory_learning_jobs SET status='pending',decision_id=NULL,error_class=NULL,"
-                'started_at=NULL,completed_at=NULL,updated_at=? WHERE turn_id=?', (_now(), turn_id))
+                "started_at=NULL,completed_at=NULL,reviewed_at=NULL,review_note='',updated_at=? WHERE turn_id=?", (_now(), turn_id))
         return {'turn_id': turn_id, 'status': 'pending'}
 
     def _analyze_context_batch(self, contexts, cancellation, cancellable):

@@ -15,6 +15,7 @@ from functools import wraps
 from jsonschema import Draft202012Validator
 
 from .backend_turns import TurnCancelled
+from .bot_activity import report_runtime_activity
 from .memory import redact_sensitive
 
 
@@ -91,7 +92,11 @@ def _request_lifecycle(method):
                     diagnose("llm_client_boundary", exc)
         attempt_token = self._memory_runtime_attempt.set(observation)
         try:
+            report_runtime_activity("model_start")
             result = method(self, *args, **kwargs)
+            if ((isinstance(result, str) and result.strip()) or
+                    (isinstance(result, dict) and result.get("content") and not result.get("tool_calls"))):
+                self._report_bot_writing()
             metrics.update(status="success", error_category=None, timed_out=False, cancelled=False)
             return result
         except BaseException as exc:
@@ -964,6 +969,13 @@ class OpenAICompatibleLLM:
         if active is not None:
             active.update(metrics)
 
+    def _report_bot_writing(self):
+        active = self._request_trace.get()
+        if (active is not None and not active.get("bot_writing") and
+                active.get("role") in {"native_tool", "answer", "unified_answer", "persistence_grounding"}):
+            active["bot_writing"] = True
+            report_runtime_activity("model_writing")
+
     def _memory_transport_serialized(self, messages) -> None:
         self._request_metrics({"serialized": True})
         observer = self.memory_context_telemetry
@@ -1381,6 +1393,8 @@ class OpenAICompatibleLLM:
                             first_reasoning = time.perf_counter()
                     content = delta.get("content")
                     if isinstance(content, str) and content:
+                        if content.strip():
+                            self._report_bot_writing()
                         content_chunks.append(content)
                         publish_stable_preview(content)
                     for item in delta.get("tool_calls") or []:
@@ -1587,6 +1601,8 @@ class OpenAICompatibleLLM:
                     content = delta.get("content")
                     if not isinstance(content, str) or not content:
                         continue
+                    if content.strip():
+                        self._report_bot_writing()
                     chunks.append(content)
                     # Whitespace-only protocol/model fragments are not useful output.
                     if first_visible is None:

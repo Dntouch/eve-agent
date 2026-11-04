@@ -1,14 +1,14 @@
 import { readFileSync, mkdirSync, chmodSync, writeFileSync, renameSync } from 'node:fs';
-import { request as httpsRequest } from 'node:https';
-import { request as httpRequest } from 'node:http';
 import { fileURLToPath } from 'node:url';
 import { resolve, dirname } from 'node:path';
 import { ChattoState, handleMessage, adoptRoomConversation } from './chatto-state.mjs';
 import { selectRoute, scopeForRoute } from './chatto-routing.mjs';
 import { loadImages } from './chatto-images.mjs';
 import { createBotPresence } from './chatto-presence.mjs';
-import { postAnswer, postScheduledAnswer } from './chatto-output.mjs';
-import { threadProgress } from './chatto-progress.mjs';
+import { postQueuedAnswer, validateDestination } from './chatto-output.mjs';
+import { createDeliveryPump } from './chatto-delivery.mjs';
+import { createBotActivityReporter } from './chatto-activity.mjs';
+import { createEveBridge } from './chatto-bridge.mjs';
 
 process.umask(0o077);
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
@@ -24,29 +24,7 @@ const bridgeToken = readFileSync(resolve(directory, 'bridge-token'), 'utf8').tri
 const tls = Boolean(effective.visual.tls_cert && effective.visual.tls_key);
 const ca = tls ? readFileSync(effective.visual.tls_cert) : undefined;
 const eveBase = new URL(`${tls ? 'https' : 'http'}://127.0.0.1:${effective.visual.port || 8790}`);
-const request = tls ? httpsRequest : httpRequest;
-function eve(path, payload, signal) {
-  return new Promise((ok, fail) => {
-    const body = JSON.stringify(payload);
-    const req = request(new URL(path, eveBase), {
-      method: 'POST', ca, signal, timeout: 900000,
-      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${bridgeToken}`,
-        'Content-Length': Buffer.byteLength(body) },
-    }, res => {
-      let text = '';
-      res.setEncoding('utf8');
-      res.on('data', chunk => { text += chunk; if (text.length > 30 * 1024 * 1024) res.destroy(new Error('Response too large')); });
-      res.on('error', fail);
-      res.on('end', () => {
-        if (res.statusCode < 200 || res.statusCode >= 300) return fail(Object.assign(new Error('EVE API rejected request'), { code: res.statusCode }));
-        try { ok(JSON.parse(text)); } catch { fail(new Error('Invalid EVE response')); }
-      });
-    });
-    req.on('timeout', () => req.destroy(new Error('EVE timeout')));
-    req.on('error', fail);
-    req.end(body);
-  });
-}
+const eve = createEveBridge({ baseUrl: eveBase, token: bridgeToken, ca });
 
 mkdirSync(directory, { recursive: true, mode: 0o700 });
 const state = new ChattoState(resolve(directory, 'state.sqlite'));
@@ -61,8 +39,10 @@ const client = createClient();
 const server = client.connect({ serverUrl, apiKey: process.env.EVE_CHATTO_BOT_KEY });
 const controller = new AbortController();
 let presence;
+let activity;
 let roomRefreshTimer;
 let deliveryTimer;
+let progressTimer;
 for (const event of ['SIGINT', 'SIGTERM']) process.on(event, () => { controller.abort(); });
 status('connecting');
 try {
@@ -97,36 +77,60 @@ try {
   }
   await refreshRooms();
   roomRefreshTimer = setInterval(() => refreshRooms().catch(() => {}), 30000);
-  let delivering = false;
-  async function deliverScheduled() {
-    if (delivering || controller.signal.aborted) return;
-    delivering = true;
-    try {
-      const batch = await eve('/api/chatto/deliveries', {}, controller.signal);
-      for (const delivery of batch.deliveries) {
-        let dispatched = false;
-        try {
-          config = JSON.parse(readFileSync(effectivePath, 'utf8')).chatto;
-          await postScheduledAnswer({
-            config, serverUrl, viewerId, ownerId, target: delivery.target, payload: delivery.payload,
-            userApi: server.service(UserService), roomApi: server.service(RoomDirectoryService),
-            messageApi: server.service(MessageService), uploadApi: server.service(AssetUploadService),
-            signal: controller.signal, onDispatch: () => { dispatched = true; },
-          });
-          await eve('/api/chatto/delivery-ack', { id: delivery.id, status: 'delivered' }, controller.signal);
-        } catch {
-          await eve('/api/chatto/delivery-ack', { id: delivery.id, status: dispatched ? 'uncertain' : 'blocked',
-            error: dispatched ? 'Send outcome uncertain' : 'Destination validation failed' }, controller.signal);
-        }
-      }
-    } finally { delivering = false; }
+  function deliveryArgs(target, signal = controller.signal) {
+    config = JSON.parse(readFileSync(effectivePath, 'utf8')).chatto;
+    return { config, serverUrl, viewerId, ownerId, target,
+      userApi: server.service(UserService), roomApi: server.service(RoomDirectoryService),
+      messageApi: server.service(MessageService), uploadApi: server.service(AssetUploadService),
+      signal };
   }
-  deliveryTimer = setInterval(() => deliverScheduled().catch(() => {}), 3000);
+  activity = createBotActivityReporter({ serverUrl, botId: viewerId, apiKey: process.env.EVE_CHATTO_BOT_KEY,
+    signal: controller.signal,
+    validate: (target, signal) => validateDestination({ ...deliveryArgs(target), signal, readOnly: true }),
+  });
+  const deliver = createDeliveryPump({ eve, signal: controller.signal,
+    isConnected: () => server.status === 'connected',
+    send: async (delivery, onDispatch, signal) => {
+      const target = delivery.target;
+      if (target.conversation_id && target.thread_root_id) {
+        const scope = scopeForRoute(serverUrl, viewerId, { roomId: target.room_id,
+          authorId: target.sender_id, threadRootId: target.thread_root_id }, { kind: target.room_kind });
+        const known = state.conversation(scope);
+        if (known && known !== target.conversation_id) throw Object.assign(new Error('Thread binding conflict'), { permanent: true });
+        if (!known) state.remember(scope, target.conversation_id);
+      }
+      await (presence ? presence.withWork(() => postQueuedAnswer({ ...deliveryArgs(target, signal), payload: delivery.payload, onDispatch }))
+        : postQueuedAnswer({ ...deliveryArgs(target, signal), payload: delivery.payload, onDispatch }));
+    },
+    onDelivered: delivery => {
+      if (delivery.id.startsWith('chatto-job:')) {
+        state.finish(delivery.target.message_id, 'replied');
+      }
+    },
+  });
+  let checkingProgress = false;
+  let activityRevision = 0;
+  async function refreshProgress() {
+    if (checkingProgress || controller.signal.aborted || server.status !== 'connected') return;
+    checkingProgress = true;
+    const generation = activityRevision;
+    try {
+      const batch = await eve('/api/chatto/jobs', {}, AbortSignal.any([controller.signal, AbortSignal.timeout(1500)]));
+      if (generation === activityRevision && !controller.signal.aborted) activity.syncJobs(batch.jobs);
+    } finally { checkingProgress = false; }
+  }
+  deliveryTimer = setInterval(() => deliver().catch(() => {
+    console.warn(`${new Date().toISOString()} Chatto delivery polling failed; persisted delivery state retained.`);
+  }), 3000);
+  progressTimer = setInterval(() => refreshProgress().catch(() => {}), 500);
+  void refreshProgress().catch(() => {});
   console.log('EVE bot connected. Configured DMs and channels enabled.');
   await server.consumeEvents({
     signal: controller.signal,
     onStatus: update => {
+      activityRevision++;
       presence?.setConnected(update.state === 'ready');
+      activity.setConnected(update.state === 'ready');
       status(update.state, { gap: Boolean(update.gap) });
     },
     onEvent: async (event, { signal }) => {
@@ -173,29 +177,13 @@ try {
           access_profile: route.profile,
         };
         if (route.kind === 'dm') message.reasons.push('direct_message');
-        const destination = { roomId: message.roomId, threadRootId: message.threadRootId || '' };
         await handleMessage({
           message, conversationKey: scope, transport: context, signal, observeOnly: Boolean(route.observeOnly),
+          onAccepted: job => { activityRevision++; activity.acceptJob(job.id, context); },
           loadImages: () => loadImages(server, message, signal),
           withTyping: work => {
-            const typing = () => server.withTyping(destination, work, { signal });
+            const typing = () => activity.withWork(context, work, signal);
             return presence ? presence.withWork(typing) : typing();
-          },
-          progress: config.thread_status_enabled === false ? undefined : threadProgress(server.service(MessageService), destination, { signal, timeoutMs: 5000 }),
-          bindThread: (root, id) => {
-            const key = scopeForRoute(serverUrl, viewerId, { ...message, threadRootId: root }, route);
-            const known = state.conversation(key);
-            if (known && known !== id) throw new Error('Thread conversation binding conflict');
-            if (!known) state.remember(key, id);
-          },
-          reply: async (text, resources, result) => {
-            if (result?.thread_root_id) destination.threadRootId = result.thread_root_id;
-            const latest = await server.service(RoomDirectoryService).getRoom({ roomId: message.roomId }, { signal });
-            if (!latest.room || !selectRoute(config, viewerId, ownerId, latest.room, message)) throw new Error('Room access changed');
-            const output = { ...destination,
-              inReplyTo: destination.threadRootId ? message.id : '',
-            };
-            return postAnswer(server.service(AssetUploadService), server.service(MessageService), output, text, resources, signal);
           },
         }, ownerId, state, eve);
         status('ready');
@@ -211,4 +199,4 @@ try {
   status('connection_failed');
   console.error('Chatto connection stopped or setup failed.');
   process.exitCode = controller.signal.aborted ? 0 : 1;
-} finally { clearInterval(deliveryTimer); clearInterval(roomRefreshTimer); await presence?.stop(); client.close(); state.close(); status('stopped'); }
+} finally { clearInterval(progressTimer); clearInterval(deliveryTimer); clearInterval(roomRefreshTimer); await activity?.stop(); await presence?.stop(); client.close(); state.close(); status('stopped'); }

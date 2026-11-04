@@ -1,11 +1,11 @@
-import { withProgress } from './chatto-progress.mjs';
 import { DatabaseSync } from 'node:sqlite';
 
 export class ChattoState {
   constructor(path) {
     this.db = new DatabaseSync(path);
     this.db.exec(`CREATE TABLE IF NOT EXISTS conversations (scope TEXT PRIMARY KEY, id TEXT NOT NULL);
-      CREATE TABLE IF NOT EXISTS deliveries (id TEXT PRIMARY KEY, status TEXT NOT NULL);`);
+      CREATE TABLE IF NOT EXISTS deliveries (id TEXT PRIMARY KEY, status TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS job_progress (id TEXT PRIMARY KEY, message_id TEXT NOT NULL);`);
   }
   claim(id) {
     return this.db.prepare("INSERT OR IGNORE INTO deliveries VALUES (?, 'started')").run(id).changes === 1;
@@ -18,6 +18,10 @@ export class ChattoState {
   }
   remember(scope, id) {
     this.db.prepare('INSERT INTO conversations VALUES (?, ?)').run(scope, id);
+  }
+  progressMessage(id, messageId) {
+    if (messageId) this.db.prepare('INSERT OR REPLACE INTO job_progress VALUES (?, ?)').run(id, messageId);
+    return this.db.prepare('SELECT message_id FROM job_progress WHERE id=?').get(id)?.message_id;
   }
   close() { this.db.close(); }
 }
@@ -77,19 +81,15 @@ export async function handleMessage(ctx, ownerId, state, eve) {
         state.finish(message.id, 'observed');
         return;
       }
-      const result = await eve('/api/chatto/conversation', {
+      const result = await eve('/api/chatto/submit', {
         conversation_id: id, text: message.body, images, context: ctx.transport,
       }, ctx.signal);
-      if (typeof result.answer !== 'string' || !result.answer.trim()) throw new Error('Empty EVE answer');
-      if (result.thread_root_id && ctx.bindThread) ctx.bindThread(result.thread_root_id, result.conversation_id);
-      await ctx.reply(result.answer, result.resources || [], result);
-      state.finish(message.id, 'replied');
+      if (typeof result.id !== 'string' || !result.id.startsWith('chatto-job:')) throw new Error('Invalid Chatto job ID');
+      state.finish(message.id, 'accepted');
+      ctx.onAccepted?.(result);
     };
     if (ctx.observeOnly) await processMessage();
-    else await ctx.withTyping(() => ctx.progress ? withProgress(processMessage,
-      () => eve('/api/chatto/activity', { conversation_id: state.conversation(ctx.conversationKey), context: ctx.transport },
-        AbortSignal.any([ctx.signal || new AbortController().signal, AbortSignal.timeout(5000)])), ctx.progress)
-      : processMessage());
+    else await ctx.withTyping(processMessage);
   } catch (error) {
     // No automatic retry: EVE may already have performed an action or Chatto accepted a reply.
     state.finish(message.id, 'uncertain');

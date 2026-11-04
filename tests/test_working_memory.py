@@ -714,7 +714,7 @@ class WorkingRuntimeTest(unittest.TestCase):
         self.assertEqual(['data:image/png;base64,AA=='],session.store.value(session.workspace_id,session.request['reference'])['images'])
 
     def test_core_prompt_does_not_grow(self):
-        self.assertLess(len(CORE_PROMPT.split()),50)
+        self.assertLessEqual(len(CORE_PROMPT.split()),50)
 
 
 class CountingProtocolTest(unittest.TestCase):

@@ -95,6 +95,10 @@ class ConversationLearningCoordinator:
         status = self.resume(run_now=True)
         return {**status, "requeued_failed": amount}
 
+    def retry_turn(self, turn_id: str) -> dict:
+        result = self.pipeline.retry_turn(turn_id, reopen_review=True)
+        return {**self.resume(run_now=True), "retry": result}
+
     def status(self) -> dict:
         row = self._runtime_row()
         counts = self.pipeline.job_counts()

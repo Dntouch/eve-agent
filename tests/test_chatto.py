@@ -324,6 +324,23 @@ class ChattoTest(unittest.TestCase):
         self.api.configure({**self.config, 'channel_ids': []})
         self.assertFalse(any(t.get('transport') == 'chatto' for t in self.api.output_targets()))
 
+    def test_channel_sender_can_select_own_dm_without_previous_eve_dm_history(self):
+        self.api.configure({**self.config, 'member_dm_enabled': True})
+        for sender, profile in [('owner', 'owner_dm'), ('guest', 'member_dm')]:
+            with self.api.scheduled_access({**self.context, 'sender_id': sender, 'thread_root_id': 'thread'}):
+                targets = self.api.output_targets()
+            self.assertEqual(len(targets), 1)
+            target = targets[0]
+            self.assertEqual(target['id'], 'chatto:dm:self')
+            self.assertEqual(target['recipient_user_id'], sender)
+            self.assertEqual(target['access_profile'], profile)
+            self.assertNotIn('room_id', target)
+            self.assertNotIn('thread_root_id', target)
+            self.assertNotIn('message_id', target)
+        self.api.configure({**self.config, 'owner_dm_enabled': False})
+        with self.api.scheduled_access({**self.context, 'sender_id': 'owner'}):
+            self.assertEqual(self.api.output_targets(), [])
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)

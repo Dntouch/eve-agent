@@ -4,6 +4,7 @@ import hashlib
 import json
 import tempfile
 import unittest
+import uuid
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -216,8 +217,125 @@ class HandoffTest(unittest.TestCase):
         self.assertEqual(['Vorgang fehlgeschlagen.'], [m['content'] for m in messages])
         self.assertEqual('failed', json.loads(messages[0]['metadata_json'])['runtime_status'])
 
-    def test_base_prompt_is_byte_identical_to_pre_change_contract(self):
-        self.assertEqual('ff172335332be70a7df1385d657face9b18cce783acc9099432da744615de72d',
+    def test_scheduled_no_change_completes_without_chat_or_another_model_call(self):
+        from eve_agent.scheduled_execution import scheduled_execution
+        reason = 'Keine meldepflichtige Änderung seit dem letzten Check.'
+        self.llm.request_tool_turn.return_value = call('eve__complete_check', {
+            'outcome': 'no_change', 'reason': reason})
+        self.agent._native_tool_runtime = self.runtime
+        with scheduled_execution({'task_id': 'task', 'run_id': 'run'}):
+            result = self.agent.respond_turn('Prüfe, melde nur Änderungen.')
+        self.assertEqual('no_change', result.outcome)
+        self.assertEqual(reason, result.outcome_reason)
+        self.assertEqual('', result.answer)
+        self.assertIsNone(result.assistant_message_id)
+        self.assertIsNone(result.presentation)
+        self.assertEqual((), result.resources)
+        self.assertEqual(1, self.llm.request_tool_turn.call_count)
+        self.assertEqual([], self.conversations.messages(self.agent.conversation_id)['messages'])
+        session = self.runtime.working_session
+        with self.db.connect() as c:
+            row = c.execute('SELECT status,answer_id FROM memory_work_turns WHERE id=?', (session.turn_id,)).fetchone()
+        self.assertEqual('completed', row['status'])
+        self.assertEqual('no_change', session.store.value(session.workspace_id, row['answer_id'])['outcome'])
+        names = {tool['function']['name'] for tool in self.llm.request_tool_turn.call_args.args[1]}
+        self.assertIn('eve__complete_check', names)
+
+    def test_silent_completion_is_unavailable_in_regular_conversations(self):
+        self.llm.request_tool_turn.side_effect = [call('eve__complete_check', {
+            'outcome': 'no_change', 'reason': 'Keine Änderung'}), {'content': 'Antwort', 'tool_calls': []}]
+        self.assertEqual('Antwort', self.runtime.respond('Frage'))
+        names = {tool['function']['name'] for tool in self.llm.request_tool_turn.call_args.args[1]}
+        self.assertNotIn('eve__complete_check', names)
+        with self.assertRaisesRegex(ValueError, 'geplanten Durchlauf'):
+            self.runtime._execute_direct('eve_runtime', 'complete_check', {'reason': 'test'}, {}, [])
+
+    def test_no_change_remains_available_after_context_reset(self):
+        from eve_agent.scheduled_execution import scheduled_execution
+        self.llm.request_tool_turn.side_effect = [
+            call('eve__load_capabilities', {'capabilities': ['working_memory']}),
+            call('working_memory__reset_context', {}),
+            call('eve__complete_check', {'outcome': 'no_change', 'reason': 'Keine Änderung'})]
+        with scheduled_execution({'task_id': 'task'}):
+            self.assertEqual('', self.runtime.respond('Prüfe'))
+        self.assertEqual('no_change', self.runtime.last_result['outcome'])
+        self.assertEqual(3, self.llm.request_tool_turn.call_count)
+        self.assertEqual([], self.conversations.messages(self.agent.conversation_id)['messages'])
+
+    def test_silent_completion_requires_valid_arguments_and_a_single_call(self):
+        from eve_agent.scheduled_execution import scheduled_execution
+        for invalid in ({'outcome': 'no_change', 'reason': '   '}, {'outcome': 'something_else', 'reason': 'Test'}):
+            with self.subTest(invalid=invalid), scheduled_execution({'task_id': 'task'}):
+                self.llm.request_tool_turn.side_effect = [call('eve__complete_check', invalid),
+                    {'content': 'Bericht', 'tool_calls': []}]
+                self.assertEqual('Bericht', self.runtime.respond('Prüfe'))
+        with scheduled_execution({'task_id': 'task'}):
+            batch = call('eve__complete_check', {'outcome': 'no_change', 'reason': 'Test'})
+            batch['tool_calls'] += call('eve__complete_check', {'outcome': 'no_change', 'reason': 'Test'})['tool_calls']
+            batch['tool_calls'][1]['id'] = 'second-completion'
+            self.llm.request_tool_turn.side_effect = [batch, {'content': 'Bericht', 'tool_calls': []}]
+            self.assertEqual('Bericht', self.runtime.respond('Prüfe'))
+
+    def _returned_call(self, session, capability, operation, parameters, result):
+        identifier = session.store.start_call(session.workspace_id, session.turn_id, uuid.uuid4().hex,
+                                             capability, operation, 'read', parameters)
+        session.store.dispatch_call(session.workspace_id, identifier)
+        session.store.finish_call(session.workspace_id, session.turn_id, identifier, result)
+
+    def test_new_clocks_queries_and_storage_ids_do_not_change_evidence(self):
+        session = self.session()
+        original = {'context': 'Identischer Inhalt', 'sources': [{'url': 'https://example.test/a'}]}
+        self._returned_call(session, 'web', 'search', {'query': 'erste Suche'}, {**original, 'query': 'erste Suche'})
+        first = session._material_signature()
+        self._returned_call(session, 'clock', 'now', {}, {'local_time': '2026-11-03T21:00:00'})
+        self._returned_call(session, 'web', 'search', {'query': 'andere Suche'}, {**original, 'query': 'andere Suche'})
+        self._returned_call(session, 'web', 'read_urls', {'urls': ['https://example.test/b']},
+                            {'status': 'error', 'error_class': 'WebReadError', 'message': 'HTTP 403'})
+        self.assertEqual(first, session._material_signature())
+        for index in range(2):
+            obj = session.store.put(session.workspace_id, {'text': 'Identisches Arbeitsmaterial'})
+            parameters = {'reference': obj['reference'], 'pointer': '/text'}
+            self._returned_call(session, 'working_memory', 'read', parameters,
+                                session.store.read(session.workspace_id, **parameters))
+            if index == 0:
+                first = session._material_signature()
+        self.assertEqual(first, session._material_signature())
+        self._returned_call(session, 'web', 'search', {}, {'context': 'Wirklich anderer Inhalt'})
+        self.assertNotEqual(first, session._material_signature())
+
+    def test_model_error_recovery_is_not_reset_by_new_evidence_or_workspace(self):
+        for switch in (False, True):
+            with self.subTest(workspace_switch=switch):
+                session = self.session()
+                session.recover([], LocalLLMOutputLimitError('length'))
+                self._returned_call(session, 'web', 'search', {'query': 'neue Suche'}, {'context': 'Neue Ergebnisse'})
+                if switch:
+                    session.pending_workspace = session.store.create()
+                    session.switch_workspace()
+                with self.assertRaises(LocalLLMOutputLimitError):
+                    session.recover([], LocalLLMOutputLimitError('length'))
+                events = session.store.list_objects(session.workspace_id, kind='model_context_error')['items']
+                self.assertTrue(any(session.store.value(session.workspace_id, e['reference']).get('recovery_allowed') is False
+                                    for e in events))
+
+    def test_repeated_output_error_after_tools_ends_the_actual_runtime(self):
+        self.llm.request_working_checkpoint = Mock(side_effect=self.checkpoint)
+        self.agent.local_files = SimpleNamespace(minimal_contract=lambda: {'operations': {'fetch': {
+            'effect': 'read', 'parameters_schema': {'type': 'object', 'properties': {}}}}},
+            execute_operation=Mock(side_effect=[{'content': 'erstes Ergebnis'}, {'content': 'anderes Ergebnis'}]))
+        second_read = call('local_files__fetch', {})
+        second_read['tool_calls'][0]['id'] = 'second-read'
+        self.llm.request_tool_turn.side_effect = [
+            call('eve__load_capabilities', {'capabilities': ['local_files']}),
+            call('local_files__fetch', {}), LocalLLMOutputLimitError('length'),
+            second_read, LocalLLMOutputLimitError('length')]
+        with self.assertRaises(LocalLLMOutputLimitError):
+            self.runtime.respond('Prüfe')
+        self.assertEqual(5, self.llm.request_tool_turn.call_count)
+        self.assertEqual(1, self.llm.request_working_checkpoint.call_count)
+
+    def test_base_prompt_is_byte_identical_to_existing_contract(self):
+        self.assertEqual('c9e18e8ec8f3138cd5b877b7b7e77bc5e8d0e7ce006358c682f625ff4a753f42',
                          hashlib.sha256(CORE_PROMPT.encode()).hexdigest())
 
     def test_new_session_gets_checkpoint_and_delta_references(self):

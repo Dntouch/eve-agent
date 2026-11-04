@@ -22,4 +22,8 @@ def provider_evidence(capability, operation, result):
         return {key: value for key, value in result.items() if key not in {'session_id', 'pid'}}
     if capability == 'working_memory' and operation == 'read' and 'content' in result:
         return selected_evidence(result)
+    if capability == 'web' and operation == 'search':
+        # Echoing a different query is not new returned content. Source URLs,
+        # excerpts and actual resources remain part of the evidence identity.
+        return {key: value for key, value in result.items() if key not in {'query', 'queries', 'site'}}
     return result.get('response') if isinstance(result.get('response'), dict) else result
