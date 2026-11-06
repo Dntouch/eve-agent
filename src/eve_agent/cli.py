@@ -945,6 +945,14 @@ def main(argv: list[str] | None = None) -> int:
         finally:
             turn_lock.release()
 
+    external_mcp = getattr(agent, "external_mcp", None)
+    if external_mcp is not None:
+        external_mcp.register_wakeup_handler(
+            lambda prompt, conversation_id: browser_message(
+                prompt, [], conversation_id, synthesize_audio=False, wait_for_slot=True,
+            )
+        )
+
     def create_streaming_tts(
         turn_id: str, store: BackendTurnStore,
     ) -> StreamingTTSPipeline | None:

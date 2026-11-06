@@ -390,11 +390,22 @@ class ShadowLearningPipeline:
                     for report in reports.values() if not prior or report["created_at"]>prior]
         assistant_meta = json.loads(assistant["metadata_json"] or "{}") if assistant else {}
         user_meta = json.loads(user["metadata_json"] or "{}") if user else {}
+        dialog_context=[];skip_event_answer=False
+        for row in dialog:
+            metadata=json.loads(row['metadata_json'] or '{}')
+            source=metadata.get('conversation_source')
+            if isinstance(source,dict) and isinstance(source.get('mcp_wakeup'),dict):
+                skip_event_answer=True
+                continue
+            if skip_event_answer and row['role']=='assistant':
+                skip_event_answer=False
+                continue
+            skip_event_answer=False
+            dialog_context.append({"role":row["role"],
+                                   "content":redact_sensitive(str(row["content"])),
+                                   **_input_provenance(metadata),"context_only":True})
         return {
-            "dialog_context": [{"role": row["role"],
-                                "content": redact_sensitive(str(row["content"])),
-                                **_input_provenance(json.loads(row['metadata_json'] or '{}')),
-                                "context_only": True} for row in dialog],
+            "dialog_context": dialog_context,
             "failure_episodes": linked,
             "episode_source_turn_ids": list(dict.fromkeys(source for episode in episodes
                 for source in json.loads(episode[0])['source_turn_ids'])),
@@ -426,6 +437,9 @@ class ShadowLearningPipeline:
     def _deterministic_gate(self, snapshot: dict) -> dict | None:
         if not snapshot["user_content"].strip():
             return self._no_persist("no_user_observation")
+        source = snapshot.get("conversation_source")
+        if isinstance(source, dict) and isinstance(source.get("mcp_wakeup"), dict):
+            return self._no_persist("integration_event")
         return None
 
     @staticmethod

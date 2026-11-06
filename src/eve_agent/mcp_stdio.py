@@ -5,9 +5,10 @@ import threading
 
 
 class McpStdioClient:
-    def __init__(self, command, *, env, cwd, protocol_version="2024-11-05"):
+    def __init__(self, command, *, env, cwd, protocol_version="2024-11-05", on_event=None):
         self.protocol_version = protocol_version
         self.command, self.env, self.cwd = command, env, cwd
+        self.on_event = on_event
         self.process = None
         self._condition = threading.Condition()
         self._send_lock = threading.Lock()
@@ -26,15 +27,25 @@ class McpStdioClient:
         try:
             for line in self.process.stdout:
                 message = json.loads(line)
+                event = False
                 with self._condition:
                     if 'id' in message and 'method' not in message:
                         self._responses[message['id']] = message
                     else:
+                        event = 'id' not in message
                         self.events.append(message)
+                        if len(self.events) > 256:
+                            del self.events[:-256]
                         if 'id' in message:
                             self.send({'id': message['id'], 'error': {
                                 'code': -32601, 'message': 'MCP client capability unavailable'}})
                     self._condition.notify_all()
+                if event and self.on_event is not None:
+                    try:
+                        self.on_event(message)
+                    except Exception as exc:
+                        with self._condition:
+                            self.stderr.append(f'MCP event handler error: {type(exc).__name__}')
         except Exception as exc:
             self.stderr.append(f'MCP reader error: {exc}')
         finally:

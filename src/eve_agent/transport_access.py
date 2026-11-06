@@ -10,9 +10,18 @@ _access = ContextVar("eve_transport_access", default=None)
 
 
 @contextmanager
-def transport_access(metadata, *, public=False, allowed_capabilities=None, activity=None):
+def transport_access(metadata, *, public=False, allowed_capabilities=None,
+                     preloaded_capabilities=None, runtime_limits=None, activity=None):
     allowed = frozenset(allowed_capabilities) if allowed_capabilities is not None else PUBLIC_CAPABILITIES
-    token = _access.set({"metadata": deepcopy(metadata), "public": bool(public), "allowed": allowed, "activity": activity})
+    preloaded = frozenset(preloaded_capabilities or ())
+    if not preloaded.issubset(allowed):
+        raise ValueError("Preloaded capabilities must also be allowed")
+    limits = dict(runtime_limits or {})
+    if (set(limits) - {"model_rounds", "tool_calls"}
+            or any(type(value) is not int or not 1 <= value <= 100 for value in limits.values())):
+        raise ValueError("Runtime limits must be positive integers up to 100")
+    token = _access.set({"metadata": deepcopy(metadata), "public": bool(public), "allowed": allowed,
+                         "preloaded": preloaded, "limits": limits, "activity": activity})
     try:
         yield
     finally:
@@ -22,6 +31,16 @@ def transport_access(metadata, *, public=False, allowed_capabilities=None, activ
 def transport_metadata():
     current = _access.get()
     return deepcopy(current["metadata"]) if current else None
+
+
+def transport_preloaded_capabilities():
+    current = _access.get()
+    return current["preloaded"] if current else frozenset()
+
+
+def transport_runtime_limits():
+    current = _access.get()
+    return deepcopy(current["limits"]) if current else {}
 
 
 def capability_allowed(name):

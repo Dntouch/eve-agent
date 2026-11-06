@@ -3,10 +3,12 @@ import json
 from pathlib import Path
 import sys
 import tempfile
+import threading
 import unittest
 
 from eve_agent.external_mcp import ExternalMcpServers, validate_servers
-from eve_agent.transport_access import transport_access
+from eve_agent.transport_access import (transport_access, transport_metadata,
+                                        transport_preloaded_capabilities, transport_runtime_limits)
 
 SERVER = r'''
 import json, os, sys
@@ -33,6 +35,21 @@ for line in sys.stdin:
         result = {'content':[{'type':'text','text':json.dumps({'count':count,'cwd':os.getcwd(),'env':os.getenv('FIXTURE_WORKSPACE')})}]}
         if name == 'fail': result['isError'] = True
         if name == 'image': result['content'] = [{'type':'image','mimeType':'image/png','data':'aW1hZ2U='}]
+    print(json.dumps({'jsonrpc':'2.0','id':req['id'],'result':result}), flush=True)
+'''
+
+WAKE_SERVER = r'''
+import json, sys
+for line in sys.stdin:
+    req = json.loads(line)
+    if 'id' not in req: continue
+    if req['method'] == 'initialize':
+        result = {'protocolVersion':req['params']['protocolVersion'], 'serverInfo':{'name':'wake','version':'1'}, 'capabilities':{'tools':{}}}
+    elif req['method'] == 'tools/list':
+        print(json.dumps({'jsonrpc':'2.0','method':'notifications/eve/test','params':{'event_id':'fixture:event-0001'}}), flush=True)
+        print(json.dumps({'jsonrpc':'2.0','method':'notifications/eve/test','params':{'event_id':'fixture:event-0001'}}), flush=True)
+        print(json.dumps({'jsonrpc':'2.0','method':'notifications/eve/test','params':{'event_id':'bad id'}}), flush=True)
+        result = {'tools':[]}
     print(json.dumps({'jsonrpc':'2.0','id':req['id'],'result':result}), flush=True)
 '''
 
@@ -149,9 +166,78 @@ class ExternalMcpTest(unittest.TestCase):
             self.assertEqual(self.payload(self.call('inspect', 'branched-thread'))['count'], 1)
         self.assertEqual(self.payload(self.call('inspect', 'other-room'))['count'], 0)
 
+    def test_opted_in_notification_wakes_once_with_fixed_local_prompt(self):
+        from eve_agent.transport_access import capability_allowed
+        prompt = 'Fixed trusted prompt'
+        self.mcp.close_all()
+        self.cfg['servers']['fixture'].update(command=sys.executable, args=['-u', '-c', WAKE_SERVER],
+            wakeups={'notifications/eve/test':prompt})
+        self.mcp = ExternalMcpServers(self.cfg, self.root)
+        completed = threading.Event()
+        calls = []
+        def wake(text, conversation_id):
+            calls.append((text, conversation_id, transport_metadata(), capability_allowed('mcp_fixture'),
+                          capability_allowed('shell'), transport_preloaded_capabilities(),
+                          transport_runtime_limits()))
+            completed.set()
+        self.mcp.register_wakeup_handler(wake)
+        with transport_access({'transport':'chatto', 'mcp_session_id':'match-thread'}, public=True,
+                              allowed_capabilities={'mcp_fixture'}):
+            self.mcp.contracts('battle-conversation')
+        self.assertTrue(completed.wait(2))
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][:2], (prompt, 'battle-conversation'))
+        self.assertEqual(calls[0][2]['mcp_session_id'], 'match-thread')
+        self.assertTrue(calls[0][3])
+        self.assertFalse(calls[0][4])
+        self.assertEqual(calls[0][5], frozenset({'mcp_fixture'}))
+        self.assertEqual(calls[0][6], {'model_rounds':8, 'tool_calls':12})
+        self.assertEqual(calls[0][2]['mcp_wakeup'], {
+            'server':'fixture', 'method':'notifications/eve/test',
+            'event_id':'fixture:event-0001',
+        })
+
+    def test_notifications_of_same_kind_coalesce_while_one_is_running(self):
+        self.mcp.close_all()
+        self.cfg['servers']['fixture']['wakeups'] = {'notifications/eve/test':'Fixture event'}
+        self.mcp = ExternalMcpServers(self.cfg, self.root)
+        started, release, completed = threading.Event(), threading.Event(), threading.Event()
+        calls = []
+        def wake(text, conversation_id):
+            calls.append(transport_metadata()['mcp_wakeup']['event_id'])
+            if len(calls) == 1:
+                started.set()
+                release.wait(2)
+            if len(calls) == 2:
+                completed.set()
+        self.mcp.register_wakeup_handler(wake)
+        self.mcp.contracts('battle-conversation')
+        session = next(iter(self.mcp.sessions.values()))
+        def event(identifier):
+            return {'jsonrpc':'2.0', 'method':'notifications/eve/test',
+                    'params':{'event_id':identifier}}
+        self.mcp._server_event('fixture', session, event('fixture:event-0001'))
+        self.assertTrue(started.wait(2))
+        self.mcp._server_event('fixture', session, event('fixture:event-0002'))
+        self.mcp._server_event('fixture', session, event('fixture:event-0003'))
+        release.set()
+        self.assertTrue(completed.wait(2))
+        self.assertEqual(calls, ['fixture:event-0001', 'fixture:event-0003'])
+
+    def test_preloaded_capability_must_also_be_allowed(self):
+        with self.assertRaisesRegex(ValueError, 'must also be allowed'):
+            with transport_access({}, public=True, allowed_capabilities={'memory'},
+                                  preloaded_capabilities={'mcp_fixture'}):
+                pass
+
+        with self.assertRaisesRegex(ValueError, 'Runtime limits'):
+            with transport_access({}, runtime_limits={'model_rounds':0}):
+                pass
+
     def test_validation_rejects_bad_configuration(self):
         for cfg in [{'bad-name': {'command':'a'}}, {'okay':{'command':'a','scope':'guess'}},
-                    {'okay':{'command':'a','timeout_seconds':True}}, {'okay':{'command':'a','args':'shell'}}]:
+                    {'okay':{'command':'a','timeout_seconds':True}}, {'okay':{'command':'a','args':'shell'}},
+                    {'okay':{'command':'a','wakeups':{'bad':'x'}}}]:
             with self.assertRaises(ValueError): validate_servers(cfg)
 
 

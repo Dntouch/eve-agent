@@ -1,18 +1,21 @@
 """Configurable external MCP servers; native contracts, no domain interpretation."""
 import atexit
 import base64
+from collections import deque, OrderedDict
 from copy import deepcopy
 import hashlib
 import mimetypes
 import os
 from pathlib import Path
+import queue
 import re
 import threading
 
 from jsonschema import Draft202012Validator
 
 from .mcp_stdio import McpStdioClient
-from .transport_access import capability_allowed, require_capability, transport_metadata, report_transport_activity
+from .transport_access import (PUBLIC_CAPABILITIES, capability_allowed, require_capability,
+                               transport_access, transport_metadata, report_transport_activity)
 
 
 PREFIX = 'mcp_'
@@ -25,7 +28,7 @@ def validate_servers(servers):
     for name, cfg in servers.items():
         if not re.fullmatch(r'[a-z][a-z0-9_]{0,39}', name) or not isinstance(cfg, dict):
             raise ValueError('MCP-Servernamen: Kleinbuchstaben, Ziffern und Unterstriche, maximal 40 Zeichen')
-        allowed = {'chatto_reply_mode', 'title', 'enabled', 'command', 'args', 'cwd', 'env', 'scope', 'timeout_seconds', 'protocol_version', 'description', 'attachment_roots', 'startup', 'after_write'}
+        allowed = {'chatto_reply_mode', 'title', 'enabled', 'command', 'args', 'cwd', 'env', 'scope', 'timeout_seconds', 'protocol_version', 'description', 'attachment_roots', 'startup', 'after_write', 'wakeups'}
         if set(cfg) - allowed:
             raise ValueError(f'Unbekannte MCP-Option für {name}: {sorted(set(cfg) - allowed)[0]}')
         if type(cfg.get('enabled', True)) is not bool:
@@ -59,6 +62,14 @@ def validate_servers(servers):
         env = cfg.get('env', {})
         if not isinstance(env, dict) or any(not isinstance(k, str) or not isinstance(v, str) or '\x00' in k + v or '=' in k for k, v in env.items()):
             raise ValueError(f'{name}.env muss Umgebungsvariablen auf Zeichenketten abbilden')
+        wakeups = cfg.get('wakeups')
+        if wakeups is not None:
+            if (not isinstance(wakeups, dict) or not 1 <= len(wakeups) <= 8
+                or any(not isinstance(method, str)
+                       or not re.fullmatch(r'notifications/[a-z][a-z0-9_/-]{0,99}', method)
+                       or not isinstance(prompt, str) or not 1 <= len(prompt.strip()) <= 1000 or '\x00' in prompt
+                       for method, prompt in wakeups.items())):
+                raise ValueError(f'{name}.wakeups muss gültige Notification-Methoden auf lokale Prompts abbilden')
 
 
 class ExternalMcpServers:
@@ -69,7 +80,79 @@ class ExternalMcpServers:
         self.max_sessions = config.get('max_sessions', 8)
         self.sessions = {}
         self.lock = threading.RLock()
+        self.wakeup_handler = None
+        self.wakeup_queue = queue.Queue()
+        self.wakeup_thread = None
         atexit.register(self.close_all)
+
+    def register_wakeup_handler(self, handler):
+        if not callable(handler):
+            raise TypeError('MCP wakeup handler must be callable')
+        with self.lock:
+            if self.wakeup_handler is not None:
+                raise RuntimeError('MCP wakeup handler already registered')
+            self.wakeup_handler = handler
+            self.wakeup_thread = threading.Thread(target=self._wakeup_loop, name='eve-mcp-wakeup', daemon=True)
+            self.wakeup_thread.start()
+
+    def _wakeup_loop(self):
+        while True:
+            name, session = self.wakeup_queue.get()
+            with session['wakeup_lock']:
+                session['wakeup_queued'] = False
+                method, item = session['wakeup_pending'].popitem(last=False)
+                session['wakeup_running'] = True
+            prompt, conversation_id, metadata = item
+            try:
+                with transport_access(metadata, public=True,
+                                      allowed_capabilities=PUBLIC_CAPABILITIES | {PREFIX + name},
+                                      preloaded_capabilities={PREFIX + name},
+                                      runtime_limits={'model_rounds':8, 'tool_calls':12}):
+                    self.wakeup_handler(prompt, conversation_id)
+                session['wakeup_error'] = None
+            except BaseException as exc:
+                session['wakeup_error'] = type(exc).__name__
+            finally:
+                with session['wakeup_lock']:
+                    session['wakeup_running'] = False
+                    if session['wakeup_pending'] and not session['wakeup_queued']:
+                        session['wakeup_queued'] = True
+                        self.wakeup_queue.put((name, session))
+                self.wakeup_queue.task_done()
+
+    def _server_event(self, name, session, event):
+        wakeups = self.config[name].get('wakeups', {})
+        if not wakeups or self.wakeup_handler is None or not isinstance(event, dict):
+            return
+        prompt = wakeups.get(event.get('method'))
+        if not prompt or set(event) - {'jsonrpc', 'method', 'params'}:
+            return
+        params = event.get('params')
+        if (event.get('jsonrpc') != '2.0' or not isinstance(params, dict) or set(params) != {'event_id'}
+            or not isinstance(params.get('event_id'), str)
+            or not re.fullmatch(r'[A-Za-z0-9:._-]{8,200}', params['event_id'])):
+            return
+        # Each stdio session has one reader thread. Do not take the global MCP
+        # lock here: the request waiting for this reader may currently own it.
+        if params['event_id'] in session['wakeup_ids']:
+            return
+        session['wakeup_ids'].append(params['event_id'])
+        conversation_id = session.get('conversation_id')
+        if not conversation_id:
+            return
+        metadata = deepcopy(session.get('transport_metadata') or {})
+        metadata['mcp_wakeup'] = {
+            'server': name, 'method': event['method'], 'event_id': params['event_id'],
+        }
+        with session['wakeup_lock']:
+            # Keep one pending event per method. A newer notification of the
+            # same kind supersedes the older pending one; different kinds are
+            # retained and still run serially.
+            session['wakeup_pending'][event['method']] = (prompt, conversation_id, metadata)
+            if session['wakeup_running'] or session['wakeup_queued']:
+                return
+            session['wakeup_queued'] = True
+        self.wakeup_queue.put((name, session))
 
     def _session(self, name, conversation_id):
         cfg = self.config[name]
@@ -91,13 +174,21 @@ class ExternalMcpServers:
             cwd = Path(expand(cfg.get('cwd') or '{workspace}'))
             if not cwd.is_absolute():
                 cwd = self.root / cwd
+            session = {'workspace': workspace, 'roots': [], 'tools': {}, 'uncertain': False,
+                       'startup_attempted': False, 'startup_error': None, 'conversation_id': conversation_id,
+                       'transport_metadata': context, 'wakeup_ids': deque(maxlen=256), 'wakeup_error': None,
+                       'wakeup_lock': threading.Lock(), 'wakeup_pending': OrderedDict(),
+                       'wakeup_running': False, 'wakeup_queued': False}
             client = McpStdioClient([expand(cfg['command']), *map(expand, cfg.get('args', []))],
-                env=env, cwd=str(cwd), protocol_version=cfg.get('protocol_version', '2025-06-18'))
+                env=env, cwd=str(cwd), protocol_version=cfg.get('protocol_version', '2025-06-18'),
+                on_event=lambda event, n=name, s=session: self._server_event(n, s, event))
             roots = [workspace, *(Path(expand(v)).expanduser() for v in cfg.get('attachment_roots', []))]
             roots = [(p if p.is_absolute() else self.root / p).resolve() for p in roots]
-            self.sessions[key] = {'client': client, 'workspace': workspace, 'roots': roots, 'tools': {},
-                                  'uncertain': False, 'startup_attempted': False, 'startup_error': None}
-        return self.sessions[key]
+            session.update(client=client, roots=roots)
+            self.sessions[key] = session
+        session = self.sessions[key]
+        session.update(conversation_id=conversation_id, transport_metadata=context)
+        return session
 
     def _request(self, name, session, method, params):
         client = session['client']
@@ -178,7 +269,9 @@ class ExternalMcpServers:
                         'runtime': {'transport': 'mcp-stdio', 'server': deepcopy(session['client'].server),
                             'scope': cfg.get('scope', 'conversation'), 'workspace': str(session['workspace']),
                             'attachment_roots': list(map(str, session['roots'])),
-                            'execution_outcome_unknown': session['uncertain']}}
+                            'execution_outcome_unknown': session['uncertain'],
+                            'wakeup_enabled': bool(cfg.get('wakeups')),
+                            'wakeup_error': session['wakeup_error']}}
                 except Exception as exc:
                     contracts[capability] = {'description': cfg.get('description') or name, 'operations': {},
                                              'error': str(exc), 'runtime': {'transport': 'mcp-stdio', 'error': str(exc)}}

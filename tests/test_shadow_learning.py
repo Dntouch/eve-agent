@@ -43,6 +43,23 @@ def proposal(
 
 
 class ShadowLearningTest(unittest.TestCase):
+    def test_integration_events_are_not_learned_or_used_as_later_dialog_context(self):
+        source={'mcp_wakeup':{'server':'fixture','method':'notifications/eve/test',
+                              'event_id':'fixture:event-0001'}}
+        self.conversations.append_turn(
+            self.conversation_id, 'Fixture event', 'Synthetic event answer',
+            turn_id='event-turn', user_metadata={'conversation_source':source})
+        fake=FakeLearningLLM(proposal())
+        for pipeline_type in (ShadowLearningPipeline,ProductiveLearningPipeline):
+            pipeline=pipeline_type(self.database,fake)
+            result=pipeline.evaluate_turn('event-turn')
+            self.assertEqual(result['decision_type'],'no_persist')
+            self.assertEqual(result['reason_code'],'integration_event')
+        self.assertEqual(fake.calls,0)
+        later,_=self.turn('Normal follow-up')
+        history=ShadowLearningPipeline(self.database)._snapshot(later)['dialog_context']
+        self.assertEqual(history,[])
+
     def test_scheduled_input_keeps_automatic_origin_in_learning_and_evidence(self):
         metadata = {'input_kind': 'scheduled', 'scheduled_execution': {
             'task_id': 'task', 'run_id': 'run', 'origin_source': {'sender_name': 'Stefan'}}}

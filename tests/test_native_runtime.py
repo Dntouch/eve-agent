@@ -172,6 +172,122 @@ class NativeRuntimeTest(unittest.TestCase):
         self.assertEqual(self.agent._tool_events[0]['result']['status'], 'accepted')
         self.assertEqual(self.home.calls, [])
 
+    def test_transport_preloads_allowed_provider_in_first_model_round(self):
+        from eve_agent.transport_access import transport_access
+        from unittest.mock import patch
+        self.agent.external_mcp = SimpleNamespace(contracts=lambda conversation_id: {
+            'mcp_fixture': {'description': 'Live fixture', 'operations': {
+                'inspect': {'effect': 'read', 'parameters_schema': {
+                    'type': 'object', 'properties': {}, 'additionalProperties': False,
+                }},
+            }},
+        })
+        self.llm.request_tool_turn.return_value = {
+            'content': 'Live-Zustand verfügbar.', 'tool_calls': [], 'finish_reason': 'stop',
+        }
+        self.agent.history = [
+            {'role':'user', 'content':'Old event instruction'},
+            {'role':'assistant', 'content':'Old constrained answer'},
+        ]
+        with transport_access({'mcp_wakeup': {
+                'server':'fixture', 'method':'notifications/eve/test',
+                'event_id':'fixture:event-0001'}}, public=True,
+                              allowed_capabilities={'memory', 'mcp_fixture'},
+                              preloaded_capabilities={'mcp_fixture'}), \
+                patch('eve_agent.learned_execution.try_replay') as replay:
+            self.runtime.respond('Fixture-Ereignis.')
+            replay.assert_not_called()
+        first_tools = self.llm.request_tool_turn.call_args_list[0].args[1]
+        self.assertIn('mcp_fixture__inspect', {tool['function']['name'] for tool in first_tools})
+        first_messages = self.llm.request_tool_turn.call_args_list[0].args[0]
+        self.assertEqual([message['role'] for message in first_messages], ['system', 'user'])
+        self.assertNotIn('Old event instruction', json.dumps(first_messages))
+
+    def test_transport_limits_model_rounds_and_rejects_duplicate_reads(self):
+        from eve_agent.transport_access import transport_access
+        from unittest.mock import patch
+        def model(*args, **kwargs):
+            return {'content':'', 'tool_calls':[{
+                'id':'load-' + str(self.llm.request_tool_turn.call_count),
+                'name':'eve__load_capabilities',
+                'arguments':{'capabilities':['memory']},
+            }]}
+        self.llm.request_tool_turn.side_effect = model
+        with transport_access({'mcp_wakeup': {
+                'server':'fixture', 'method':'notifications/eve/test',
+                'event_id':'fixture:event-0002'}}, public=True,
+                preloaded_capabilities={'memory'},
+                runtime_limits={'model_rounds':2, 'tool_calls':3}), \
+                patch('eve_agent.learned_execution.try_replay') as replay:
+            with self.assertRaisesRegex(RuntimeError, 'model-round limit'):
+                self.runtime.respond('Fixture-Ereignis.')
+            replay.assert_not_called()
+        self.assertEqual(self.llm.request_tool_turn.call_count, 2)
+        self.assertEqual(self.agent._tool_events[-1]['result']['error'], 'duplicate_read')
+
+    def test_successful_effectful_call_allows_fresh_identical_read(self):
+        from eve_agent.transport_access import transport_access
+        provider = SimpleNamespace(
+            contracts=lambda conversation_id: {'mcp_fixture': {
+                'description': 'Live fixture',
+                'operations': {
+                    'inspect': {'effect': 'read', 'parameters_schema': {
+                        'type': 'object', 'properties': {}, 'additionalProperties': False,
+                    }},
+                    'advance': {'effect': 'write', 'parameters_schema': {
+                        'type': 'object', 'properties': {}, 'additionalProperties': False,
+                    }},
+                },
+            }},
+            execute=Mock(side_effect=[
+                {'status': 'completed', 'revision': 1, 'phase': 'movement'},
+                {'status': 'completed', 'revision': 2},
+                {'status': 'completed', 'revision': 2, 'phase': 'weapons'},
+            ]),
+        )
+        self.agent.external_mcp = provider
+        self.llm.request_tool_turn.side_effect = [
+            {'content': '', 'tool_calls': [{
+                'id': 'read-before', 'name': 'mcp_fixture__inspect', 'arguments': {},
+            }]},
+            {'content': '', 'tool_calls': [{
+                'id': 'advance', 'name': 'mcp_fixture__advance', 'arguments': {},
+            }]},
+            {'content': '', 'tool_calls': [{
+                'id': 'read-after', 'name': 'mcp_fixture__inspect', 'arguments': {},
+            }]},
+            {'content': 'Aktualisiert.', 'tool_calls': []},
+        ]
+        with transport_access({'mcp_wakeup': {
+                'server': 'fixture', 'method': 'notifications/eve/test',
+                'event_id': 'fixture:event-0003'}}, public=True,
+                allowed_capabilities={'memory', 'mcp_fixture'},
+                preloaded_capabilities={'mcp_fixture'}):
+            self.assertEqual(self.runtime.respond('Fixture-Ereignis.'), 'Aktualisiert.')
+        self.assertEqual(
+            ['inspect', 'advance', 'inspect'],
+            [call.args[1] for call in provider.execute.call_args_list],
+        )
+        self.assertEqual(
+            ['completed', 'completed', 'completed'],
+            [event['status'] for event in self.agent._tool_events],
+        )
+
+    def test_tagged_wakeup_turns_are_removed_from_later_history(self):
+        history = [
+            {'role':'user', 'content':'Normal question'},
+            {'role':'assistant', 'content':'Normal answer'},
+            {'role':'user', 'content':'Fixture event', 'conversation_source': {
+                'mcp_wakeup': {'server':'fixture', 'method':'notifications/eve/test',
+                               'event_id':'fixture:event-0003'}}},
+            {'role':'assistant', 'content':'Synthetic event answer'},
+            {'role':'user', 'content':'Next normal question'},
+        ]
+        filtered = self.runtime._conversation_history(history)
+        self.assertEqual([item['content'] for item in filtered], [
+            'Normal question', 'Normal answer', 'Next normal question',
+        ])
+
     def test_public_channel_hides_and_blocks_privileged_tools_without_changing_prompt(self):
         from eve_agent.transport_access import transport_access
         self.assertIn('home_assistant', self.runtime._capabilities())

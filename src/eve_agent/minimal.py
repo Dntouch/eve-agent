@@ -23,7 +23,8 @@ from .backend_turns import TurnCancelled
 from .bot_activity import tool_activity
 from .memory import MemoryHit
 from .provenance import PlanningProvenance
-from .transport_access import capability_allowed, require_capability, transport_metadata
+from .transport_access import (capability_allowed, require_capability, transport_metadata,
+                               transport_preloaded_capabilities, transport_runtime_limits)
 from .scheduled_execution import EXECUTION_PROMPT, scheduled_metadata
 
 
@@ -43,6 +44,7 @@ def operation_capability(operation):
 class NativeToolRuntime:
     def __init__(self, agent, *, max_decisions=None):
         self.agent = agent
+        self.max_decisions = max_decisions
         self.last_result = None
         self.last_provenance = {"planner_rounds": [], "plans": [], "transitions": []}
         self._current_round_provenance = None
@@ -431,16 +433,27 @@ class NativeToolRuntime:
 
     @staticmethod
     def _conversation_history(history):
-        return [
-            {"role": item.get("role"), "content": (
+        result = []
+        skip_event_answer = False
+        for item in history:
+            if not isinstance(item, dict):
+                continue
+            source = item.get("conversation_source")
+            if isinstance(source, dict) and isinstance(source.get("mcp_wakeup"), dict):
+                skip_event_answer = True
+                continue
+            if skip_event_answer and item.get("role") == "assistant":
+                skip_event_answer = False
+                continue
+            skip_event_answer = False
+            if item.get("role") not in {"user", "assistant"} or not isinstance(item.get("content"), str):
+                continue
+            result.append({"role": item.get("role"), "content": (
                 json.dumps({**{key: item[key] for key in ("conversation_source", "scheduled_execution") if item.get(key)},
                             "message": item["content"]}, ensure_ascii=False)
                 if item.get("conversation_source") or item.get("scheduled_execution") else item.get("content")
-            )}
-            for item in history
-            if isinstance(item, dict) and item.get("role") in {"user", "assistant"}
-            and isinstance(item.get("content"), str)
-        ]
+            )})
+        return result
 
     def _memory_first_context(self, text, trace_id):
         retrieve = getattr(self.agent.memory, "retrieve", None)
@@ -1009,6 +1022,8 @@ class NativeToolRuntime:
         from .memory import redact_sensitive
 
         a = self.agent
+        source_metadata = transport_metadata() or {}
+        integration_event = isinstance(source_metadata.get("mcp_wakeup"), dict)
         from .transient_credentials import current_credentials
         credentials = current_credentials()
         text = credentials.model_text if credentials and credentials.values else redact_sensitive(text or "Analysiere die bereitgestellten Bilder.")
@@ -1027,10 +1042,11 @@ class NativeToolRuntime:
             getattr(a.telemetry, "session_lifecycle", lambda **_: None)(**lifecycle)
         trace_id = str(trace_id or uuid.uuid4().hex)
         a._trace_id = trace_id
-        if getattr(a, "semantic_links", None) is not None:
+        if not integration_event and getattr(a, "semantic_links", None) is not None:
             from .native_semantics import NativeSemanticSession
             self.semantic_session = NativeSemanticSession(a, text, trace_id)
-        if a.conversation_id and getattr(a.memory, "database", None) and a.conversations:
+        if (not integration_event and a.conversation_id
+                and getattr(a.memory, "database", None) and a.conversations):
             from .working_context import WorkingMemorySession
             self.working_session = WorkingMemorySession(a, text, images, trace_id)
         self.last_provenance = {
@@ -1051,19 +1067,20 @@ class NativeToolRuntime:
         a.last_sources = []
 
         state = {
-            "work_task_discoveries": [], "loaded_capabilities": [],
+            "work_task_discoveries": [],
+            "loaded_capabilities": list(transport_preloaded_capabilities()),
             "turn_query": text, "trace_id": trace_id,
         }
         from .learned_execution import try_replay
         # A stored experience for the same words may describe an interactive
         # correction. Scheduled runs need the current execution context.
-        replayed = try_replay(self, text, images, state) if execution is None else None
+        replayed = try_replay(self, text, images, state) if execution is None and not state["loaded_capabilities"] else None
         if replayed is not None:
             return replayed
-        semantic_memory, semantic_claims = self._semantic_memory_context(text, trace_id)
+        semantic_memory, semantic_claims = ([], []) if integration_event else self._semantic_memory_context(text, trace_id)
         if self.semantic_session:
             self.semantic_session.retrieved = {item["memory_id"]: deepcopy(item) for item in semantic_memory}
-        memory, memory_claims = self._memory_first_context(text, trace_id)
+        memory, memory_claims = ([], []) if integration_event else self._memory_first_context(text, trace_id)
         if semantic_memory:
             semantic_ids = {item.get("memory_id") for item in semantic_memory}
             memory = semantic_memory + [
@@ -1072,8 +1089,8 @@ class NativeToolRuntime:
         for item in memory:
             item.update(reference_kind="durable_memory", lookup_operation="memory.find")
         standing_reader = getattr(a.memory, "standing_instructions", None)
-        standing = standing_reader(telemetry_context={"trace_id": trace_id, "turn_id": trace_id,
-            "conversation_id": a.conversation_id}) if callable(standing_reader) else []
+        standing = (standing_reader(telemetry_context={"trace_id": trace_id, "turn_id": trace_id,
+            "conversation_id": a.conversation_id}) if callable(standing_reader) and not integration_event else [])
         standing_ids = {item["memory_id"] for item in standing}
         memory = standing + [item for item in memory if item.get("memory_id") not in standing_ids]
         semantic_claims.extend({"claim_id": item["memory_id"], "source": "explicit_applicability"}
@@ -1095,8 +1112,8 @@ class NativeToolRuntime:
                 'current_input_ids': [f'input:{index}' for index in range(len(images))]}
         if execution is not None:
             context["scheduled_execution"] = execution
-        elif transport_metadata() is not None:
-            context["conversation_source"] = transport_metadata()
+        elif source_metadata:
+            context["conversation_source"] = source_metadata
         runtime_model_info = getattr(a.llm, "runtime_model_info", lambda: {})()
         if runtime_model_info.get("vision") is True:
             context["runtime_capabilities"] = {"native_image_input": True}
@@ -1121,10 +1138,13 @@ class NativeToolRuntime:
 
         if memory:
             context["memory"] = memory
-        pending = a._pending_context()
+        pending = None if integration_event else a._pending_context()
         if pending:
             context["pending"] = pending
         capabilities = self._capabilities(state)
+        state["loaded_capabilities"] = [
+            name for name in state["loaded_capabilities"] if name in capabilities
+        ]
         tools, bindings = self._published_tools(
             capabilities, state["loaded_capabilities"],
         )
@@ -1144,12 +1164,22 @@ class NativeToolRuntime:
                 *[{"type": "image_url", "image_url": {"url": image}} for image in images],
             ]
         messages = [{"role": "system", "content": turn_prompt}]
-        messages.extend(self._conversation_history(a.history))
+        if not integration_event:
+            messages.extend(self._conversation_history(a.history))
         messages.append({"role": "user", "content": user_content})
         last_route = Route.CHAT
         completed_results = []
+        runtime_limits = transport_runtime_limits()
+        round_limit = runtime_limits.get("model_rounds", self.max_decisions)
+        tool_limit = runtime_limits.get("tool_calls")
+        model_rounds = 0
+        tool_calls = 0
+        completed_reads = {}
 
         while True:
+            if round_limit is not None and model_rounds >= round_limit:
+                raise RuntimeError("Native tool model-round limit reached")
+            model_rounds += 1
             a._cancel_checkpoint()
             if self.working_session:
                 messages, tools, replaced_bindings = self.working_session.prepare(
@@ -1196,6 +1226,9 @@ class NativeToolRuntime:
                     "provider_results": deepcopy(completed_results),
                 }
                 return self._finish(text, answer, last_route, result=result)
+            if tool_limit is not None and tool_calls + len(calls) > tool_limit:
+                raise RuntimeError("Native tool call limit reached")
+            tool_calls += len(calls)
 
             assistant_calls = []
             for call in calls:
@@ -1259,21 +1292,45 @@ class NativeToolRuntime:
                         Draft202012Validator(binding["schema"]).validate(parameters)
                         if capability == "eve_runtime" and operation == "complete_check" and len(calls) != 1:
                             raise ValueError("Der endgültige Abschluss muss allein aufgerufen werden")
-                        # The presence renderer already understands generic
-                        # ``tool:*`` states. Publish the exact dispatched
-                        # capability here, at the native tool boundary, so the
-                        # animation reflects a real invocation rather than a
-                        # Python guess about user intent.
-                        a.bus.set(
-                            f"tool:{capability}",
-                            f"{capability} · {operation}",
-                        )
-                        a._cancel_checkpoint()
+                        read_key = None
+                        if binding["effect"] == "read":
+                            read_key = (capability, operation, json.dumps(
+                                parameters, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+                            ))
+                        route = last_route
                         if work_call:
                             self.working_session.store.dispatch_call(work_scope[0], work_call)
-                        result, route = self._execute_direct(
-                            capability, operation, parameters, state, images,
-                        )
+                        if read_key in completed_reads:
+                            result = {
+                                "status": "rejected", "error": "duplicate_read",
+                                "provider_called": False,
+                                "message": "This identical read already returned during the current turn.",
+                            }
+                        else:
+                            # The presence renderer already understands generic
+                            # ``tool:*`` states. Publish the exact dispatched
+                            # capability here, at the native tool boundary, so the
+                            # animation reflects a real invocation rather than a
+                            # Python guess about user intent.
+                            a.bus.set(
+                                f"tool:{capability}",
+                                f"{capability} · {operation}",
+                            )
+                            a._cancel_checkpoint()
+                            result, route = self._execute_direct(
+                                capability, operation, parameters, state, images,
+                            )
+                            if read_key is not None:
+                                completed_reads[read_key] = deepcopy(result)
+                            elif (binding["effect"] != "read" and isinstance(result, dict)
+                                  and result.get("status") in {
+                                      None, "completed", "success", "returned",
+                                      "accepted", "applied",
+                                  }):
+                                # A successful effectful call may advance a remote
+                                # revision or phase. Identical reads made before it
+                                # are therefore stale, not loop repetitions.
+                                completed_reads.clear()
                         from .transient_credentials import redact_transient
                         result = redact_transient(result)
                         a._presentation_resources = redact_transient(a._presentation_resources)
